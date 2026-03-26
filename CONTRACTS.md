@@ -133,6 +133,22 @@ function post(status: string) {
 // session.error  → error
 ```
 
+### Codex CLI (Hooks)
+
+Codex CLI supports hooks (beta). Run the setup script:
+
+```bash
+bash integrations/codex/setup.sh
+```
+
+This installs `~/.codex/hooks.json` and enables `codex_hooks` in `~/.codex/config.toml`.
+
+Events mapped:
+- `SessionStart` → idle
+- `UserPromptSubmit` → running
+- `PostToolUse` → running
+- `Stop` → idle
+
 ### Aider / Any Agent (Generic curl)
 
 For any agent that supports shell hooks or custom commands:
