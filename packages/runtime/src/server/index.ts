@@ -1209,10 +1209,17 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
           for (const line of lines) {
             try {
               const entry = JSON.parse(line);
+
+              // Prefer custom title from /rename command
+              if (entry.type === "custom-title" && entry.customTitle) {
+                threadName = entry.customTitle;
+                continue;
+              }
+
               const msg = entry.message;
               if (!msg?.role) continue;
 
-              // Extract thread name from first user message
+              // Extract thread name from first user message (fallback)
               if (!threadName && msg.role === "user") {
                 const content = msg.content;
                 let t: string | undefined;
@@ -1367,8 +1374,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       for (const [session, agents] of nextBySession) {
         const prev = paneAgentsBySession.get(session);
         if (!prev || prev.size !== agents.size) { changed = true; break; }
-        for (const key of agents.keys()) {
-          if (!prev.has(key)) { changed = true; break; }
+        for (const [key, agent] of agents) {
+          const prevAgent = prev.get(key);
+          if (!prevAgent || prevAgent.threadName !== agent.threadName) { changed = true; break; }
         }
         if (changed) break;
       }

@@ -27,6 +27,7 @@ interface ContentItem {
 
 interface JournalEntry {
   type?: string;
+  customTitle?: string;
   message?: {
     role?: string;
     content?: ContentItem[] | string;
@@ -65,6 +66,12 @@ export function determineStatus(entry: JournalEntry): AgentStatus {
 
   return "idle";
 }
+
+function extractCustomTitle(entry: JournalEntry): string | undefined {
+  if (entry.type === "custom-title" && entry.customTitle) return entry.customTitle;
+  return undefined;
+}
+
 
 function extractThreadName(entry: JournalEntry): string | undefined {
   const msg = entry.message;
@@ -146,7 +153,9 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
       for (const line of lines) {
         let entry: JournalEntry;
         try { entry = JSON.parse(line); } catch { continue; }
-        if (!threadName) {
+        const customTitle = extractCustomTitle(entry);
+        if (customTitle) threadName = customTitle;
+        else if (!threadName) {
           const name = extractThreadName(entry);
           if (name) threadName = name;
         }
@@ -176,7 +185,9 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
       let entry: JournalEntry;
       try { entry = JSON.parse(line); } catch { continue; }
 
-      if (!threadName) {
+      const customTitle = extractCustomTitle(entry);
+      if (customTitle) threadName = customTitle;
+      else if (!threadName) {
         const name = extractThreadName(entry);
         if (name) threadName = name;
       }
@@ -185,9 +196,10 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
     }
 
     const prevStatus = prev?.status;
+    const prevThreadName = prev?.threadName;
     this.sessions.set(threadId, { status: latestStatus, fileSize: size, threadName, projectDir });
 
-    if (latestStatus !== prevStatus) {
+    if (latestStatus !== prevStatus || threadName !== prevThreadName) {
       const session = this.ctx.resolveSession(projectDir);
       if (session) {
         this.ctx.emit({
