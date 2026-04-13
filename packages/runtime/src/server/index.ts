@@ -525,14 +525,40 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       }
     }
 
-    // Build paneId -> windowId map for agent-to-window association
-    const paneToWindow = new Map<string, string>();
+    // Build windowId -> agent mapping by scanning pane process trees directly
+    const windowAgentMap = new Map<string, { agent: string; status: import("../contracts/agent").AgentStatus }>();
     try {
-      const raw = shell(["tmux", "list-panes", "-a", "-F", "#{pane_id}|#{window_id}"]);
+      const raw = shell(["tmux", "list-panes", "-a", "-F", "#{session_name}|#{pane_id}|#{pane_pid}|#{window_id}|#{pane_title}"]);
+      const sidebarPaneIds = new Set<string>();
+      for (const { panes: sbPanes } of listSidebarPanesByProvider()) {
+        for (const sb of sbPanes) sidebarPaneIds.add(sb.paneId);
+      }
+      const tree = buildProcessTree();
       for (const line of raw.split("\n")) {
         if (!line) continue;
-        const sep = line.indexOf("|");
-        if (sep > 0) paneToWindow.set(line.slice(0, sep), line.slice(sep + 1));
+        const i1 = line.indexOf("|");
+        const i2 = line.indexOf("|", i1 + 1);
+        const i3 = line.indexOf("|", i2 + 1);
+        const i4 = line.indexOf("|", i3 + 1);
+        const paneSession = line.slice(0, i1);
+        const paneId = line.slice(i1 + 1, i2);
+        const panePid = parseInt(line.slice(i2 + 1, i3), 10);
+        const windowId = line.slice(i3 + 1, i4);
+        const paneTitle = line.slice(i4 + 1);
+        if (sidebarPaneIds.has(paneId)) continue;
+        if (paneTitle === "opensessions-sidebar") continue;
+        for (const [agentName, patterns] of Object.entries(AGENT_TITLE_PATTERNS)) {
+          if (!matchProcessTreeFast(panePid, patterns, tree)) continue;
+          // Get the best status from the tracker for this agent in this session
+          const agents = tracker.getAgents(paneSession);
+          const agentEvent = agents.find((a) => a.agent === agentName);
+          const status = agentEvent?.status ?? "idle";
+          const existing = windowAgentMap.get(windowId);
+          // Keep the most active status if multiple agents in same window
+          if (!existing || STATUS_PRIORITY[status] > STATUS_PRIORITY[existing.status]) {
+            windowAgentMap.set(windowId, { agent: agentName, status });
+          }
+        }
       }
     } catch {}
 
@@ -566,12 +592,11 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         localLinks: buildLocalLinks(getSessionPorts(name), portlessState),
         windows,
         windowList: (windowList ?? []).map((w) => {
-          const agents = tracker.getAgents(name);
-          const windowAgent = agents.find((a) => a.paneId && paneToWindow.get(a.paneId) === w.id);
+          const winAgent = windowAgentMap.get(w.id);
           return {
             ...w,
-            agentStatus: windowAgent?.status,
-            agentName: windowAgent?.agent,
+            agentStatus: winAgent?.status,
+            agentName: winAgent?.agent,
           };
         }),
         uptime,
@@ -1073,6 +1098,11 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     "claude-code": ["claude"],
     codex: ["codex"],
     opencode: ["opencode"],
+  };
+
+  const STATUS_PRIORITY: Record<string, number> = {
+    "tool-running": 7, running: 6, error: 5, stale: 4,
+    interrupted: 3, waiting: 2, done: 1, idle: 0,
   };
 
   const PANE_HIGHLIGHT_BORDER = "fg=#fab387,bold";
