@@ -1703,7 +1703,8 @@ function SessionCard(props: SessionCardProps) {
               {(win) => {
                 const winAgentIcon = () => {
                   const s = (win as any).agentStatus;
-                  if (!s || s === "idle") return "";
+                  if (!s) return "";
+                  if (s === "idle") return "○";
                   if (s === "running") return SPINNERS[props.spinIdx() % SPINNERS.length]!;
                   if (s === "tool-running") return "⚙";
                   if (s === "done") return "✓";
@@ -1714,7 +1715,8 @@ function SessionCard(props: SessionCardProps) {
                 };
                 const winAgentColor = () => {
                   const s = (win as any).agentStatus;
-                  if (!s || s === "idle") return "";
+                  if (!s) return "";
+                  if (s === "idle") return P().surface2;
                   return SC()[s] ?? P().overlay0;
                 };
                 return (
