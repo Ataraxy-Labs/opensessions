@@ -1700,17 +1700,42 @@ function SessionCard(props: SessionCardProps) {
           {/* Row 4: window/tab list (when session has >1 window) */}
           <Show when={(props.session.windowList?.length ?? 0) > 1}>
             <For each={props.session.windowList}>
-              {(win) => (
-                <text truncate wrapMode="none"
-                  onMouseDown={() => {
-                    props.onSwitchWindow?.(win.index);
-                  }}
-                  fg={win.active ? P().green : P().overlay0}>
-                  <span style={{ fg: win.active ? P().green : P().overlay0 }}>
-                    {`  ${win.active ? "▸" : " "} ${win.index}:${win.name}`}
-                  </span>
-                </text>
-              )}
+              {(win) => {
+                const winAgentIcon = () => {
+                  const s = (win as any).agentStatus;
+                  if (!s || s === "idle") return "";
+                  if (s === "running") return SPINNERS[props.spinIdx() % SPINNERS.length]!;
+                  if (s === "tool-running") return "⚙";
+                  if (s === "done") return "✓";
+                  if (s === "error") return "✗";
+                  if (s === "waiting") return "◉";
+                  if (s === "interrupted" || s === "stale") return "⚠";
+                  return "";
+                };
+                const winAgentColor = () => {
+                  const s = (win as any).agentStatus;
+                  if (!s || s === "idle") return "";
+                  return SC()[s] ?? P().overlay0;
+                };
+                return (
+                  <box flexDirection="row">
+                    <text truncate wrapMode="none" flexGrow={1}
+                      onMouseDown={() => {
+                        props.onSwitchWindow?.(win.index);
+                      }}
+                      fg={win.active ? P().green : P().overlay0}>
+                      <span style={{ fg: win.active ? P().green : P().overlay0 }}>
+                        {`  ${win.active ? "▸" : " "} ${win.index}:${win.name}`}
+                      </span>
+                    </text>
+                    <Show when={winAgentIcon()}>
+                      <text flexShrink={0}>
+                        <span style={{ fg: winAgentColor() }}>{" "}{winAgentIcon()}</span>
+                      </text>
+                    </Show>
+                  </box>
+                );
+              }}
             </For>
           </Show>
         </box>

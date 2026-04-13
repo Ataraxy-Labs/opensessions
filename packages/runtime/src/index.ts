@@ -49,6 +49,7 @@ export {
 } from "./shared";
 export type {
   SessionData,
+  WindowData,
   ServerState,
   FocusUpdate,
   ResizeNotify,

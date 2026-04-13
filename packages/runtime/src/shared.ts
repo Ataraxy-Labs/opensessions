@@ -15,6 +15,11 @@ export interface LocalLink {
   label: string;
 }
 
+export interface WindowData extends MuxWindowInfo {
+  agentStatus?: AgentStatus;
+  agentName?: string;
+}
+
 export interface SessionData {
   name: string;
   createdAt: number;
@@ -27,7 +32,7 @@ export interface SessionData {
   ports: number[];
   localLinks: LocalLink[];
   windows: number;
-  windowList: MuxWindowInfo[];
+  windowList: WindowData[];
   uptime: string;
   agentState: AgentEvent | null;
   agents: AgentEvent[];

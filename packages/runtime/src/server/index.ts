@@ -525,6 +525,17 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       }
     }
 
+    // Build paneId -> windowId map for agent-to-window association
+    const paneToWindow = new Map<string, string>();
+    try {
+      const raw = shell(["tmux", "list-panes", "-a", "-F", "#{pane_id}|#{window_id}"]);
+      for (const line of raw.split("\n")) {
+        if (!line) continue;
+        const sep = line.indexOf("|");
+        if (sep > 0) paneToWindow.set(line.slice(0, sep), line.slice(sep + 1));
+      }
+    } catch {}
+
     const sessions: SessionData[] = orderedMuxSessions.map(({ name, createdAt, windows, windowList, dir, provider }) => {
       sessionProviders.set(name, provider);
       const git = getGitInfo(dir);
@@ -554,7 +565,15 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         ports: getSessionPorts(name),
         localLinks: buildLocalLinks(getSessionPorts(name), portlessState),
         windows,
-        windowList: (windowList ?? []) as import("../shared").SessionData["windowList"],
+        windowList: (windowList ?? []).map((w) => {
+          const agents = tracker.getAgents(name);
+          const windowAgent = agents.find((a) => a.paneId && paneToWindow.get(a.paneId) === w.id);
+          return {
+            ...w,
+            agentStatus: windowAgent?.status,
+            agentName: windowAgent?.agent,
+          };
+        }),
         uptime,
         agentState: tracker.getState(name),
         agents: tracker.getAgents(name),
