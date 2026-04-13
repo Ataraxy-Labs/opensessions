@@ -525,7 +525,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       }
     }
 
-    const sessions: SessionData[] = orderedMuxSessions.map(({ name, createdAt, windows, dir, provider }) => {
+    const sessions: SessionData[] = orderedMuxSessions.map(({ name, createdAt, windows, windowList, dir, provider }) => {
       sessionProviders.set(name, provider);
       const git = getGitInfo(dir);
       const providerPaneCounts = paneCountMaps.get(provider);
@@ -554,6 +554,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         ports: getSessionPorts(name),
         localLinks: buildLocalLinks(getSessionPorts(name), portlessState),
         windows,
+        windowList: (windowList ?? []) as import("../shared").SessionData["windowList"],
         uptime,
         agentState: tracker.getState(name),
         agents: tracker.getAgents(name),
@@ -1453,6 +1454,24 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
             }, 1500);
           }
         }
+        break;
+      }
+      case "switch-window": {
+        const clientSess = clientSessionNames.get(ws);
+        const tty = (clientSess ? clientTtyBySession.get(clientSess) : undefined)
+          ?? cmd.clientTty ?? clientTtys.get(ws);
+        const p = sessionProviders.get(cmd.sessionName) ?? mux;
+        p.switchSession(cmd.sessionName, tty);
+        // Select the target window by index
+        try {
+          Bun.spawnSync(["tmux", "select-window", "-t", `${cmd.sessionName}:${cmd.windowIndex}`], {
+            stdout: "pipe", stderr: "pipe",
+          });
+        } catch {}
+        focusedSession = cmd.sessionName;
+        cachedCurrentSession = cmd.sessionName;
+        cachedCurrentSessionTs = Date.now();
+        broadcastFocusOnly();
         break;
       }
       case "switch-index": {

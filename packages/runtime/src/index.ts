@@ -1,6 +1,7 @@
 export type {
   MuxProvider,
   MuxProviderV1,
+  MuxWindowInfo,
   MuxSessionInfo,
   ActiveWindow,
   SidebarPane,

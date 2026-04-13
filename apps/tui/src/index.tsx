@@ -313,6 +313,13 @@ function App() {
     send({ type: "switch-session", name });
   }
 
+  function switchToWindow(sessionName: string, windowIndex: number) {
+    setCurrentSession(sessionName);
+    setFocusedSession(sessionName);
+    setPanelFocus("sessions");
+    send({ type: "switch-window", sessionName, windowIndex });
+  }
+
   function reIdentify() {
     const sessionName = getLocalSessionName();
     if (!sessionName) return;
@@ -880,6 +887,9 @@ function App() {
                 setFocusedSession(session.name);
                 send({ type: "focus-session", name: session.name });
                 switchToSession(session.name);
+              }}
+              onSwitchWindow={(windowIndex) => {
+                switchToWindow(session.name, windowIndex);
               }}
             />
           )}
@@ -1514,6 +1524,7 @@ interface SessionCardProps {
   theme: Accessor<Theme>;
   statusColors: Accessor<Theme["status"]>;
   onSelect: () => void;
+  onSwitchWindow?: (windowIndex: number) => void;
 }
 
 function SessionCard(props: SessionCardProps) {
@@ -1684,6 +1695,23 @@ function SessionCard(props: SessionCardProps) {
             <text truncate>
               <span style={{ fg: toneColor(metaTone(), P()), attributes: DIM }}>{metaSummary()}</span>
             </text>
+          </Show>
+
+          {/* Row 4: window/tab list (when session has >1 window) */}
+          <Show when={(props.session.windowList?.length ?? 0) > 1}>
+            <For each={props.session.windowList}>
+              {(win) => (
+                <text truncate wrapMode="none"
+                  onMouseDown={() => {
+                    props.onSwitchWindow?.(win.index);
+                  }}
+                  fg={win.active ? P().green : P().overlay0}>
+                  <span style={{ fg: win.active ? P().green : P().overlay0 }}>
+                    {`  ${win.active ? "▸" : " "} ${win.index}:${win.name}`}
+                  </span>
+                </text>
+              )}
+            </For>
           </Show>
         </box>
       </box>

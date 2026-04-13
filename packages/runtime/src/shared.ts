@@ -1,5 +1,5 @@
 import type { AgentStatus, AgentEvent } from "./contracts/agent";
-import type { MuxSessionInfo } from "./contracts/mux";
+import type { MuxSessionInfo, MuxWindowInfo } from "./contracts/mux";
 import type { SessionFilterMode } from "./config";
 
 export const SERVER_PORT = 7391;
@@ -27,6 +27,7 @@ export interface SessionData {
   ports: number[];
   localLinks: LocalLink[];
   windows: number;
+  windowList: MuxWindowInfo[];
   uptime: string;
   agentState: AgentEvent | null;
   agents: AgentEvent[];
@@ -107,6 +108,7 @@ export interface SessionMetadata {
 
 export type ClientCommand =
   | { type: "switch-session"; name: string; clientTty?: string }
+  | { type: "switch-window"; sessionName: string; windowIndex: number; clientTty?: string }
   | { type: "switch-index"; index: number }
   | { type: "new-session" }
   | { type: "hide-session"; name: string }

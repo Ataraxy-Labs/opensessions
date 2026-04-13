@@ -48,11 +48,26 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     const sessions = tmux.listSessions()
       .filter((s) => s.name !== STASH_SESSION);
     const activeDirs = tmux.getActiveSessionDirs();
+    const allWindows = tmux.listWindows();
+    const windowsBySession = new Map<string, typeof allWindows>();
+    for (const w of allWindows) {
+      if (w.sessionName === STASH_SESSION) continue;
+      let list = windowsBySession.get(w.sessionName);
+      if (!list) { list = []; windowsBySession.set(w.sessionName, list); }
+      list.push(w);
+    }
     return sessions.map((s) => ({
       name: s.name,
       createdAt: s.createdAt,
       dir: activeDirs.get(s.name) ?? s.dir,
       windows: s.windowCount,
+      windowList: (windowsBySession.get(s.name) ?? []).map((w) => ({
+        id: w.id,
+        index: w.index,
+        name: w.name,
+        active: w.active,
+        paneCount: w.paneCount,
+      })),
     }));
   }
 
