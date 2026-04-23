@@ -25,6 +25,12 @@ export interface OpensessionsConfig {
   detailPanelHeights?: Record<string, number>;
   /** Default session filter: "all" (default), "active" (any agent), "running" (running agents only) */
   sessionFilter?: SessionFilterMode;
+  /** macOS only: automatically follow the system Appearance setting and switch themes */
+  autoThemeFollowsSystem?: boolean;
+  /** Theme to use when the macOS system Appearance is Dark (default: "catppuccin-mocha") */
+  darkTheme?: string;
+  /** Theme to use when the macOS system Appearance is Light (default: "catppuccin-latte") */
+  lightTheme?: string;
 }
 
 const DEFAULTS: OpensessionsConfig = {

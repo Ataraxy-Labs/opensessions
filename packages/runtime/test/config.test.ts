@@ -98,6 +98,34 @@ describe("Config", () => {
     const { rmSync } = require("fs");
     rmSync(tmpDir, { recursive: true, force: true });
   });
+
+  test("loadConfig round-trips auto-theme fields", async () => {
+    const tmpDir = `/tmp/opensessions-test-${Date.now()}`;
+    const configDir = join(tmpDir, ".config", "opensessions");
+    await Bun.write(
+      join(configDir, "config.json"),
+      JSON.stringify({
+        autoThemeFollowsSystem: true,
+        darkTheme: "tokyo-night",
+        lightTheme: "catppuccin-latte",
+      }),
+    );
+
+    const config = loadConfig(tmpDir);
+    expect(config.autoThemeFollowsSystem).toBe(true);
+    expect(config.darkTheme).toBe("tokyo-night");
+    expect(config.lightTheme).toBe("catppuccin-latte");
+
+    const { rmSync } = require("fs");
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("loadConfig leaves auto-theme fields unset when absent", () => {
+    const config = loadConfig("/tmp/nonexistent-dir-" + Date.now());
+    expect(config.autoThemeFollowsSystem).toBeUndefined();
+    expect(config.darkTheme).toBeUndefined();
+    expect(config.lightTheme).toBeUndefined();
+  });
 });
 
 describe("Themes", () => {

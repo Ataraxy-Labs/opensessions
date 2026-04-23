@@ -24,6 +24,7 @@ import {
 } from "./sidebar-coordinator";
 import { loadConfig, saveConfig } from "../config";
 import type { SessionFilterMode } from "../config";
+import { readMacSystemAppearance, themeForSystemMode } from "../system-theme";
 import {
   clampSidebarWidth,
 } from "./sidebar-width-sync";
@@ -304,6 +305,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const config = loadConfig();
   let currentTheme: string | undefined = typeof config.theme === "string" ? config.theme : undefined;
   let currentFilter: SessionFilterMode | undefined = config.sessionFilter;
+  let systemThemePollTimer: ReturnType<typeof setInterval> | null = null;
   const initialSidebarWidth = clampSidebarWidth(config.sidebarWidth ?? 26);
   let sidebarPosition: "left" | "right" = config.sidebarPosition ?? "left";
   const sidebarCoordinator = createSidebarCoordinator({ width: initialSidebarWidth });
@@ -2165,6 +2167,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     clearProgrammaticAdjustmentTimer();
     if (portPollTimer) clearInterval(portPollTimer);
     if (paneScanTimer) clearInterval(paneScanTimer);
+    if (systemThemePollTimer) clearInterval(systemThemePollTimer);
     for (const timer of pendingHighlightResets.values()) clearTimeout(timer);
     pendingHighlightResets.clear();
     for (const watcher of gitHeadWatchers.values()) watcher.close();
@@ -2605,6 +2608,30 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   }
 
   startIdleTimerIfNeeded("server booted without clients");
+
+  // --- macOS system-appearance follower -----------------------------------
+  // When `autoThemeFollowsSystem` is set, poll the macOS Appearance setting
+  // every few seconds and flip between the configured dark/light themes.
+  // macOS does not expose a CLI change-notification; polling is cheap.
+  if (config.autoThemeFollowsSystem && process.platform === "darwin") {
+    const darkTheme = config.darkTheme ?? "catppuccin-mocha";
+    const lightTheme = config.lightTheme ?? "catppuccin-latte";
+
+    async function syncSystemTheme() {
+      const mode = await readMacSystemAppearance();
+      const desired = themeForSystemMode(mode, darkTheme, lightTheme);
+      if (desired === currentTheme) return;
+      log("system-theme", "switching", { mode, from: currentTheme, to: desired });
+      currentTheme = desired;
+      saveConfig({ theme: desired });
+      broadcastState();
+    }
+
+    void syncSystemTheme();
+    systemThemePollTimer = setInterval(() => { void syncSystemTheme(); }, 3000);
+    log("system-theme", "poller started", { darkTheme, lightTheme });
+  }
+  // ------------------------------------------------------------------------
 
   process.on("SIGINT", () => { cleanup(); process.exit(0); });
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
