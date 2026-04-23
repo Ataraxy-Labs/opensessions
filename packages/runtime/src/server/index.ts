@@ -1495,6 +1495,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     amp: ["amp"],
     "claude-code": ["claude"],
     codex: ["codex"],
+    droid: ["droid", "factory"],
     opencode: ["opencode"],
   };
 

@@ -2,6 +2,7 @@ import {
   AmpAgentWatcher,
   ClaudeCodeAgentWatcher,
   CodexAgentWatcher,
+  DroidAgentWatcher,
   OpenCodeAgentWatcher,
   PiAgentWatcher,
   PluginLoader,
@@ -66,6 +67,7 @@ if (extraProviders.length > 0) {
 loader.registerWatcher(new AmpAgentWatcher());
 loader.registerWatcher(new ClaudeCodeAgentWatcher());
 loader.registerWatcher(new CodexAgentWatcher());
+loader.registerWatcher(new DroidAgentWatcher());
 loader.registerWatcher(new OpenCodeAgentWatcher());
 loader.registerWatcher(new PiAgentWatcher());
 
