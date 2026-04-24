@@ -5,8 +5,17 @@
  * determines agent status from journal entries, and emits events
  * mapped to mux sessions via the project directory encoded in folder names.
  *
- * Directory structure: ~/.claude/projects/<encoded-path>/<session-id>.jsonl
+ * Directory structure:
+ *   ~/.claude/projects/<encoded-path>/<session-id>.jsonl         — main session transcript
+ *   ~/.claude/projects/<encoded-path>/<session-id>/subagents/
+ *     agent-<subagent-id>.jsonl                                  — subagent transcripts
+ *     agent-<subagent-id>.meta.json                              — subagent metadata (ignored)
  * Encoded path: /Users/foo/myproject → -Users-foo-myproject
+ *
+ * Subagents spawned via the Task tool write to the nested subagents/ dir.
+ * The watcher treats each subagent transcript as an independent thread
+ * (threadId = "agent-<id>", same projectDir as the parent session) so the
+ * detail panel lists the main session plus every live subagent.
  *
  * All file I/O is async to avoid blocking the server event loop.
  *
@@ -102,6 +111,15 @@ interface SessionState {
 
 const POLL_MS = 2000;
 const STALE_MS = 5 * 60 * 1000;
+/** Nested directory under each session dir that holds subagent transcripts */
+const SUBAGENTS_SUBDIR = "subagents";
+/** Matches a Claude Code session UUID folder: 8-4-4-4-12 lowercase hex */
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True if the given directory name looks like a Claude Code session UUID. */
+function isSessionDirName(name: string): boolean {
+  return SESSION_UUID_RE.test(name);
+}
 /** How long to wait before promoting tool_use "running" → "waiting" (permission prompt heuristic) */
 const TOOL_USE_WAIT_MS = 3000;
 /** How long a "running" session can go without file growth before we assume the process died */
@@ -421,6 +439,22 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
     this.scanPromise = null;
   }
 
+  /** Scan a directory for recent .jsonl files and call processFile on each.
+   *  Used for both project-level dirs (main session transcripts) and nested
+   *  <session-uuid>/subagents/ dirs (subagent transcripts). */
+  private async scanJsonlDir(dirPath: string, projectDir: string, now: number): Promise<void> {
+    let files: string[];
+    try { files = await readdir(dirPath); } catch { return; }
+    for (const file of files) {
+      if (!file.endsWith(".jsonl")) continue;
+      const filePath = join(dirPath, file);
+      let fileStat;
+      try { fileStat = await stat(filePath); } catch { continue; }
+      if (now - fileStat.mtimeMs > STALE_MS) continue;
+      await this.processFile(filePath, projectDir);
+    }
+  }
+
   private async scanInternal(): Promise<void> {
     try {
       let dirs: string[];
@@ -433,16 +467,19 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
 
         const projectDir = decodeProjectDir(dir);
 
-        let files: string[];
-        try { files = await readdir(dirPath); } catch { continue; }
+        // Main session transcripts live directly under the project dir.
+        await this.scanJsonlDir(dirPath, projectDir, now);
 
-        for (const file of files) {
-          if (!file.endsWith(".jsonl")) continue;
-          const filePath = join(dirPath, file);
-          let fileStat;
-          try { fileStat = await stat(filePath); } catch { continue; }
-          if (now - fileStat.mtimeMs > STALE_MS) continue;
-          await this.processFile(filePath, projectDir);
+        // Subagent transcripts live in <project>/<session-uuid>/subagents/.
+        let entries: string[];
+        try { entries = await readdir(dirPath); } catch { continue; }
+        for (const entry of entries) {
+          if (!isSessionDirName(entry)) continue;
+          const subagentsDir = join(dirPath, entry, SUBAGENTS_SUBDIR);
+          try {
+            if (!(await stat(subagentsDir)).isDirectory()) continue;
+          } catch { continue; }
+          await this.scanJsonlDir(subagentsDir, projectDir, now);
         }
       }
     } finally {
@@ -467,6 +504,58 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
     }
   }
 
+  /** Watch a directory for .jsonl file changes and dispatch them to processFile. */
+  private watchJsonlDir(dirPath: string, projectDir: string): void {
+    try {
+      const w = watch(dirPath, (_eventType, filename) => {
+        if (!filename?.endsWith(".jsonl")) return;
+        this.processFile(join(dirPath, filename), projectDir);
+      });
+      this.fsWatchers.push(w);
+    } catch {}
+  }
+
+  /** Watch a <session-uuid>/ directory for the subagents/ subdir appearing,
+   *  and start watching subagents/ as soon as it does. Harmless if the dir
+   *  already exists — we skip re-adding a watcher in that case. */
+  private watchSessionDirForSubagents(sessionDirPath: string, projectDir: string): void {
+    const subagentsDir = join(sessionDirPath, SUBAGENTS_SUBDIR);
+    // If subagents/ already exists, watch it now.
+    try {
+      if (require("fs").statSync(subagentsDir).isDirectory()) {
+        this.watchJsonlDir(subagentsDir, projectDir);
+        return;
+      }
+    } catch {}
+
+    // Otherwise, watch the session dir for subagents/ being created.
+    try {
+      const w = watch(sessionDirPath, (_eventType, filename) => {
+        if (filename !== SUBAGENTS_SUBDIR) return;
+        try {
+          if (!require("fs").statSync(subagentsDir).isDirectory()) return;
+        } catch { return; }
+        this.watchJsonlDir(subagentsDir, projectDir);
+      });
+      this.fsWatchers.push(w);
+    } catch {}
+  }
+
+  /** Walk a project dir and set up subagent-related watchers for any
+   *  existing session UUID subdirs. */
+  private setupSubagentWatchers(projectDirPath: string, projectDir: string): void {
+    let entries: string[];
+    try { entries = require("fs").readdirSync(projectDirPath); } catch { return; }
+    for (const entry of entries) {
+      if (!isSessionDirName(entry)) continue;
+      const sessionDirPath = join(projectDirPath, entry);
+      try {
+        if (!require("fs").statSync(sessionDirPath).isDirectory()) continue;
+      } catch { continue; }
+      this.watchSessionDirForSubagents(sessionDirPath, projectDir);
+    }
+  }
+
   private setupWatchers(): void {
     let dirs: string[];
     try { dirs = require("fs").readdirSync(this.projectsDir); } catch { return; }
@@ -476,16 +565,14 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
       try { if (!require("fs").statSync(dirPath).isDirectory()) continue; } catch { continue; }
 
       const projectDir = decodeProjectDir(dir);
-      try {
-        const w = watch(dirPath, (_eventType, filename) => {
-          if (!filename?.endsWith(".jsonl")) return;
-          this.processFile(join(dirPath, filename), projectDir);
-        });
-        this.fsWatchers.push(w);
-      } catch {}
+      // Watch main session transcripts at the top level.
+      this.watchJsonlDir(dirPath, projectDir);
+      // Watch subagent transcripts nested under <session-uuid>/subagents/.
+      this.setupSubagentWatchers(dirPath, projectDir);
     }
 
-    // Watch projects dir for new project directories
+    // Watch projects dir for new project directories (and, for live sessions,
+    // new <session-uuid>/ subdirs that will sprout a subagents/ child).
     try {
       const w = watch(this.projectsDir, (eventType, filename) => {
         if (eventType !== "rename" || !filename) return;
@@ -493,13 +580,10 @@ export class ClaudeCodeAgentWatcher implements AgentWatcher {
         try { if (!require("fs").statSync(dirPath).isDirectory()) return; } catch { return; }
 
         const projectDir = decodeProjectDir(filename);
-        try {
-          const sub = watch(dirPath, (_et, fn) => {
-            if (!fn?.endsWith(".jsonl")) return;
-            this.processFile(join(dirPath, fn), projectDir);
-          });
-          this.fsWatchers.push(sub);
-        } catch {}
+        // Watch the new project dir for main-session .jsonl files plus any
+        // existing or future <session-uuid>/subagents/ subdirs.
+        this.watchJsonlDir(dirPath, projectDir);
+        this.setupSubagentWatchers(dirPath, projectDir);
       });
       this.fsWatchers.push(w);
     } catch {}
