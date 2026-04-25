@@ -665,7 +665,44 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       }
     }
 
-    const sessions: SessionData[] = orderedMuxSessions.map(({ name, createdAt, windows, dir, provider }) => {
+    // Build windowId -> agent mapping by scanning pane process trees directly
+    const windowAgentMap = new Map<string, { agent: string; status: import("../contracts/agent").AgentStatus }>();
+    try {
+      const raw = shell(["tmux", "list-panes", "-a", "-F", "#{session_name}|#{pane_id}|#{pane_pid}|#{window_id}|#{pane_title}"]);
+      const sidebarPaneIds = new Set<string>();
+      for (const { panes: sbPanes } of listSidebarPanesByProvider()) {
+        for (const sb of sbPanes) sidebarPaneIds.add(sb.paneId);
+      }
+      const tree = buildProcessTree();
+      for (const line of raw.split("\n")) {
+        if (!line) continue;
+        const i1 = line.indexOf("|");
+        const i2 = line.indexOf("|", i1 + 1);
+        const i3 = line.indexOf("|", i2 + 1);
+        const i4 = line.indexOf("|", i3 + 1);
+        const paneSession = line.slice(0, i1);
+        const paneId = line.slice(i1 + 1, i2);
+        const panePid = parseInt(line.slice(i2 + 1, i3), 10);
+        const windowId = line.slice(i3 + 1, i4);
+        const paneTitle = line.slice(i4 + 1);
+        if (sidebarPaneIds.has(paneId)) continue;
+        if (paneTitle === "opensessions-sidebar") continue;
+        for (const [agentName, patterns] of Object.entries(AGENT_TITLE_PATTERNS)) {
+          if (!matchProcessTreeFast(panePid, patterns, tree)) continue;
+          // Get the best status from the tracker for this agent in this session
+          const agents = tracker.getAgents(paneSession);
+          const agentEvent = agents.find((a) => a.agent === agentName);
+          const status = agentEvent?.status ?? "idle";
+          const existing = windowAgentMap.get(windowId);
+          // Keep the most active status if multiple agents in same window
+          if (!existing || STATUS_PRIORITY[status] > STATUS_PRIORITY[existing.status]) {
+            windowAgentMap.set(windowId, { agent: agentName, status });
+          }
+        }
+      }
+    } catch {}
+
+    const sessions: SessionData[] = orderedMuxSessions.map(({ name, createdAt, windows, windowList, dir, provider }) => {
       sessionProviders.set(name, provider);
       const git = getGitInfo(dir);
       const providerPaneCounts = paneCountMaps.get(provider);
@@ -694,6 +731,14 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         ports: getSessionPorts(name),
         localLinks: buildLocalLinks(getSessionPorts(name), portlessState),
         windows,
+        windowList: (windowList ?? []).map((w) => {
+          const winAgent = windowAgentMap.get(w.id);
+          return {
+            ...w,
+            agentStatus: winAgent?.status,
+            agentName: winAgent?.agent,
+          };
+        }),
         uptime,
         agentState: tracker.getState(name),
         agents: tracker.getAgents(name),
@@ -1498,6 +1543,11 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     opencode: ["opencode"],
   };
 
+  const STATUS_PRIORITY: Record<string, number> = {
+    "tool-running": 7, running: 6, error: 5, stale: 4,
+    interrupted: 3, waiting: 2, done: 1, idle: 0,
+  };
+
   const PANE_HIGHLIGHT_BORDER = "fg=#fab387,bold";
   const PANE_HIGHLIGHT_MS = 300;
   const pendingHighlightResets = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1985,6 +2035,24 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
             }, 1500);
           }
         }
+        break;
+      }
+      case "switch-window": {
+        const clientSess = clientSessionNames.get(ws);
+        const tty = (clientSess ? clientTtyBySession.get(clientSess) : undefined)
+          ?? cmd.clientTty ?? clientTtys.get(ws);
+        const p = sessionProviders.get(cmd.sessionName) ?? mux;
+        p.switchSession(cmd.sessionName, tty);
+        // Select the target window by index
+        try {
+          Bun.spawnSync(["tmux", "select-window", "-t", `${cmd.sessionName}:${cmd.windowIndex}`], {
+            stdout: "pipe", stderr: "pipe",
+          });
+        } catch {}
+        focusedSession = cmd.sessionName;
+        cachedCurrentSession = cmd.sessionName;
+        cachedCurrentSessionTs = Date.now();
+        broadcastFocusOnly();
         break;
       }
       case "switch-index": {

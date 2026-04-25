@@ -5,11 +5,20 @@ export type MuxSpecificationVersion = "v1";
 
 // ─── Core data types ─────────────────────────────────────────────────────────
 
+export interface MuxWindowInfo {
+  readonly id: string;
+  readonly index: number;
+  readonly name: string;
+  readonly active: boolean;
+  readonly paneCount: number;
+}
+
 export interface MuxSessionInfo {
   readonly name: string;
   readonly createdAt: number;
   readonly dir: string;
   readonly windows: number;
+  readonly windowList?: readonly MuxWindowInfo[];
 }
 
 export interface ActiveWindow {

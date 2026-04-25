@@ -1,6 +1,7 @@
 export type {
   MuxProvider,
   MuxProviderV1,
+  MuxWindowInfo,
   MuxSessionInfo,
   ActiveWindow,
   SidebarPane,
@@ -48,6 +49,7 @@ export {
 } from "./shared";
 export type {
   SessionData,
+  WindowData,
   ServerState,
   FocusUpdate,
   ResizeNotify,

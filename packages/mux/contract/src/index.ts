@@ -1,6 +1,7 @@
 // ─── Types ───────────────────────────────────────────────────────────────────
 export type {
   MuxSpecificationVersion,
+  MuxWindowInfo,
   MuxSessionInfo,
   ActiveWindow,
   SidebarPane,
