@@ -24,6 +24,7 @@ export { AgentTracker } from "./agents/tracker";
 export { AmpAgentWatcher } from "./agents/watchers/amp";
 export { ClaudeCodeAgentWatcher } from "./agents/watchers/claude-code";
 export { CodexAgentWatcher } from "./agents/watchers/codex";
+export { DroidAgentWatcher } from "./agents/watchers/droid";
 export { OpenCodeAgentWatcher } from "./agents/watchers/opencode";
 export { PiAgentWatcher } from "./agents/watchers/pi";
 export { MuxRegistry } from "./mux/registry";
