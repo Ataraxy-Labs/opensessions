@@ -465,4 +465,96 @@ describe("ClaudeCodeAgentWatcher", () => {
     const runningEvents = postSeed.filter((e) => e.status === "running");
     expect(runningEvents.length).toBeGreaterThanOrEqual(1);
   });
+
+  test("seeds subagent transcripts nested under <session-uuid>/subagents/", async () => {
+    const projDir = join(tmpDir, "-projects-myapp");
+    mkdirSync(projDir, { recursive: true });
+
+    // Main session transcript (running)
+    const mainSessionId = "01afc0dd-c3cd-4cdf-953b-29f621478d90";
+    writeFileSync(
+      join(projDir, `${mainSessionId}.jsonl`),
+      JSON.stringify({ message: { role: "user", content: "parent prompt" } }) + "\n",
+    );
+
+    // Two subagent transcripts in <mainSessionId>/subagents/
+    const subagentsDir = join(projDir, mainSessionId, "subagents");
+    mkdirSync(subagentsDir, { recursive: true });
+    writeFileSync(
+      join(subagentsDir, "agent-af575bd0d1edc3250.jsonl"),
+      JSON.stringify({ message: { role: "user", content: "research volue" } }) + "\n",
+    );
+    writeFileSync(
+      join(subagentsDir, "agent-afd87e8897eb5b3aa.jsonl"),
+      JSON.stringify({ message: { role: "user", content: "audit opensessions" } }) + "\n",
+    );
+    // Non-jsonl sibling files must be ignored (meta.json exists alongside each subagent transcript)
+    writeFileSync(join(subagentsDir, "agent-af575bd0d1edc3250.meta.json"), "{}");
+
+    watcher.start(ctx);
+    await watcher.flush();
+
+    const threadIds = events.map((e) => e.threadId).sort();
+    expect(threadIds).toEqual([
+      mainSessionId,
+      "agent-af575bd0d1edc3250",
+      "agent-afd87e8897eb5b3aa",
+    ].sort());
+    expect(new Set(events.map((e) => e.session))).toEqual(new Set(["myapp-session"]));
+  });
+
+  test("picks up a subagent file that appears after seed (live spawn)", async () => {
+    const projDir = join(tmpDir, "-projects-myapp");
+    mkdirSync(projDir, { recursive: true });
+
+    const mainSessionId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    writeFileSync(
+      join(projDir, `${mainSessionId}.jsonl`),
+      JSON.stringify({ message: { role: "user", content: "parent prompt" } }) + "\n",
+    );
+
+    watcher.start(ctx);
+    await watcher.flush();
+    const seedCount = events.length;
+
+    // Subagent dir appears after seed (the way Claude Code actually spawns them).
+    const subagentsDir = join(projDir, mainSessionId, "subagents");
+    mkdirSync(subagentsDir, { recursive: true });
+    writeFileSync(
+      join(subagentsDir, "agent-deadbeefcafef00d.jsonl"),
+      JSON.stringify({ message: { role: "user", content: "spawned subagent" } }) + "\n",
+    );
+    await watcher.flush();
+
+    const postSeed = events.slice(seedCount);
+    const subEvents = postSeed.filter((e) => e.threadId === "agent-deadbeefcafef00d");
+    expect(subEvents.length).toBeGreaterThanOrEqual(1);
+    expect(subEvents[0]!.session).toBe("myapp-session");
+  });
+
+  test("does not descend into non-UUID subdirectories", async () => {
+    const projDir = join(tmpDir, "-projects-myapp");
+    mkdirSync(projDir, { recursive: true });
+
+    writeFileSync(
+      join(projDir, "session-main.jsonl"),
+      JSON.stringify({ message: { role: "user", content: "main" } }) + "\n",
+    );
+
+    // Non-UUID subdir that happens to contain a subagents/ with a .jsonl file.
+    // We must not pick this up — only real Claude Code session UUID dirs count.
+    const bogusDir = join(projDir, "not-a-session", "subagents");
+    mkdirSync(bogusDir, { recursive: true });
+    writeFileSync(
+      join(bogusDir, "agent-bogus.jsonl"),
+      JSON.stringify({ message: { role: "user", content: "bogus" } }) + "\n",
+    );
+
+    watcher.start(ctx);
+    await watcher.flush();
+
+    const threadIds = events.map((e) => e.threadId);
+    expect(threadIds).toContain("session-main");
+    expect(threadIds).not.toContain("agent-bogus");
+  });
 });
