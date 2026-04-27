@@ -5,6 +5,7 @@ import type { SessionFilterMode } from "./config";
 export const SERVER_PORT = 7391;
 export const SERVER_HOST = "127.0.0.1";
 export const PID_FILE = "/tmp/opensessions.pid";
+export const TOKEN_FILE = "/tmp/opensessions.token";
 export const SERVER_IDLE_TIMEOUT_MS = 30_000;
 export const STUCK_RUNNING_TIMEOUT_MS = 3 * 60 * 1000;
 
@@ -42,8 +43,6 @@ export interface ServerState {
   theme: string | undefined;
   sessionFilter: SessionFilterMode | undefined;
   sidebarWidth: number;
-  initializing: boolean;
-  initLabel?: string;
   ts: number;
 }
 

@@ -1,5 +1,5 @@
 import { render } from "@opentui/solid";
-import { appendFileSync } from "fs";
+import { appendFileSync, readFileSync } from "fs";
 import { createSignal, createEffect, onCleanup, onMount, batch, For, Show, createMemo, createSelector, type Accessor } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { useKeyboard, useRenderer } from "@opentui/solid";
@@ -16,6 +16,7 @@ import {
   TERMINAL_STATUSES,
   SERVER_PORT,
   SERVER_HOST,
+  TOKEN_FILE,
   BUILTIN_THEMES,
   loadConfig,
   resolveTheme,
@@ -231,8 +232,6 @@ function App() {
 
   // --- Session filter (synced from server) ---
   const [sessionFilter, setSessionFilter] = createSignal<SessionFilterMode>("all");
-  const [initializing, setInitializing] = createSignal(false);
-  const [initLabel, setInitLabel] = createSignal("");
 
   const filteredSessions = createMemo(() => {
     const mode = sessionFilter();
@@ -529,7 +528,9 @@ function App() {
       renderer.removeListener("capabilities", doStartupRefocus);
     });
 
-    const socket = new WebSocket(`ws://${SERVER_HOST}:${SERVER_PORT}`);
+    let authToken = "";
+    try { authToken = readFileSync(TOKEN_FILE, "utf-8").trim(); } catch {}
+    const socket = new WebSocket(`ws://${SERVER_HOST}:${SERVER_PORT}?token=${authToken}`);
     ws = socket;
 
     socket.onopen = () => {
@@ -577,22 +578,13 @@ function App() {
             }
 
             setSessions(reconcile(msg.sessions, { key: "name" }));
-            // Don't override user's focused session during initialization —
-            // staggered spawns cause frequent state broadcasts that would
-            // keep yanking focus away from what the user is looking at.
-            if (!msg.initializing) {
-              setFocusedSession(startupFocus);
-            }
+            setFocusedSession(startupFocus);
             setCurrentSession(msg.currentSession);
             setTheme(resolveTheme(msg.theme));
             setSessionFilter(msg.sessionFilter ?? "all");
-            setInitializing(msg.initializing ?? false);
-            setInitLabel(msg.initLabel ?? "");
           } else if (msg.type === "focus") {
-            if (!initializing()) {
-              setFocusedSession(msg.focusedSession);
-              setCurrentSession(msg.currentSession);
-            }
+            setFocusedSession(msg.focusedSession);
+            setCurrentSession(msg.currentSession);
           } else if (msg.type === "your-session") {
             setMySession(msg.name);
             setCurrentSession(msg.name);
@@ -640,7 +632,7 @@ function App() {
   );
 
   createEffect(() => {
-    if (!hasRunning() && !initializing()) return;
+    if (!hasRunning()) return;
     const interval = setInterval(() => {
       setSpinIdx((i) => (i + 1) % SPINNERS.length);
     }, 120);
@@ -840,7 +832,6 @@ function App() {
             <span style={{ fg: P().lavender, attributes: DIM }}>{" "}{"⏻ "}{FILTER_LABELS[sessionFilter()]}</span>
           </Show>
           {runningCount() > 0 ? <span style={{ fg: P().yellow }}>{" "}{"⚡"}{runningCount()}</span> : ""}
-          <Show when={initializing()}><span style={{ fg: P().peach, attributes: DIM }}>{" "}{"◐◓◑◒"[spinIdx() % 4]} {initLabel() || "warming up…"}</span></Show>
           <Show when={flashMessage()}><span style={{ fg: P().overlay0, attributes: DIM }}>{" "}{flashMessage()}</span></Show>
           {errorCount() > 0 ? <span style={{ fg: P().red }}>{" "}{"✗"}{errorCount()}</span> : ""}
           {unseenCount() > 0 ? <span style={{ fg: P().teal }}>{" "}{"●"}{" "}{unseenCount()}</span> : ""}

@@ -36,4 +36,7 @@ export interface AgentWatcher {
 
   /** Stop watching and clean up resources. */
   stop(): void;
+
+  /** Trigger an immediate poll/refresh cycle (optional). */
+  refresh?(): void;
 }

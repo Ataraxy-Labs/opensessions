@@ -88,7 +88,7 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     const base = `http://${serverHost}:${serverPort}`;
     const hookPost = (path: string, data?: string) => {
       const body = data ? ` -d '${data}'` : "";
-      return `run-shell -b "curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST ${base}${path}${body} >/dev/null 2>&1 || true"`;
+      return `run-shell -b "curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST -H 'x-opensessions-token: '$(cat /tmp/opensessions.token 2>/dev/null) ${base}${path}${body} >/dev/null 2>&1 || true"`;
     };
     // tmux expands #{} formats at hook-fire time — no need for $(tmux display-message)
     // Use | as field separator (safe for session names, window IDs, TTYs)
@@ -128,7 +128,7 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
 
   listActiveWindows(): ActiveWindow[] {
     return tmux.listWindows()
-      .filter((w) => w.sessionName !== STASH_SESSION)
+      .filter((w) => w.active && w.sessionName !== STASH_SESSION)
       .map((w) => ({ id: w.id, sessionName: w.sessionName, active: w.active }));
   }
 
@@ -194,7 +194,7 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
       if (stashedPane) {
         plog("spawnSidebar: restoring from stash", { paneId: stashedPane.id, target: targetPane.id });
         const joinFlag = position === "left" ? "-hb" : "-h";
-        rawTmux(["join-pane", joinFlag, "-d", "-f", "-l", String(width), "-s", stashedPane.id, "-t", targetPane.id]);
+        rawTmux(["join-pane", joinFlag, "-f", "-l", String(width), "-s", stashedPane.id, "-t", targetPane.id]);
         tmux.setPaneTitle(stashedPane.id, SIDEBAR_PANE_TITLE);
         // Do NOT selectPane here — same as fresh spawns. The TUI's
         // restoreTerminalModes fires on focus-in after join-pane, generating
@@ -230,24 +230,11 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
 
   hideSidebar(paneId: string): void {
     this.ensureStash();
+    // Ensure the stash window is large enough to accept another pane.
+    // join-pane fails with "pane too small" when stash panes fill up.
+    rawTmux(["resize-window", "-t", `${STASH_SESSION}:`, "-x", "200", "-y", "200"]);
     plog("hideSidebar: stashing pane", { paneId });
-    // Try join-pane into the last stash window; if it fails (pane too small),
-    // create a new stash window, resize it, and retry.
-    const lastWindow = () => {
-      const wins = rawTmux(["list-windows", "-t", STASH_SESSION, "-F", "#{window_id}"]);
-      const ids = wins.split("\n").filter(Boolean);
-      return ids[ids.length - 1] ?? `${STASH_SESSION}:`;
-    };
-    let target = lastWindow();
-    rawTmux(["resize-window", "-t", target, "-x", "200", "-y", "200"]);
-    const r = Bun.spawnSync(["tmux", "join-pane", "-d", "-s", paneId, "-t", target], { stdout: "pipe", stderr: "pipe" });
-    if (r.exitCode !== 0) {
-      plog("hideSidebar: stash full, creating new window", { paneId });
-      rawTmux(["new-window", "-d", "-t", `${STASH_SESSION}:`]);
-      target = lastWindow();
-      rawTmux(["resize-window", "-t", target, "-x", "200", "-y", "200"]);
-      rawTmux(["join-pane", "-d", "-s", paneId, "-t", target]);
-    }
+    rawTmux(["join-pane", "-d", "-s", paneId, "-t", `${STASH_SESSION}:`]);
   }
 
   killSidebarPane(paneId: string): void {
@@ -256,22 +243,6 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
 
   resizeSidebarPane(paneId: string, width: number): void {
     tmux.resizePane(paneId, { width });
-  }
-
-  /**
-   * Force-resize a window to the given dimensions, triggering tmux to
-   * re-layout its panes. Used after monitor switches to pre-layout
-   * background windows so they don't need re-layout on focus.
-   */
-  resizeWindow(windowId: string, width: number, height: number): void {
-    rawTmux(["resize-window", "-t", windowId, "-x", String(width), "-y", String(height)]);
-  }
-
-  /** Get the current client dimensions. */
-  getClientSize(): { width: number; height: number } | null {
-    const clients = tmux.listClients();
-    if (clients.length === 0) return null;
-    return { width: clients[0]!.width, height: clients[0]!.height };
   }
 
   killOrphanedSidebarPanes(): void {

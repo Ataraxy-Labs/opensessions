@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync, appendFileSync, watch, type FSWatcher } from "fs";
+import { randomBytes } from "crypto";
 import { join } from "path";
 import { homedir } from "os";
 import type { MuxProvider } from "../contracts/mux";
@@ -22,6 +23,7 @@ import {
   SERVER_PORT,
   SERVER_HOST,
   PID_FILE,
+  TOKEN_FILE,
   SERVER_IDLE_TIMEOUT_MS,
   STUCK_RUNNING_TIMEOUT_MS,
 } from "../shared";
@@ -57,7 +59,6 @@ interface GitInfo {
 
 const gitInfoCache = new Map<string, { info: GitInfo; ts: number }>();
 const GIT_CACHE_TTL_MS = 5000;
-const SPAWN_STAGGER_MS = 500;
 
 function getGitInfo(dir: string): GitInfo {
   if (!dir) return { branch: "", dirty: false, isWorktree: false };
@@ -65,20 +66,15 @@ function getGitInfo(dir: string): GitInfo {
   const cached = gitInfoCache.get(dir);
   if (cached && Date.now() - cached.ts < GIT_CACHE_TTL_MS) return cached.info;
 
-  const out = shell([
-    "sh", "-c",
-    `cd "${dir}" 2>/dev/null && git rev-parse --abbrev-ref HEAD --git-dir 2>/dev/null && echo "---" && git status --porcelain 2>/dev/null`,
-  ]);
-  if (!out) return { branch: "", dirty: false, isWorktree: false };
-  const sepIdx = out.indexOf("---");
-  const headerPart = sepIdx >= 0 ? out.slice(0, sepIdx).trim() : out.trim();
-  const statusPart = sepIdx >= 0 ? out.slice(sepIdx + 3).trim() : "";
-  const lines = headerPart.split("\n");
+  const headOut = shell(["git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD", "--git-dir"]);
+  const statusOut = shell(["git", "-C", dir, "status", "--porcelain"]);
+  if (!headOut) return { branch: "", dirty: false, isWorktree: false };
+  const lines = headOut.split("\n");
   const branch = lines[0] ?? "";
   const gitDir = lines[1] ?? "";
   const info: GitInfo = {
     branch,
-    dirty: statusPart.length > 0,
+    dirty: statusOut.length > 0,
     isWorktree: gitDir.includes("/worktrees/"),
   };
   gitInfoCache.set(dir, { info, ts: Date.now() });
@@ -377,10 +373,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   let focusedSession: string | null = null;
   let lastState: ServerState | null = null;
   let clientCount = 0;
-  let initializing = false;
-  let initLabel = "";
-  let initializingTimer: ReturnType<typeof setTimeout> | null = null;
-  let resizeStaggerTimers: ReturnType<typeof setTimeout>[] = [];
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   const clientTtys = new WeakMap<object, string>();
   const clientSessionNames = new WeakMap<object, string>();
@@ -390,7 +382,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const clientTtyBySession = new Map<string, string>();
 
   function sendYourSession(ws: any, sessionName: string, clientTty?: string | null): void {
+    const prev = clientSessionNames.get(ws);
     clientSessionNames.set(ws, sessionName);
+    log("sendYourSession", "sent", { prev, sessionName, clientTty: clientTty ?? null });
     ws.send(JSON.stringify({
       type: "your-session",
       name: sessionName,
@@ -398,13 +392,14 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }));
   }
 
-  function syncClientSessionsForTty(clientTty: string | undefined, sessionName: string): void {
+  /** Update server-side TTY→session bookkeeping without pushing your-session
+   *  to TUI clients. Each TUI's mySession is set once at startup via
+   *  identify-pane; session switches update currentSession through the
+   *  focus broadcast path instead. */
+  function syncTtyMapping(clientTty: string | undefined, sessionName: string): void {
     if (!clientTty) return;
     clientTtyBySession.set(sessionName, clientTty);
-    for (const ws of connectedClients) {
-      if (clientTtys.get(ws) !== clientTty) continue;
-      sendYourSession(ws, sessionName, clientTty);
-    }
+    log("syncTtyMapping", "updated", { clientTty, sessionName });
   }
 
   function getCurrentSession(): string | null {
@@ -500,7 +495,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       focusedSession = sessions.find((s) => s.name === currentSession)?.name ?? sessions[0]!.name;
     }
 
-    return { type: "state", sessions, focusedSession, currentSession, theme: currentTheme, sessionFilter: currentFilter, sidebarWidth, initializing, initLabel, ts: Date.now() };
+    return { type: "state", sessions, focusedSession, currentSession, theme: currentTheme, sessionFilter: currentFilter, sidebarWidth, ts: Date.now() };
   }
 
   let broadcastPending = false;
@@ -575,6 +570,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     invalidateCurrentSessionCache();
     // Rescan pane agents when session focus changes
     refreshPaneAgents();
+    for (const w of allWatchers) {
+      if ('refresh' in w && typeof w.refresh === 'function') w.refresh();
+    }
     const hadUnseen = tracker.handleFocus(name);
     if (hadUnseen && lastState) {
       // Patch unseen flags in-place — avoids a full computeState with many subprocesses
@@ -710,87 +708,28 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         }
       }
       sidebarVisible = false;
-      initializing = false;
-      initLabel = "";
-      if (initializingTimer) { clearTimeout(initializingTimer); initializingTimer = null; }
-      for (const t of resizeStaggerTimers) clearTimeout(t);
-      resizeStaggerTimers = [];
     } else {
       sidebarVisible = true;
       setPendingEnforcement();
-      invalidateSidebarPaneCache();
-
-      // Prioritized spawn order:
-      // 1. Current active window (instant)
-      // 2. Other windows in the current session
-      // 3. Windows in other sessions (staggered)
-      const curSession = ctx?.session ?? getCurrentSession();
-
-      // Track max delay to know when all spawns are done
-      let maxDelay = 0;
-
       for (const p of providers) {
         const allWindows = p.listActiveWindows();
-        log("toggle", recoverVisibleState ? "RECOVER — ensuring all windows" : "ON — spawning in all windows", {
+        log("toggle", recoverVisibleState ? "RECOVER — ensuring active windows" : "ON — spawning in active windows", {
           provider: p.name,
-          total: allWindows.length,
-          currentSession: curSession,
+          count: allWindows.length,
         });
-
-        // Tier 1: current active window (instant)
-        const curWindowId = ctx?.windowId ?? p.getCurrentWindowId();
-        if (curSession && curWindowId) {
-          const activeWindow = allWindows.find((w) => w.sessionName === curSession && w.id === curWindowId);
-          if (activeWindow) {
-            log("toggle", "tier1: active window", { session: curSession, windowId: curWindowId });
-            ensureSidebarInWindow(p, { session: activeWindow.sessionName, windowId: activeWindow.id });
-          }
+        for (const w of allWindows) {
+          ensureSidebarInWindow(p, { session: w.sessionName, windowId: w.id });
         }
-
-        // Tier 2: other windows in current session (slight delay)
-        const tier2 = allWindows.filter((w) => w.sessionName === curSession && w.id !== curWindowId);
-        // Tier 3: windows in other sessions
-        const tier3 = allWindows.filter((w) => w.sessionName !== curSession);
-
-        log("toggle", "spawn plan", { tier2: tier2.length, tier3: tier3.length });
-
-        // Stagger background spawns — each ensureSidebarInWindow blocks ~100ms
-        // with sync tmux calls, so space them out to keep the event loop responsive.
-        let delay = SPAWN_STAGGER_MS;
-        for (const w of tier2) {
-          const win = w;
-          const prov = p;
-          setTimeout(() => {
-            if (sidebarVisible) ensureSidebarInWindow(prov, { session: win.sessionName, windowId: win.id });
-          }, delay);
-          delay += SPAWN_STAGGER_MS;
-        }
-        for (const w of tier3) {
-          const win = w;
-          const prov = p;
-          setTimeout(() => {
-            if (sidebarVisible) ensureSidebarInWindow(prov, { session: win.sessionName, windowId: win.id });
-          }, delay);
-          delay += SPAWN_STAGGER_MS;
-        }
-        if (delay > maxDelay) maxDelay = delay;
       }
-
-      // Set initializing state during stagger
-      if (maxDelay > 0) {
-        initializing = true;
-        initLabel = "warming up…";
-        if (initializingTimer) clearTimeout(initializingTimer);
-        initializingTimer = setTimeout(() => {
-          initializingTimer = null;
-          initializing = false;
-          initLabel = "";
-          log("toggle", "initializing complete");
-          broadcastState();
-        }, maxDelay + 500); // extra 500ms buffer for last spawn to finish
-      }
-
-      scheduleSidebarWidthEnforcement();
+      enforceSidebarWidth();
+      // Re-enforce after a short delay — stash restores via join-pane may not
+      // have their final geometry yet when the first enforce runs.
+      setTimeout(() => {
+        if (sidebarVisible) {
+          setPendingEnforcement();
+          enforceSidebarWidth();
+        }
+      }, 200);
       server.publish("sidebar", JSON.stringify({ type: "re-identify" }));
     }
     log("toggle", "done", { sidebarVisible });
@@ -830,8 +769,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }
 
     // Use cached pane listing to avoid redundant tmux list-panes -a calls
-    // Invalidate before check — staggered spawns change pane state between calls
-    invalidateSidebarPaneCache();
     const allPanesByProvider = listSidebarPanesByProvider();
     const providerEntry = allPanesByProvider.find((e) => e.provider === p);
     const existingPanes = providerEntry?.panes ?? [];
@@ -859,8 +796,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }
     // Always enforce width — session switches can change window width,
     // causing tmux to proportionally redistribute pane sizes.
-    // Call directly (not scheduled) since we're already behind debouncedEnsureSidebar.
-    setPendingEnforcement();
     enforceSidebarWidth();
   }
 
@@ -870,32 +805,14 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   let ensureSidebarPendingCtx: { session: string; windowId: string } | undefined;
 
   function debouncedEnsureSidebar(ctx?: { session: string; windowId: string }): void {
-   if (ctx) ensureSidebarPendingCtx = ctx;
-   if (ensureSidebarTimer) clearTimeout(ensureSidebarTimer);
-   ensureSidebarTimer = setTimeout(() => {
-     ensureSidebarTimer = null;
-     const nextCtx = ensureSidebarPendingCtx;
-     ensureSidebarPendingCtx = undefined;
-     ensureSidebarInWindow(undefined, nextCtx);
-   }, 150);
-  }
-
-  // Debounced width enforcement — collapses resize storms (monitor switch,
-  // terminal resize) into a single tmux resize pass.
-  let sidebarEnforceTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function scheduleSidebarWidthEnforcement(): void {
-   if (!sidebarVisible) return;
-   log("scheduleEnforce", "scheduling debounced enforcement", { sidebarWidth });
-   setPendingEnforcement();
-   if (sidebarEnforceTimer) clearTimeout(sidebarEnforceTimer);
-   sidebarEnforceTimer = setTimeout(() => {
-     sidebarEnforceTimer = null;
-     log("scheduleEnforce", "FIRING debounced enforcement", { sidebarVisible, sidebarWidth });
-     if (sidebarVisible) {
-       enforceSidebarWidth();
-     }
-   }, 150);
+    if (ctx) ensureSidebarPendingCtx = ctx;
+    if (ensureSidebarTimer) clearTimeout(ensureSidebarTimer);
+    ensureSidebarTimer = setTimeout(() => {
+      ensureSidebarTimer = null;
+      const nextCtx = ensureSidebarPendingCtx;
+      ensureSidebarPendingCtx = undefined;
+      ensureSidebarInWindow(undefined, nextCtx);
+    }, 150);
   }
 
   function quitAll(): void {
@@ -919,46 +836,37 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   // --- Sidebar width enforcement ---
 
-  // When true, report-width messages from TUIs are SIGWINCH echoes caused
-  // by server-side tmux resizes — ignore them instead of treating as user drag.
-  // Auto-expires after 500ms.
+  // When true, the next report-width from a TUI is a proportional resize echo
+  // (caused by session switch, terminal resize, etc.), NOT a user drag.
+  // Set by /focus, /ensure-sidebar, /client-resized hooks; cleared by report-width
+  // or auto-expires after 500ms (in case no SIGWINCH fires, e.g. width didn't change).
   let pendingEnforcement = false;
   let pendingEnforcementTimer: ReturnType<typeof setTimeout> | null = null;
 
   function setPendingEnforcement() {
-    log("pendingEnforcement", "SET");
     pendingEnforcement = true;
     if (pendingEnforcementTimer) clearTimeout(pendingEnforcementTimer);
     pendingEnforcementTimer = setTimeout(() => {
       if (pendingEnforcement) {
-        log("pendingEnforcement", "EXPIRED (500ms)");
         pendingEnforcement = false;
       }
       pendingEnforcementTimer = null;
     }, 500);
   }
 
-  let enforcing = false;
-
   function enforceSidebarWidth(skipSession?: string) {
-    if (enforcing) {
-      log("enforce", "SKIPPED — re-entrancy guard");
-      return;
-    }
-    enforcing = true;
-    log("enforce", "START", { sidebarWidth, skipSession, pendingEnforcement });
-    try {
-      invalidateSidebarPaneCache();
-      for (const { provider, panes } of listSidebarPanesByProvider()) {
-        for (const pane of panes) {
-          if (pane.width === sidebarWidth) continue;
-          if (skipSession && pane.sessionName === skipSession) continue;
-          log("enforce", `${pane.paneId} ${pane.width}→${sidebarWidth}`);
-          provider.resizeSidebarPane(pane.paneId, sidebarWidth);
+    invalidateSidebarPaneCache();
+    for (const { provider, panes } of listSidebarPanesByProvider()) {
+      for (const pane of panes) {
+        if (pane.width === sidebarWidth) {
+          continue;
         }
+        if (skipSession && pane.sessionName === skipSession) {
+          continue;
+        }
+        log("enforce", `${pane.paneId} ${pane.width}→${sidebarWidth}`);
+        provider.resizeSidebarPane(pane.paneId, sidebarWidth);
       }
-    } finally {
-      enforcing = false;
     }
   }
 
@@ -1352,7 +1260,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         }
 
         p.switchSession(cmd.name, tty);
-        syncClientSessionsForTty(tty, cmd.name);
+        syncTtyMapping(tty, cmd.name);
 
         // Optimistic server-side focus update — so other TUI instances see the
         // change immediately via broadcastFocusOnly, without waiting for the
@@ -1471,7 +1379,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         break;
       case "report-width": {
         if (!sidebarVisible) {
-          log("report-width", "SKIP — sidebar not visible");
           break;
         }
         const reported = clampSidebarWidth(cmd.width);
@@ -1482,25 +1389,28 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         // changes. Background panes still receive resize events, but treating
         // those as user intent causes global width ping-pong across sessions.
         if (!session || !current || session !== current) {
-          log("report-width", "SKIP — not active session", { reported, session, current, pendingEnforcement });
           break;
         }
 
         if (pendingEnforcement) {
-          // Ignore SIGWINCH echoes caused by server-side tmux resizes.
-          log("report-width", "SUPPRESSED (pendingEnforcement)", { reported, sidebarWidth, session });
+          // This report-width is an echo from a previous enforce resize.
+          // Always absorb it to avoid an infinite enforce→resize→report loop.
           break;
         }
-        if (reported === sidebarWidth) {
-          log("report-width", "SKIP — same width", { reported, sidebarWidth });
+        const drift = Math.abs(reported - sidebarWidth);
+        // Ignore ≤ 2 column drift (tmux rounding) and > 20 column jumps
+        // (stale enforcement echoes). Only accept mid-range as user drags.
+        if (drift <= 2) {
           break;
         }
-        const oldWidth = sidebarWidth;
-        log("report-width", "ACCEPTED as user drag", { reported, oldWidth, session });
+        if (drift > 20) {
+          log("report-width", "ignoring large drift (likely stale echo)", { reported, sidebarWidth, drift });
+          enforceSidebarWidth();
+          break;
+        }
         sidebarWidth = reported;
         saveConfig({ sidebarWidth });
         broadcastState();
-        setPendingEnforcement();
         enforceSidebarWidth(session ?? undefined);
         break;
       }
@@ -1528,8 +1438,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     for (const w of allWatchers) w.stop();
     if (watcherBroadcastTimer) clearTimeout(watcherBroadcastTimer);
     if (debounceTimer) clearTimeout(debounceTimer);
-    if (sidebarEnforceTimer) clearTimeout(sidebarEnforceTimer);
-    if (pendingEnforcementTimer) clearTimeout(pendingEnforcementTimer);
     if (portPollTimer) clearInterval(portPollTimer);
     if (paneScanTimer) clearInterval(paneScanTimer);
     for (const timer of pendingHighlightResets.values()) clearTimeout(timer);
@@ -1537,21 +1445,33 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     for (const watcher of gitHeadWatchers.values()) watcher.close();
     gitHeadWatchers.clear();
     if (idleTimer) clearTimeout(idleTimer);
-    if (initializingTimer) clearTimeout(initializingTimer);
-    for (const t of resizeStaggerTimers) clearTimeout(t);
     try { unlinkSync(PID_FILE); } catch {}
+    try { unlinkSync(TOKEN_FILE); } catch {}
     for (const p of allProviders) p.cleanupHooks();
   }
 
   // --- Write PID + start server ---
 
   writeFileSync(PID_FILE, String(process.pid));
+  const authToken = randomBytes(32).toString("hex");
+  writeFileSync(TOKEN_FILE, authToken, { mode: 0o600 });
 
   const server = Bun.serve({
     port: SERVER_PORT,
     hostname: SERVER_HOST,
     async fetch(req, server) {
       const url = new URL(req.url);
+
+      // Allow unauthenticated liveness check on GET / (but not WebSocket upgrades)
+      if (req.method === "GET" && url.pathname === "/" && !req.headers.get("upgrade")) {
+        return new Response("opensessions server", { status: 200 });
+      }
+
+      // Validate auth token for all other requests
+      const reqToken = url.searchParams.get("token") ?? req.headers.get("x-opensessions-token");
+      if (reqToken !== authToken) {
+        return new Response("unauthorized", { status: 401 });
+      }
 
       if (req.method === "POST" && url.pathname === "/refresh") {
         broadcastState();
@@ -1564,7 +1484,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
           const ctx = parseContext(body);
           if (ctx) {
             setPendingEnforcement();
-            syncClientSessionsForTty(ctx.clientTty, ctx.session);
+            syncTtyMapping(ctx.clientTty, ctx.session);
             handleFocus(ctx.session);
           } else {
             // Legacy: body is just the session name
@@ -1585,6 +1505,19 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
           log("http", "POST /toggle", { ctx });
           toggleSidebar(ctx);
           broadcastState();
+        } catch {}
+        return new Response("ok", { status: 200 });
+      }
+
+      if (req.method === "POST" && url.pathname === "/show") {
+        try {
+          const body = await req.text();
+          const ctx = parseContext(body) ?? undefined;
+          log("http", "POST /show", { ctx, sidebarVisible });
+          if (!sidebarVisible) {
+            toggleSidebar(ctx);
+            broadcastState();
+          }
         } catch {}
         return new Response("ok", { status: 200 });
       }
@@ -1615,9 +1548,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
           const ctx = parseContext(body) ?? undefined;
           setPendingEnforcement();
           log("http", "POST /ensure-sidebar", { sidebarVisible, ctx });
-          // Enforce width immediately — window switch causes tmux to
-          // proportionally redistribute panes, fix it before user sees it.
-          if (sidebarVisible) enforceSidebarWidth();
           debouncedEnsureSidebar(ctx ?? undefined);
         } catch {}
         return new Response("ok", { status: 200 });
@@ -1625,53 +1555,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
       // client-resized hook: terminal window changed size — enforce stored width
       if (req.method === "POST" && url.pathname === "/client-resized") {
-        log("http", "POST /client-resized", { sidebarVisible, sidebarWidth, pendingEnforcement });
-        scheduleSidebarWidthEnforcement();
-        // Pre-resize all background windows to the new terminal size so
-        // tmux doesn't need to re-layout (and proportionally resize panes)
-        // when the user switches to them. One final enforce at the end.
+        setPendingEnforcement();
         if (sidebarVisible) {
-          // Cancel any in-flight resize stagger from a previous client-resized
-          for (const t of resizeStaggerTimers) clearTimeout(t);
-          resizeStaggerTimers = [];
-
-          for (const p of getProvidersWithSidebar()) {
-            if (!('resizeWindow' in p && 'getClientSize' in p)) continue;
-            const tp = p as any;
-            const size = tp.getClientSize();
-            if (!size) continue;
-            const allWindows = p.listActiveWindows();
-            let delay = SPAWN_STAGGER_MS;
-            initializing = true;
-            initLabel = "adjusting…";
-            if (initializingTimer) clearTimeout(initializingTimer);
-            broadcastState();
-            for (const w of allWindows) {
-              const win = w;
-              const provider = tp;
-              const { width, height } = size;
-              resizeStaggerTimers.push(setTimeout(() => {
-                if (!sidebarVisible) return;
-                setPendingEnforcement();
-                provider.resizeWindow(win.id, width, height);
-                // Immediately enforce sidebar width in this window to avoid
-                // a visible flash of tmux's proportional redistribution.
-                invalidateSidebarPaneCache();
-                enforceSidebarWidth();
-              }, delay));
-              delay += SPAWN_STAGGER_MS;
-            }
-            // One final enforce after all windows are resized
-            resizeStaggerTimers.push(setTimeout(() => {
-              if (!sidebarVisible) return;
-              setPendingEnforcement();
-              enforceSidebarWidth();
-              initializing = false;
-              initLabel = "";
-              resizeStaggerTimers = [];
-              broadcastState();
-            }, delay));
-          }
+          enforceSidebarWidth();
         }
         return new Response("ok", { status: 200 });
       }
@@ -1680,7 +1566,22 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       if (req.method === "POST" && url.pathname === "/pane-exited") {
         if (sidebarVisible) {
           invalidateSidebarPaneCache();
-          for (const { provider } of listSidebarPanesByProvider()) {
+          // If a sidebar pane is the only pane left in its window, spawn a
+          // new shell pane so the session doesn't become a dead sidebar-only state.
+          for (const { provider, panes } of listSidebarPanesByProvider()) {
+            for (const pane of panes) {
+              const totalPanes = mux.getPaneCount(pane.sessionName);
+              if (totalPanes <= 1) {
+                log("pane-exited", "sidebar is only pane left, spawning shell", { session: pane.sessionName });
+                Bun.spawnSync(["tmux", "split-window", "-t", pane.sessionName, "-h", "-b"], {
+                  stdout: "pipe", stderr: "pipe",
+                });
+                // Re-enforce sidebar width after spawning the new pane
+                invalidateSidebarPaneCache();
+                setPendingEnforcement();
+                enforceSidebarWidth();
+              }
+            }
             provider.killOrphanedSidebarPanes();
           }
         }
@@ -1838,33 +1739,12 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }
     const panesByProvider = reconcileSidebarPresence();
     if (panesByProvider.some(({ panes }) => panes.length > 0)) {
-      const curSession = getCurrentSession();
       for (const p of getProvidersWithSidebar()) {
-        const allWindows = p.listActiveWindows();
-        const curWindowId = p.getCurrentWindowId();
-
-        // Tier 1: current active window (instant)
-        if (curSession && curWindowId) {
-          const activeWindow = allWindows.find((w) => w.sessionName === curSession && w.id === curWindowId);
-          if (activeWindow) {
-            ensureSidebarInWindow(p, { session: activeWindow.sessionName, windowId: activeWindow.id });
-          }
-        }
-
-        // Tier 2 + 3: staggered
-        const tier2 = allWindows.filter((w) => w.sessionName === curSession && w.id !== curWindowId);
-        const tier3 = allWindows.filter((w) => w.sessionName !== curSession);
-        let delay = SPAWN_STAGGER_MS;
-        for (const w of [...tier2, ...tier3]) {
-          const win = w;
-          const prov = p;
-          setTimeout(() => {
-            if (sidebarVisible) ensureSidebarInWindow(prov, { session: win.sessionName, windowId: win.id });
-          }, delay);
-          delay += SPAWN_STAGGER_MS;
+        for (const w of p.listActiveWindows()) {
+          ensureSidebarInWindow(p, { session: w.sessionName, windowId: w.id });
         }
       }
-      scheduleSidebarWidthEnforcement();
+      enforceSidebarWidth();
     }
   }
   // Seed port snapshot before first broadcast so clients see ports immediately

@@ -114,7 +114,12 @@ interface CfAgentStateMessage {
   };
 }
 
-const POLL_MS = 10_000;
+const DTW_WS_BASE = "wss://production.ampworkers.com";
+/** How long to wait before promoting quiet tool boundaries from running → waiting */
+const TOOL_WAIT_MS = 3_000;
+/** How long Amp can stay quiet before we consider the thread stale */
+const STUCK_RUNNING_MS = 2 * 60 * 1000;
+/** Only consider threads updated in the last 5 minutes */
 const RECENT_MS = 5 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 10_000;
 const WS_RETRY_MS = 5_000;
@@ -192,7 +197,14 @@ async function loadAmpUrl(): Promise<string> {
     const settingsPath = join(homedir(), ".config", "amp", "settings.json");
     const raw = await Bun.file(settingsPath).text();
     const settings = JSON.parse(raw);
-    if (settings.url && typeof settings.url === "string") return settings.url.replace(/\/$/, "");
+    if (settings.url && typeof settings.url === "string") {
+      const url = settings.url.replace(/\/$/, "");
+      if (!url.startsWith("https://")) {
+        console.warn(`[amp-watcher] Refusing non-HTTPS Amp URL: ${url}`);
+        return "https://ampcode.com";
+      }
+      return url;
+    }
   } catch {
   }
   return "https://ampcode.com";
@@ -283,6 +295,13 @@ export class AmpAgentWatcher implements AgentWatcher {
     this.ctx = null;
   }
 
+  /** Trigger an immediate poll cycle (e.g., when sidebar is focused). */
+  refresh(): void {
+    if (!this.stopped && this.ctx) {
+      void this.poll(this.lifecycle);
+    }
+  }
+
   private isActive(lifecycle = this.lifecycle): boolean {
     return !this.stopped && this.ctx !== null && this.lifecycle === lifecycle;
   }
@@ -334,10 +353,8 @@ export class AmpAgentWatcher implements AgentWatcher {
     if (!apiKey) return;
 
     await this.poll(lifecycle);
-    if (!this.isActive(lifecycle)) return;
-    this.pollTimer = setInterval(() => {
-      void this.poll(lifecycle);
-    }, POLL_MS);
+    // No periodic polling — rely on on-demand refresh() calls (e.g., sidebar focus).
+    // WebSocket handles real-time status for active threads.
   }
 
   private emitStatus(threadId: string, snapshot: ThreadSnapshot): boolean {
