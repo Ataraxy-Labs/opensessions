@@ -306,6 +306,11 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   let currentTheme: string | undefined = typeof config.theme === "string" ? config.theme : undefined;
   let currentFilter: SessionFilterMode | undefined = config.sessionFilter;
   let systemThemePollTimer: ReturnType<typeof setInterval> | null = null;
+  // Tracks the most recently observed macOS appearance while auto-follow is active.
+  // Used by the `set-theme` handler so a manual override is persisted to the
+  // appearance-specific slot, not to `theme` (which would be clobbered next poll).
+  let autoThemeFollowing = false;
+  let currentSystemMode: "dark" | "light" | undefined;
   const initialSidebarWidth = clampSidebarWidth(config.sidebarWidth ?? 26);
   let sidebarPosition: "left" | "right" = config.sidebarPosition ?? "left";
   const sidebarCoordinator = createSidebarCoordinator({ width: initialSidebarWidth });
@@ -2061,7 +2066,16 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         break;
       case "set-theme":
         currentTheme = cmd.theme;
-        saveConfig({ theme: cmd.theme });
+        if (autoThemeFollowing) {
+          // When auto-follow is active, persist the manual choice to the
+          // appearance-specific slot so the next poll cycle does not silently
+          // overwrite it. Falls back to `theme` if mode hasn't been read yet.
+          if (currentSystemMode === "dark") saveConfig({ darkTheme: cmd.theme });
+          else if (currentSystemMode === "light") saveConfig({ lightTheme: cmd.theme });
+          else saveConfig({ theme: cmd.theme });
+        } else {
+          saveConfig({ theme: cmd.theme });
+        }
         broadcastState();
         break;
       case "set-filter":
@@ -2614,16 +2628,23 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // every few seconds and flip between the configured dark/light themes.
   // macOS does not expose a CLI change-notification; polling is cheap.
   if (config.autoThemeFollowsSystem && process.platform === "darwin") {
+    autoThemeFollowing = true;
     const darkTheme = config.darkTheme ?? "catppuccin-mocha";
     const lightTheme = config.lightTheme ?? "catppuccin-latte";
 
     async function syncSystemTheme() {
       const mode = await readMacSystemAppearance();
-      const desired = themeForSystemMode(mode, darkTheme, lightTheme);
+      currentSystemMode = mode;
+      // Re-read the per-mode theme each cycle so a manual override via the
+      // `set-theme` handler (which writes to `darkTheme` / `lightTheme`) is
+      // picked up on the next poll instead of being silently overwritten.
+      const fresh = loadConfig();
+      const dark = fresh.darkTheme ?? darkTheme;
+      const light = fresh.lightTheme ?? lightTheme;
+      const desired = themeForSystemMode(mode, dark, light);
       if (desired === currentTheme) return;
       log("system-theme", "switching", { mode, from: currentTheme, to: desired });
       currentTheme = desired;
-      saveConfig({ theme: desired });
       broadcastState();
     }
 
