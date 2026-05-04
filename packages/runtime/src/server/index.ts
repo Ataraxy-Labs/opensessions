@@ -2540,6 +2540,11 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // running. Clear any legacy stash session on startup so hidden panes do not
   // keep bloating the tmux server after upgrades.
   for (const p of getProvidersWithSidebar()) p.cleanupSidebar();
+  // Kill stale sidebar panes left over from a previous run — e.g. tmux-resurrect
+  // or tmux-continuum restored panes with the sidebar title but spawned plain
+  // shells instead of the TUI process after a system restart. Must run before
+  // reconcileSidebarPresence so the visibility check sees an accurate count.
+  for (const p of getProvidersWithSidebar()) p.killStaleSidebarPanes();
   const sidebarPresence = reconcileSidebarPresence();
   if (sidebarPresence.visible) {
     for (const { provider } of listSidebarPanesByProvider()) {
