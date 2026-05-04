@@ -387,6 +387,11 @@ export class ZellijProvider implements MuxProviderV1, WindowCapable, SidebarCapa
     // Zellij handles pane lifecycle automatically
   }
 
+  killStaleSidebarPanes(): void {
+    // Zellij does not persist pane state across restarts the way
+    // tmux-resurrect/continuum does, so there is nothing to clean up.
+  }
+
   /**
    * Batch pane count retrieval for all sessions.
    * Only the current session can be queried via `zellij action`.

@@ -85,6 +85,12 @@ export interface SidebarCapable {
   resizeSidebarPane(paneId: string, width: number): void;
   /** Kill sidebar panes that are the only pane left in their window (orphaned). */
   killOrphanedSidebarPanes(): void;
+  /**
+   * Kill stale sidebar panes — panes that retain the sidebar title (e.g. restored
+   * by tmux-resurrect/continuum after a system restart) but no longer have the
+   * TUI process running. Should be called once at server startup.
+   */
+  killStaleSidebarPanes(): void;
   cleanupSidebar(): void;
 }
 
@@ -127,6 +133,7 @@ export function isSidebarCapable(p: MuxProvider): p is MuxProviderV1 & SidebarCa
     typeof p.killSidebarPane === "function" &&
     typeof p.resizeSidebarPane === "function" &&
     typeof p.killOrphanedSidebarPanes === "function" &&
+    typeof p.killStaleSidebarPanes === "function" &&
     typeof p.cleanupSidebar === "function"
   );
 }

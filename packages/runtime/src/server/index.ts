@@ -1733,6 +1733,13 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // --- Bootstrap ---
 
   for (const p of allProviders) p.setupHooks(SERVER_HOST, SERVER_PORT);
+  // Kill stale sidebar panes left over from a previous run — e.g. tmux-resurrect
+  // or tmux-continuum restored panes with the sidebar title but spawned plain
+  // shells instead of the TUI process after a system restart. Must run before
+  // reconcileSidebarPresence so the visibility check sees an accurate count.
+  for (const p of getProvidersWithSidebar()) {
+    p.killStaleSidebarPanes();
+  }
   if (reconcileSidebarPresence()) {
     for (const { provider } of listSidebarPanesByProvider()) {
       provider.killOrphanedSidebarPanes();

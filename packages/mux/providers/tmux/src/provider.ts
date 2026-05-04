@@ -35,6 +35,10 @@ function rawTmux(args: string[]): string {
 
 const STASH_SESSION = "_os_stash";
 const SIDEBAR_PANE_TITLE = "opensessions-sidebar";
+// Pane is stale if it has the sidebar title but its current command is a plain
+// shell — e.g. tmux-resurrect/continuum restored the pane title after a system
+// restart but spawned a default shell instead of the TUI process.
+const SHELL_COMMANDS = new Set(["zsh", "bash", "fish", "sh", "ksh", "dash"]);
 
 export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapable, BatchCapable {
   readonly specificationVersion = "v1" as const;
@@ -100,7 +104,7 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
 
     // client-session-changed: update focus AND ensure sidebar in the new session's window
     tmux.setGlobalHook("client-session-changed", `${focusCmd} ; ${ensureCmd}`);
-    tmux.setGlobalHook("session-created", refreshCmd);
+    tmux.setGlobalHook("session-created", `${refreshCmd} ; ${ensureCmd}`);
     tmux.setGlobalHook("session-closed", refreshCmd);
     tmux.setGlobalHook("after-select-window", ensureCmd);
     tmux.setGlobalHook("after-new-window", ensureCmd);
@@ -153,7 +157,13 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     }
 
     return panes
-      .filter((p) => p.title === SIDEBAR_PANE_TITLE && p.sessionName !== STASH_SESSION)
+      .filter((p) =>
+        p.title === SIDEBAR_PANE_TITLE
+        && p.sessionName !== STASH_SESSION
+        // Exclude stale panes (sidebar title but plain shell — restored by
+        // tmux-resurrect/continuum after restart with no TUI process).
+        && !SHELL_COMMANDS.has(p.command)
+      )
       .map((p) => ({
         paneId: p.id,
         sessionName: p.sessionName,
@@ -243,6 +253,17 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
 
   resizeSidebarPane(paneId: string, width: number): void {
     tmux.resizePane(paneId, { width });
+  }
+
+  killStaleSidebarPanes(): void {
+    const allPanes = tmux.listPanes();
+    for (const p of allPanes) {
+      if (p.title !== SIDEBAR_PANE_TITLE) continue;
+      if (p.sessionName === STASH_SESSION) continue;
+      if (!SHELL_COMMANDS.has(p.command)) continue;
+      plog("killStaleSidebarPanes: killing", { paneId: p.id, command: p.command, session: p.sessionName });
+      tmux.killPane(p.id);
+    }
   }
 
   killOrphanedSidebarPanes(): void {
