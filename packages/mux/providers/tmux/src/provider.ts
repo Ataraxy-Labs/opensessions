@@ -35,6 +35,10 @@ function rawTmux(args: string[]): string {
 
 const STASH_SESSION = "_os_stash";
 const SIDEBAR_PANE_TITLE = "opensessions-sidebar";
+// Pane is stale if it has the sidebar title but its current command is a plain
+// shell — e.g. tmux-resurrect/continuum restored the pane title after a system
+// restart but spawned a default shell instead of the TUI process.
+const SHELL_COMMANDS = new Set(["zsh", "bash", "fish", "sh", "ksh", "dash"]);
 
 export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapable, BatchCapable {
   readonly specificationVersion = "v1" as const;
@@ -152,7 +156,13 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     }
 
     return panes
-      .filter((p) => p.title === SIDEBAR_PANE_TITLE && p.sessionName !== STASH_SESSION)
+      .filter((p) =>
+        p.title === SIDEBAR_PANE_TITLE
+        && p.sessionName !== STASH_SESSION
+        // Exclude stale panes (sidebar title but plain shell — restored by
+        // tmux-resurrect/continuum after restart with no TUI process).
+        && !SHELL_COMMANDS.has(p.command)
+      )
       .map((p) => ({
         paneId: p.id,
         sessionName: p.sessionName,
@@ -232,6 +242,17 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     const clients = tmux.listClients().filter((client) => client.tty.length > 0);
     if (clients.length === 0) return null;
     return { width: clients[0]!.width, height: clients[0]!.height };
+  }
+
+  killStaleSidebarPanes(): void {
+    const allPanes = tmux.listPanes();
+    for (const p of allPanes) {
+      if (p.title !== SIDEBAR_PANE_TITLE) continue;
+      if (p.sessionName === STASH_SESSION) continue;
+      if (!SHELL_COMMANDS.has(p.command)) continue;
+      plog("killStaleSidebarPanes: killing", { paneId: p.id, command: p.command, session: p.sessionName });
+      tmux.killPane(p.id);
+    }
   }
 
   killOrphanedSidebarPanes(): void {

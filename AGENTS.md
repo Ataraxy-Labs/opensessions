@@ -38,6 +38,7 @@ opensessions/
 │       │   ├── tmux/        # @opensessions/mux-tmux — tmux provider
 │       │   └── zellij/      # @opensessions/mux-zellij — experimental zellij provider
 │       └── tmux-sdk/        # @opensessions/tmux-sdk — lower-level tmux command wrapper
+├── ai_logs/           # AI-assisted dev session logs (NN-kebab-case-name.md)
 ├── CONTRACTS.md       # Agent integration guide (Amp, Claude Code, OpenCode, Aider)
 ├── turbo.json         # Turborepo config
 ├── opensessions.tmux  # Root TPM entrypoint
@@ -102,6 +103,7 @@ interface AgentWatcher {
 - **Built-in watchers in runtime**: Amp, Claude Code, Codex, and OpenCode have built-in watchers in `packages/runtime/src/agents/watchers/`. Community agents use the `AgentWatcher` plugin interface.
 - **OpenTUI Solid**: JSX needs `bunfig.toml` preload and `jsxImportSource: "@opentui/solid"` in tsconfig. Build needs `solidPlugin`.
 - **Never call `process.exit()` directly in TUI**: Use `renderer.destroy()`.
+- **AI session logs**: Always write AI-assisted dev session logs to `ai_logs/` at the project root (this directory — `~/repos/github/opensessions/ai_logs/`), not inside any TPM-installed clone (e.g. `~/.tmux/plugins/opensessions/`). Use the `ai-session-logger` skill's `NN-kebab-case-name.md` convention.
 
 ## Common Commands
 
