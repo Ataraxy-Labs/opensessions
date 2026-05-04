@@ -2,15 +2,18 @@
  * macOS system-appearance helpers.
  *
  * On macOS, the global "Appearance" preference (System Settings → Appearance)
- * flips between Light and Dark. We expose two helpers:
+ * flips between Light and Dark. We expose three helpers:
  *   - `readMacSystemAppearance()` reads the current setting via `defaults`.
  *   - `themeForSystemMode()` maps a mode + configured theme names to the
  *     theme the server should apply.
- *
- * The pair is enough for a simple polling loop in the server. macOS does not
- * expose a CLI change-notification, so polling every few seconds is the
- * pragmatic approach; the calls are cheap (one `defaults` subprocess).
+ *   - `watchMacSystemAppearance()` invokes a callback on every detected
+ *     appearance change. Push-based via kqueue file watch on the underlying
+ *     plist; falls back to a slow safety poll for atomic-rename cases.
  */
+
+import { watch } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export type SystemAppearanceMode = "dark" | "light";
 
@@ -47,4 +50,66 @@ export function themeForSystemMode(
   lightTheme: string,
 ): string {
   return mode === "dark" ? darkTheme : lightTheme;
+}
+
+export interface SystemAppearanceWatcher {
+  stop(): void;
+}
+
+/**
+ * Watch the macOS Appearance setting and fire `onChange` when it flips.
+ *
+ * macOS rewrites `~/Library/Preferences/.GlobalPreferences.plist` whenever
+ * any global preference (including AppleInterfaceStyle) changes. We watch
+ * that file with kqueue (zero-overhead push) and re-read appearance on
+ * every event. Most events are unrelated to appearance (e.g. other prefs
+ * being written) so we suppress the callback unless the *value* actually
+ * changed.
+ *
+ * A 60s safety poll covers the rare case where the plist is replaced via
+ * atomic rename — kqueue loses the inode and the watcher goes silent.
+ *
+ * On non-darwin platforms returns a no-op watcher.
+ */
+export function watchMacSystemAppearance(
+  onChange: (mode: SystemAppearanceMode) => void | Promise<void>,
+  opts?: { safetyPollMs?: number },
+): SystemAppearanceWatcher {
+  if (process.platform !== "darwin") {
+    return { stop() {} };
+  }
+
+  const plistPath = join(homedir(), "Library", "Preferences", ".GlobalPreferences.plist");
+  let lastMode: SystemAppearanceMode | null = null;
+  let stopped = false;
+
+  async function check() {
+    if (stopped) return;
+    const mode = await readMacSystemAppearance();
+    if (mode !== lastMode) {
+      lastMode = mode;
+      await onChange(mode);
+    }
+  }
+
+  let watcher: ReturnType<typeof watch> | null = null;
+  try {
+    watcher = watch(plistPath, () => { void check(); });
+  } catch {
+    // fall through — safety poll alone keeps us correct
+  }
+
+  const safetyMs = opts?.safetyPollMs ?? 60_000;
+  const safetyTimer = setInterval(() => { void check(); }, safetyMs);
+
+  // Initial read so the consumer learns the starting mode without waiting.
+  void check();
+
+  return {
+    stop() {
+      stopped = true;
+      try { watcher?.close(); } catch {}
+      clearInterval(safetyTimer);
+    },
+  };
 }

@@ -1,6 +1,10 @@
 import { describe, test, expect } from "bun:test";
 
-import { readMacSystemAppearance, themeForSystemMode } from "../src/system-theme";
+import {
+  readMacSystemAppearance,
+  themeForSystemMode,
+  watchMacSystemAppearance,
+} from "../src/system-theme";
 
 describe("themeForSystemMode", () => {
   test("dark mode → dark theme", () => {
@@ -35,5 +39,43 @@ describe("readMacSystemAppearance", () => {
     } finally {
       Object.defineProperty(process, "platform", { value: original, configurable: true });
     }
+  });
+});
+
+describe("watchMacSystemAppearance", () => {
+  test("returns a no-op watcher on non-darwin", () => {
+    const original = process.platform;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    try {
+      let calls = 0;
+      const w = watchMacSystemAppearance(() => { calls++; });
+      expect(typeof w.stop).toBe("function");
+      w.stop();
+      expect(calls).toBe(0);
+    } finally {
+      Object.defineProperty(process, "platform", { value: original, configurable: true });
+    }
+  });
+
+  test("stop() is idempotent on non-darwin", () => {
+    const original = process.platform;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    try {
+      const w = watchMacSystemAppearance(() => {});
+      w.stop();
+      w.stop();
+    } finally {
+      Object.defineProperty(process, "platform", { value: original, configurable: true });
+    }
+  });
+
+  test("on darwin, fires callback with the initial mode", async () => {
+    if (process.platform !== "darwin") return;
+    let received: "dark" | "light" | null = null;
+    const w = watchMacSystemAppearance((mode) => { received = mode; }, { safetyPollMs: 60_000 });
+    // Initial check is queued via void check() — give it a tick to land.
+    await new Promise((r) => setTimeout(r, 100));
+    w.stop();
+    expect(received === "dark" || received === "light").toBe(true);
   });
 });

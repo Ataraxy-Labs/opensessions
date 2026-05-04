@@ -24,7 +24,12 @@ import {
 } from "./sidebar-coordinator";
 import { loadConfig, saveConfig } from "../config";
 import type { SessionFilterMode } from "../config";
-import { readMacSystemAppearance, themeForSystemMode } from "../system-theme";
+import {
+  readMacSystemAppearance,
+  themeForSystemMode,
+  watchMacSystemAppearance,
+  type SystemAppearanceWatcher,
+} from "../system-theme";
 import {
   clampSidebarWidth,
 } from "./sidebar-width-sync";
@@ -305,7 +310,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const config = loadConfig();
   let currentTheme: string | undefined = typeof config.theme === "string" ? config.theme : undefined;
   let currentFilter: SessionFilterMode | undefined = config.sessionFilter;
-  let systemThemePollTimer: ReturnType<typeof setInterval> | null = null;
+  let systemThemeWatcher: SystemAppearanceWatcher | null = null;
   // Tracks the most recently observed macOS appearance while auto-follow is active.
   // Used by the `set-theme` handler so a manual override is persisted to the
   // appearance-specific slot, not to `theme` (which would be clobbered next poll).
@@ -734,6 +739,13 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   }
 
   let broadcastPending = false;
+  // Hash of the last bytes published to "sidebar". Many call sites trigger
+  // broadcastState() but most do not actually change observable state (e.g.
+  // theme polls, focus moves that resolve to the same session, agent
+  // updates that produce identical metadata). Hashing the serialized
+  // payload and skipping the publish when unchanged kills redundant fan-out
+  // to all WS clients without changing the wire protocol.
+  let lastBroadcastHash: bigint | null = null;
 
   function broadcastState() {
     if (broadcastPending) return;
@@ -751,6 +763,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     lastState = computeState();
     syncGitWatchers(lastState.sessions, broadcastState);
     const msg = JSON.stringify(lastState);
+    const hash = Bun.hash(msg);
+    if (hash === lastBroadcastHash) return;
+    lastBroadcastHash = hash;
     server.publish("sidebar", msg);
   }
 
@@ -2181,7 +2196,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     clearProgrammaticAdjustmentTimer();
     if (portPollTimer) clearInterval(portPollTimer);
     if (paneScanTimer) clearInterval(paneScanTimer);
-    if (systemThemePollTimer) clearInterval(systemThemePollTimer);
+    if (systemThemeWatcher) systemThemeWatcher.stop();
     for (const timer of pendingHighlightResets.values()) clearTimeout(timer);
     pendingHighlightResets.clear();
     for (const watcher of gitHeadWatchers.values()) watcher.close();
@@ -2624,33 +2639,33 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   startIdleTimerIfNeeded("server booted without clients");
 
   // --- macOS system-appearance follower -----------------------------------
-  // When `autoThemeFollowsSystem` is set, poll the macOS Appearance setting
-  // every few seconds and flip between the configured dark/light themes.
-  // macOS does not expose a CLI change-notification; polling is cheap.
+  // When `autoThemeFollowsSystem` is set, watch the macOS Appearance plist
+  // and flip between the configured dark/light themes on change. Push-based
+  // (kqueue) — replaces the previous 3-second polling loop that spawned a
+  // `defaults` subprocess on every tick.
   if (config.autoThemeFollowsSystem && process.platform === "darwin") {
     autoThemeFollowing = true;
     const darkTheme = config.darkTheme ?? "catppuccin-mocha";
     const lightTheme = config.lightTheme ?? "catppuccin-latte";
 
-    async function syncSystemTheme() {
-      const mode = await readMacSystemAppearance();
-      currentSystemMode = mode;
+    async function syncSystemTheme(mode?: "dark" | "light") {
+      const observed = mode ?? (await readMacSystemAppearance());
+      currentSystemMode = observed;
       // Re-read the per-mode theme each cycle so a manual override via the
       // `set-theme` handler (which writes to `darkTheme` / `lightTheme`) is
-      // picked up on the next poll instead of being silently overwritten.
+      // honoured on the next event instead of being silently overwritten.
       const fresh = loadConfig();
       const dark = fresh.darkTheme ?? darkTheme;
       const light = fresh.lightTheme ?? lightTheme;
-      const desired = themeForSystemMode(mode, dark, light);
+      const desired = themeForSystemMode(observed, dark, light);
       if (desired === currentTheme) return;
-      log("system-theme", "switching", { mode, from: currentTheme, to: desired });
+      log("system-theme", "switching", { mode: observed, from: currentTheme, to: desired });
       currentTheme = desired;
       broadcastState();
     }
 
-    void syncSystemTheme();
-    systemThemePollTimer = setInterval(() => { void syncSystemTheme(); }, 3000);
-    log("system-theme", "poller started", { darkTheme, lightTheme });
+    systemThemeWatcher = watchMacSystemAppearance((mode) => { void syncSystemTheme(mode); });
+    log("system-theme", "watcher started", { darkTheme, lightTheme });
   }
   // ------------------------------------------------------------------------
 
