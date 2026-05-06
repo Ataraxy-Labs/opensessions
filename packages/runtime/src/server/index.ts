@@ -2285,13 +2285,15 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         return new Response("ok", { status: 200 });
       }
 
-      // pane-exited hook: a pane closed — kill orphaned sidebar panes
+      // pane-exited hook: a pane closed — kill orphaned sidebar panes and
+      // re-enforce sidebar width (tmux redistributes space when panes close)
       if (req.method === "POST" && url.pathname === "/pane-exited") {
         if (isSidebarVisible()) {
           invalidateSidebarPaneCache();
           for (const { provider } of listSidebarPanesByProvider()) {
             provider.killOrphanedSidebarPanes();
           }
+          scheduleClientResizeSync();
         }
         return new Response("ok", { status: 200 });
       }
