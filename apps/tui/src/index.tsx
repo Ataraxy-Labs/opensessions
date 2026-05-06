@@ -276,8 +276,24 @@ function App() {
   const [focusedAgentIdx, setFocusedAgentIdx] = createSignal(0);
 
   // --- Modal state ---
-  const [modal, setModal] = createSignal<"none" | "theme-picker" | "confirm-kill">("none");
+  const [modal, setModal] = createSignal<"none" | "theme-picker" | "confirm-kill" | "confirm-quit">("none");
   const [killTarget, setKillTarget] = createSignal<string | null>(null);
+
+  // --- Terminal focus tracking (defends against tmux send-keys injection) ---
+  // Real human keystrokes only reach the sidebar pane while it has terminal
+  // focus. tmux send-keys to a non-focused pane delivers raw bytes but does
+  // NOT cause a focus-in escape sequence. By gating destructive UI shortcuts
+  // (q, x, n, c, d, digits, Tab, Enter, etc.) on this signal we make
+  // accidental keystroke injection from other tmux clients/agents a no-op.
+  // See ai_logs/02-harden-tui-input.md (and the Oracle review) for context.
+  //
+  // Default `true`: on startup, before any focus event has been observed,
+  // permit input. After tmux sends the first focus-out (which it does when
+  // refocusMainPane runs after capability detection), this flips to false
+  // and stays correct from then on. Terminals that don't support focus
+  // reporting will simply leave this true (graceful degradation — destructive
+  // actions still require Enter confirmation thanks to the modal hardening).
+  const [paneHasTerminalFocus, setPaneHasTerminalFocus] = createSignal(true);
   let themeBeforePreview: Theme | null = null;
 
   // --- Flash message (brief feedback after actions like refresh) ---
@@ -554,9 +570,45 @@ function App() {
     // Fallback: if no capability response arrives within 2s, refocus anyway
     const refocusTimeout = setTimeout(doStartupRefocus, 2000);
 
+    // --- Terminal focus reporting (DECSET 1004) ---
+    // Enable focus events so we can distinguish real user keystrokes (which
+    // arrive while the pane is focused) from tmux send-keys injection from
+    // other clients (which delivers bytes WITHOUT a focus-in event). This
+    // is the primary defense against accidental UI-action injection.
+    //
+    // We attach a parallel `data` listener on stdin: Node allows multiple
+    // listeners on the same Readable, so OpenTUI's input parser still gets
+    // every byte. We don't touch raw mode or pause/resume the stream.
+    let focusEventsEnabled = false;
+    try {
+      process.stdout.write("\x1b[?1004h");
+      focusEventsEnabled = true;
+    } catch { /* terminal doesn't support write — leave gating as default-true */ }
+
+    let focusSeqTail = "";
+    const onStdinData = (chunk: Buffer | string) => {
+      const data = focusSeqTail + (typeof chunk === "string" ? chunk : chunk.toString("binary"));
+      let i = 0;
+      while (i < data.length) {
+        if (data.charCodeAt(i) === 0x1b && i + 2 < data.length && data[i + 1] === "[") {
+          const code = data[i + 2];
+          if (code === "I") { setPaneHasTerminalFocus(true); i += 3; continue; }
+          if (code === "O") { setPaneHasTerminalFocus(false); i += 3; continue; }
+        }
+        i++;
+      }
+      // Retain a small tail in case a focus sequence is split across chunks.
+      focusSeqTail = data.slice(-3);
+    };
+    process.stdin.on("data", onStdinData);
+
     onCleanup(() => {
       clearTimeout(refocusTimeout);
       renderer.removeListener("capabilities", doStartupRefocus);
+      try { process.stdin.off("data", onStdinData); } catch {}
+      if (focusEventsEnabled) {
+        try { process.stdout.write("\x1b[?1004l"); } catch {}
+      }
     });
 
     const socket = new WebSocket(`ws://${SERVER_HOST}:${SERVER_PORT}`);
@@ -718,19 +770,43 @@ function App() {
       return;
     }
 
-    // --- Confirm kill modal ---
+    // --- Confirm kill modal: Enter confirms, anything else cancels ---
+    // Previously a single `y` keystroke confirmed, which made `tmux send-keys`
+    // a one-shot kill-session attack vector once the modal was open. Requiring
+    // Enter means injected printable text can no longer slip through.
     if (currentModal === "confirm-kill") {
-      if (key.name === "y") {
+      if (key.name === "return") {
         const target = killTarget();
         if (target) send({ type: "kill-session", name: target });
-        setKillTarget(null);
-        setModal("none");
-      } else {
-        setKillTarget(null);
-        setModal("none");
       }
+      setKillTarget(null);
+      setModal("none");
       return;
     }
+
+    // --- Confirm quit modal: Enter confirms close-sidebar, anything else cancels ---
+    if (currentModal === "confirm-quit") {
+      if (key.name === "return") {
+        // Local-only close: kills only THIS sidebar pane via the server's
+        // close-sidebar handler. Other sessions' sidebars stay alive and the
+        // server keeps running. Compare to the legacy `quit` path which tore
+        // down every sidebar globally and called process.exit(0).
+        send({ type: "close-sidebar" });
+        // Tear down the local renderer so the pane closes promptly even if
+        // the server reply lags. Don't fire-and-forget HTTP /quit anymore —
+        // it triggers the destructive global path.
+        setTimeout(() => renderer.destroy(), 250);
+      }
+      setModal("none");
+      return;
+    }
+
+    // --- Defense against tmux send-keys injection ---
+    // If terminal focus reporting tells us this pane is NOT focused, ignore
+    // every shortcut. This drops accidental keystrokes from `tmux send-keys`
+    // targeting another pane in the sidebar's window. See the comment on
+    // paneHasTerminalFocus above for the trust model.
+    if (!paneHasTerminalFocus()) return;
 
     // --- Normal mode keybindings ---
     // Alt+Up / Alt+Down → reorder session
@@ -745,17 +821,11 @@ function App() {
 
     switch (key.name) {
       case "q":
-        // Primary path: WebSocket "quit" command. This can lose the frame if
-        // the TUI process tears down before Bun's WS buffer flushes to TCP.
-        send({ type: "quit" });
-        // Fallback path: a separate HTTP request on its own TCP connection.
-        // Whichever arrives first triggers quitAll → process.exit(0) on the
-        // server, which closes our WebSocket → socket.onclose → renderer.destroy.
-        // Not awaited — we're fire-and-forget.
-        fetch(`http://${SERVER_HOST}:${SERVER_PORT}/quit`, { method: "POST" }).catch(() => {});
-        // Last-resort timeout: if the server never responds, still tear down
-        // so the user isn't stuck in a dead TUI.
-        setTimeout(() => renderer.destroy(), 500);
+        // Open a confirm modal instead of immediately quitting. The modal
+        // requires Enter to confirm, so injected printable characters cannot
+        // tear the sidebar down. The confirmed action is `close-sidebar`,
+        // which is scoped to this client's pane (no global blast radius).
+        setModal("confirm-quit");
         break;
       case "escape":
         if (panelFocus() === "agents") {
@@ -1084,9 +1154,40 @@ function App() {
               <span style={{ fg: P().text }}>{killTarget() ?? ""}</span>
             </text>
             <text>
-              <span style={{ fg: P().overlay0 }}>y</span>
-              <span style={{ fg: P().overlay1 }}>/</span>
-              <span style={{ fg: P().overlay0 }}>n</span>
+              <span style={{ fg: P().overlay0 }}>enter</span>
+              <span style={{ fg: P().overlay1 }}>{" / "}</span>
+              <span style={{ fg: P().overlay0 }}>esc</span>
+            </text>
+          </box>
+        </box>
+      </Show>
+
+      {/* Quit (close sidebar) confirmation overlay */}
+      <Show when={modal() === "confirm-quit"}>
+        <box
+          position="absolute"
+          top={0} left={0} right={0} bottom={0}
+          justifyContent="center"
+          alignItems="center"
+          backgroundColor="transparent"
+        >
+          <box
+            border
+            borderStyle="rounded"
+            borderColor={P().yellow}
+            backgroundColor={P().mantle}
+            padding={1}
+            paddingX={2}
+            flexDirection="column"
+            alignItems="center"
+          >
+            <text>
+              <span style={{ fg: P().yellow, attributes: BOLD }}>Close sidebar?</span>
+            </text>
+            <text>
+              <span style={{ fg: P().overlay0 }}>enter</span>
+              <span style={{ fg: P().overlay1 }}>{" / "}</span>
+              <span style={{ fg: P().overlay0 }}>esc</span>
             </text>
           </box>
         </box>

@@ -460,6 +460,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const clientTtys = new WeakMap<object, string>();
   const clientSessionNames = new WeakMap<object, string>();
   const clientWindowIds = new WeakMap<object, string>();
+  // Map ws → tmux/zellij pane ID of the sidebar pane this TUI client is running in.
+  // Used by `close-sidebar` to scope a quit to one local sidebar pane instead of
+  // killing every sidebar globally (see quitAll for the global path).
+  const clientPaneIds = new WeakMap<object, string>();
   const connectedClients = new Set<any>();
   const sessionProviders = new Map<string, MuxProvider>();
   // Map session name → client TTY (from hook context, for multi-client setups)
@@ -1414,6 +1418,56 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }, CLIENT_RESIZE_SETTLE_MS);
   }
 
+  /**
+   * Close ONLY the sidebar pane that the requesting WS client is running in.
+   * Used by the TUI's `q` keystroke as a scoped, non-destructive alternative
+   * to `quit` (which globally tears down every sidebar across every session
+   * and exits the server). Doing this client-locally:
+   *   - kills only one pane via the appropriate provider
+   *   - does NOT touch other sessions' sidebars
+   *   - does NOT call process.exit
+   * If the WS has no recorded pane id (e.g. identify-pane was never sent),
+   * the call is a no-op.
+   */
+  function closeLocalSidebar(ws: any): void {
+    const paneId = clientPaneIds.get(ws);
+    if (!paneId) {
+      log("close-sidebar", "no pane id for ws — ignoring");
+      return;
+    }
+    log("close-sidebar", "closing local sidebar pane", { paneId });
+    invalidateSidebarPaneCache();
+    let killed = false;
+    for (const p of getProvidersWithSidebar()) {
+      try {
+        const panes = p.listSidebarPanes();
+        if (panes.some((pane) => pane.paneId === paneId)) {
+          try {
+            p.killSidebarPane(paneId);
+            killed = true;
+            // Drop from owned set so quitAll/teardown doesn't try to kill it
+            // again (would be a no-op but pollutes the skippedForeignCount log).
+            serverOwnedSidebarPanes.delete(paneId);
+            clientPaneIds.delete(ws);
+          } catch (err) {
+            log("close-sidebar", "killSidebarPane failed", { paneId, error: String(err) });
+          }
+          break;
+        }
+      } catch (err) {
+        log("close-sidebar", "listSidebarPanes failed", { provider: p.name, error: String(err) });
+      }
+    }
+    if (killed) {
+      invalidateSidebarPaneCache();
+      // Re-broadcast so any remaining TUI instances refresh their notion
+      // of where sidebar panes exist. Do NOT exit the server.
+      try { broadcastState(); } catch {}
+    } else {
+      log("close-sidebar", "pane not found in any provider's sidebar set", { paneId });
+    }
+  }
+
   let quitting = false;
   function quitAll(): void {
     // Re-entrancy guard: the TUI sends both a WS "quit" command and an
@@ -2111,6 +2165,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       case "quit":
         quitAll();
         break;
+      case "close-sidebar":
+        closeLocalSidebar(ws);
+        break;
       case "identify-pane":
         if (cmd.windowId) clientWindowIds.set(ws, cmd.windowId);
         // Claim this pane as belonging to *this* server instance. Covers
@@ -2121,6 +2178,8 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         // actually connect to *us* (panes pointing at a sibling server connect
         // there instead).
         if (cmd.paneId) serverOwnedSidebarPanes.add(cmd.paneId);
+        // Track this client's sidebar pane id so close-sidebar can scope to it.
+        if (cmd.paneId) clientPaneIds.set(ws, cmd.paneId);
         // Hidden sidebar panes live in _os_stash temporarily; don't let that
         // transient session overwrite the client's logical session identity.
         if (cmd.sessionName === "_os_stash") break;

@@ -89,6 +89,13 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
   }
 
   setupHooks(serverHost: string, serverPort: number): void {
+    // Enable terminal focus reporting forwarding so the sidebar TUI can
+    // distinguish real keystrokes (delivered with focus-in escape sequences)
+    // from `tmux send-keys` injection (which delivers raw bytes without
+    // focus events). The TUI uses this signal to gate destructive shortcuts
+    // and avoid accidental UI-action injection from other tmux clients.
+    try { rawTmux(["set-option", "-g", "focus-events", "on"]); } catch {}
+
     const base = `http://${serverHost}:${serverPort}`;
     const hookPost = (path: string, data?: string) => {
       const body = data ? ` -d '${data}'` : "";
