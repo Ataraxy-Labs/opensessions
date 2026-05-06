@@ -102,6 +102,7 @@ export const HOOK_NAMES = [
   "window-layout-changed",
   "after-select-window",
   "after-new-window",
+  "after-kill-pane",
   "after-resize-pane",
   "pane-died",
   "pane-exited",
