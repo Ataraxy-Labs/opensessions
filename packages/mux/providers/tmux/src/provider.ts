@@ -106,9 +106,10 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     tmux.setGlobalHook("after-new-window", ensureCmd);
     // client-resized: terminal window changed size — enforce stored width back
     tmux.setGlobalHook("client-resized", clientResizedCmd);
-    // pane-exited: a pane closed — kill orphaned sidebar panes (only pane left in window)
+    // after-kill-pane: a pane was killed — clean up orphaned sidebars and
+    // re-enforce width (pane-exited is not recognised by tmux 3.4+)
     const paneExitedCmd = hookPost("/pane-exited");
-    tmux.setGlobalHook("pane-exited", paneExitedCmd);
+    tmux.setGlobalHook("after-kill-pane", paneExitedCmd);
   }
 
   cleanupHooks(): void {
@@ -118,7 +119,7 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     tmux.unsetGlobalHook("after-select-window");
     tmux.unsetGlobalHook("after-new-window");
     tmux.unsetGlobalHook("client-resized");
-    tmux.unsetGlobalHook("pane-exited");
+    tmux.unsetGlobalHook("after-kill-pane");
   }
 
   getAllPaneCounts(): Map<string, number> {
