@@ -33,14 +33,26 @@ if [ ${#valid_dirs[@]} -eq 0 ]; then
   exit 1
 fi
 
-selected=$(find "${valid_dirs[@]}" -mindepth 1 -maxdepth "$MAXDEPTH" -type d 2>/dev/null | fzf \
+fzf_output=$(find "${valid_dirs[@]}" -mindepth 1 -maxdepth "$MAXDEPTH" -type d -not -path '*/.*' 2>/dev/null | fzf \
   --reverse \
-  --header="Pick a directory for new session" \
+  --print-query \
+  --header="Pick a directory (or type a path and press Enter)" \
   --preview=':' \
   --preview-window=hidden \
   --bind='ctrl-c:abort')
 
-[ -z "$selected" ] && exit 0
+# --print-query outputs: line 1 = query, line 2 = selected match (if any)
+query=$(echo "$fzf_output" | sed -n '1p')
+match=$(echo "$fzf_output" | sed -n '2p')
+
+# Prefer the selected match; fall back to typed query if it's a valid directory
+if [ -n "$match" ]; then
+  selected="$match"
+elif [ -d "$query" ]; then
+  selected="$query"
+else
+  exit 0
+fi
 
 # Derive session name from directory basename, replacing dots with underscores
 session_name=$(basename "$selected" | tr '.' '_')
