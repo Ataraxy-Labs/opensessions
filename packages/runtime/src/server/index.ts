@@ -2226,6 +2226,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const server = Bun.serve({
     port: SERVER_PORT,
     hostname: SERVER_HOST,
+    // SO_REUSEADDR equivalent — avoids EADDRINUSE during the kernel's TIME_WAIT
+    // window after an unclean shutdown. Common when the idle-timeout cleanup
+    // races a manual respawn from `toggle.sh ensure_server`.
+    reusePort: true,
     async fetch(req, server) {
       const url = new URL(req.url);
 
