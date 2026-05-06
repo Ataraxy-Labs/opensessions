@@ -22,6 +22,7 @@ import {
   isUserDragActive,
   readSidebarCoordinatorState,
 } from "./sidebar-coordinator";
+import { isLastLiveOpensessionsInstance } from "./server-instance-scope";
 import { loadConfig, saveConfig } from "../config";
 import type { SessionFilterMode } from "../config";
 import {
@@ -1031,6 +1032,25 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   const pendingSidebarSpawns = new Set<string>();
 
+  // Sidebar panes this server instance owns: panes we either spawned ourselves
+  // or that a TUI client identified to us via `identify-pane`. quitAll() and
+  // shutdown teardown only touch panes in this set so we never kill panes
+  // belonging to a sibling opensessions server (e.g. another tmux socket on the
+  // same machine — see resolveServerKey/resolveServerPort in shared.ts for why
+  // multiple servers can coexist).
+  const serverOwnedSidebarPanes = new Set<string>();
+
+  function pruneOwnedPanesAgainstLive(): void {
+    if (serverOwnedSidebarPanes.size === 0) return;
+    const liveIds = new Set<string>();
+    for (const { panes } of listSidebarPanesByProvider()) {
+      for (const pane of panes) liveIds.add(pane.paneId);
+    }
+    for (const owned of [...serverOwnedSidebarPanes]) {
+      if (!liveIds.has(owned)) serverOwnedSidebarPanes.delete(owned);
+    }
+  }
+
   function toggleSidebar(ctx?: { session: string; windowId: string }): void {
     const providers = getProvidersWithSidebar();
     if (providers.length === 0) {
@@ -1050,10 +1070,16 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
     if (sidebarPresent && !recoverVisibleState) {
       for (const p of providers) {
-        const panes = p.listSidebarPanes();
-        log("toggle", "OFF — hiding panes", { provider: p.name, count: panes.length });
-        for (const pane of panes) {
+        const allPanes = p.listSidebarPanes();
+        const owned = allPanes.filter((pane) => serverOwnedSidebarPanes.has(pane.paneId));
+        log("toggle", "OFF — hiding owned panes", {
+          provider: p.name,
+          ownedCount: owned.length,
+          skippedForeignCount: allPanes.length - owned.length,
+        });
+        for (const pane of owned) {
           p.hideSidebar(pane.paneId);
+          serverOwnedSidebarPanes.delete(pane.paneId);
         }
       }
       clearTransientResizeTimer();
@@ -1198,6 +1224,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       try {
         const newPaneId = p.spawnSidebar(curSession, windowId, sidebarWidth, sidebarPosition, scriptsDir);
         log("ensure", "spawn result", { newPaneId });
+        if (newPaneId) serverOwnedSidebarPanes.add(newPaneId);
         // Do NOT refocus the main pane here — the TUI handles it.
         // For fresh spawns, the TUI refocuses after capability detection.
         // For stash restores, the TUI refocuses after restoreTerminalModes
@@ -1398,18 +1425,32 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       process.exit(0);
     }
     quitting = true;
-    log("quit", "killing all sidebar panes");
+    log("quit", "killing owned sidebar panes", { ownedCount: serverOwnedSidebarPanes.size });
     // Wrap every teardown step so a single throw (tmux command failure,
     // watcher.stop(), xstate send on a stopped actor, etc.) doesn't skip
     // process.exit and leave a zombie server behind — which is exactly
     // what the "q doesn't kill server" reports have been.
     try {
+      // Only kill panes this server actually owns. listSidebarPanes() on the
+      // tmux provider does `tmux list-panes -a` which is server-wide, so
+      // without this filter we would also kill panes belonging to other live
+      // opensessions servers on different sockets/ports — see
+      // server-instance-scope.ts for the rationale.
       for (const p of getProvidersWithSidebar()) {
         try {
-          const panes = p.listSidebarPanes();
-          log("quit", "found panes to kill", { provider: p.name, count: panes.length });
-          for (const pane of panes) {
-            try { p.killSidebarPane(pane.paneId); } catch (err) {
+          const allPanes = p.listSidebarPanes();
+          const owned = allPanes.filter((pane) => serverOwnedSidebarPanes.has(pane.paneId));
+          const skipped = allPanes.length - owned.length;
+          log("quit", "found panes to kill", {
+            provider: p.name,
+            ownedCount: owned.length,
+            skippedForeignCount: skipped,
+          });
+          for (const pane of owned) {
+            try {
+              p.killSidebarPane(pane.paneId);
+              serverOwnedSidebarPanes.delete(pane.paneId);
+            } catch (err) {
               log("quit", "killSidebarPane failed", { paneId: pane.paneId, error: String(err) });
             }
           }
@@ -2072,6 +2113,14 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         break;
       case "identify-pane":
         if (cmd.windowId) clientWindowIds.set(ws, cmd.windowId);
+        // Claim this pane as belonging to *this* server instance. Covers
+        // post-restart recovery where existing TUI panes survived a server
+        // crash/restart and now reconnect — without this, quitAll() would skip
+        // them and leave zombie panes behind. The server-instance scoping in
+        // server-instance-scope.ts still ensures we only claim panes that
+        // actually connect to *us* (panes pointing at a sibling server connect
+        // there instead).
+        if (cmd.paneId) serverOwnedSidebarPanes.add(cmd.paneId);
         // Hidden sidebar panes live in _os_stash temporarily; don't let that
         // transient session overwrite the client's logical session identity.
         if (cmd.sessionName === "_os_stash") break;
@@ -2175,7 +2224,21 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     clearResizeStaggerTimers();
     sidebarCoordinator.stop();
     try { unlinkSync(PID_FILE); } catch {}
-    for (const p of allProviders) p.cleanupHooks();
+    // Global tmux hooks are shared by every opensessions server on this
+    // machine. Only unset them when this is the last live instance — otherwise
+    // we'd kneecap a sibling server (e.g. one bound to a different tmux
+    // socket) that still depends on after-new-window / client-session-changed
+    // / pane-exited / etc. firing back into its own port. See
+    // server-instance-scope.ts for the rationale.
+    const otherLive = !isLastLiveOpensessionsInstance({
+      ownPidFile: PID_FILE,
+      ownPid: process.pid,
+    });
+    if (otherLive) {
+      log("cleanup", "skipping provider.cleanupHooks — sibling opensessions server is still live");
+    } else {
+      for (const p of allProviders) p.cleanupHooks();
+    }
   }
 
   // --- Write PID + start server ---
@@ -2293,6 +2356,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
             provider.killOrphanedSidebarPanes();
           }
         }
+        // Drop pane ids from our owned set when their tmux pane is gone, so
+        // the set doesn't accumulate stale ids over the server's lifetime.
+        invalidateSidebarPaneCache();
+        pruneOwnedPanesAgainstLive();
         return new Response("ok", { status: 200 });
       }
 
