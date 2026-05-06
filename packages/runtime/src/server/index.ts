@@ -1232,8 +1232,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     // Always enforce width — session switches can change window width,
     // causing tmux to proportionally redistribute pane sizes.
     // Call directly (not scheduled) since we're already behind debouncedEnsureSidebar.
+    // reuseCache: we just listed panes above (line 1206) and the 300ms TTL
+    // cache is fresh; the inner enforce can skip its own list-panes call.
     suppressWidthReports();
-    enforceSidebarWidth();
+    enforceSidebarWidth(undefined, { reuseCache: true });
   }
 
   // Debounced ensure-sidebar — collapses rapid hook-fired calls during fast
@@ -1469,7 +1471,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   let enforcing = false;
 
-  function enforceSidebarWidth(skipWindowId?: string) {
+  function enforceSidebarWidth(skipWindowId?: string, opts?: { reuseCache?: boolean }) {
     if (enforcing) {
       log("enforce", "SKIPPED — re-entrancy guard");
       return;
@@ -1482,7 +1484,12 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       widthReportsSuppressed: areWidthReportsSuppressed(getSidebarState()),
     });
     try {
-      invalidateSidebarPaneCache();
+      // Callers that have just listed panes (e.g. ensureSidebarInWindow) can
+      // pass reuseCache to skip the invalidation and let the 300ms TTL
+      // serve a cache hit, avoiding a redundant `tmux list-panes -a` call.
+      // Each list-panes hits 50-200ms on a busy tmux; halving the calls per
+      // session switch is the largest single perf win on the hot path.
+      if (!opts?.reuseCache) invalidateSidebarPaneCache();
       for (const { provider, panes } of listSidebarPanesByProvider()) {
         for (const pane of panes) {
           if (pane.width === sidebarWidth) continue;
