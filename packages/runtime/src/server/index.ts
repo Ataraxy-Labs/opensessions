@@ -2219,17 +2219,33 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     for (const p of allProviders) p.cleanupHooks();
   }
 
-  // --- Write PID + start server ---
+  // --- Singleton guard + Write PID + start server ---
+
+  // If a previous server is already alive, bail out cleanly instead of
+  // racing it. Without this, every M-s during the brief TIME_WAIT window
+  // could spawn an additional server (especially with reusePort), leading
+  // to multiple processes sharing 7391 with disjoint in-memory state.
+  try {
+    const existingPidStr = readFileSync(PID_FILE, "utf8").trim();
+    const existingPid = Number(existingPidStr);
+    if (Number.isFinite(existingPid) && existingPid > 0 && existingPid !== process.pid) {
+      try {
+        process.kill(existingPid, 0); // probe; throws if dead
+        console.error(`opensessions: another server is already running (pid ${existingPid}). Exiting.`);
+        process.exit(0);
+      } catch {
+        // PID file exists but process is dead — stale, proceed.
+      }
+    }
+  } catch {
+    // No PID file or unreadable — first start, proceed.
+  }
 
   writeFileSync(PID_FILE, String(process.pid));
 
   const server = Bun.serve({
     port: SERVER_PORT,
     hostname: SERVER_HOST,
-    // SO_REUSEADDR equivalent — avoids EADDRINUSE during the kernel's TIME_WAIT
-    // window after an unclean shutdown. Common when the idle-timeout cleanup
-    // races a manual respawn from `toggle.sh ensure_server`.
-    reusePort: true,
     async fetch(req, server) {
       const url = new URL(req.url);
 
