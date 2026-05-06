@@ -709,7 +709,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         uptime,
         agentState: tracker.getState(name),
         agents: tracker.getAgents(name),
-        eventTimestamps: tracker.getEventTimestamps(name),
+        // eventTimestamps intentionally omitted from the wire payload —
+        // not consumed by the TUI, but a fresh number per agent-emit
+        // would defeat the broadcast hash-dedup and re-fan-out to every
+        // WS client on a sub-second cadence when agents are chatty.
         metadata: metadataStore.get(name),
       };
     });

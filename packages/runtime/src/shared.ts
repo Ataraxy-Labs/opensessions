@@ -77,7 +77,12 @@ export interface SessionData {
   uptime: string;
   agentState: AgentEvent | null;
   agents: AgentEvent[];
-  eventTimestamps: number[];
+  /**
+   * Internal-only diagnostic — server-side tracker uses these for stale/active
+   * heuristics. Optional in the wire shape because the TUI does not read them
+   * and shipping them on every agent emit defeats broadcast deduplication.
+   */
+  eventTimestamps?: number[];
   metadata?: SessionMetadata | null;
 }
 
