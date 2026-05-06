@@ -154,25 +154,45 @@ function wrapLocalLinks(links: SessionData["localLinks"], maxWidth: number): Ses
 function refocusMainPane() {
   if (muxCtx.type === "tmux") {
     try {
+      const selfPaneId = muxCtx.paneId;
       // Use the TUI's own pane ID to find its current window (handles stash restore
       // where the pane may have moved to a different window than the original).
       const windowId = process.env.REFOCUS_WINDOW
         || Bun.spawnSync(
-            ["tmux", "display-message", "-t", muxCtx.paneId, "-p", "#{window_id}"],
+            ["tmux", "display-message", "-t", selfPaneId, "-p", "#{window_id}"],
             { stdout: "pipe", stderr: "pipe" },
           ).stdout.toString().trim();
-      if (!windowId) return;
+      if (!windowId) {
+        logResizeDebug("refocusMainPane:no-window-id", { selfPaneId });
+        return;
+      }
       const r = Bun.spawnSync(
-        ["tmux", "list-panes", "-t", windowId, "-F", "#{pane_id} #{pane_title}"],
+        ["tmux", "list-panes", "-t", windowId, "-F", "#{pane_id}"],
         { stdout: "pipe", stderr: "pipe" },
       );
-      const lines = r.stdout.toString().trim().split("\n");
-      const main = lines.find((l) => !l.includes("opensessions-sidebar"));
+      const paneIds = r.stdout.toString().trim().split("\n").filter(Boolean);
+      // Identify "main" as any pane in the window that is NOT this TUI's own pane.
+      // Title-based detection races with the parent server's setPaneTitle call:
+      // when the sidebar is on the left, list-panes orders the new sidebar pane
+      // first (lower pane_index), and if its title hasn't been set yet the find
+      // would pick the sidebar itself and re-select it.
+      const main = paneIds.find((id) => id && id !== selfPaneId);
+      logResizeDebug("refocusMainPane:tmux", { windowId, selfPaneId, paneIds, main });
       if (main) {
-        const paneId = main.split(" ")[0];
-        Bun.spawnSync(["tmux", "select-pane", "-t", paneId], { stdout: "pipe", stderr: "pipe" });
+        const sel = Bun.spawnSync(
+          ["tmux", "select-pane", "-t", main],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        if (sel.exitCode !== 0) {
+          logResizeDebug("refocusMainPane:select-failed", {
+            main,
+            stderr: sel.stderr.toString().trim(),
+          });
+        }
       }
-    } catch {}
+    } catch (err) {
+      logResizeDebug("refocusMainPane:error", { error: String(err) });
+    }
   } else if (muxCtx.type === "zellij") {
     // Zellij: move focus to the right (away from the sidebar on the left)
     try {
