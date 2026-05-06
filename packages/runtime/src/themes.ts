@@ -83,6 +83,22 @@ const TOKYO_NIGHT: Theme = {
   icons: CATPPUCCIN_MOCHA.icons,
 };
 
+const GRUVBOX_LIGHT: Theme = {
+  palette: {
+    blue: "#076678", lavender: "#8f3f71", pink: "#b16286", mauve: "#8f3f71",
+    yellow: "#b57614", green: "#79740e", red: "#9d0006", peach: "#af3a03",
+    teal: "#427b58", sky: "#458588", text: "#3c3836", subtext0: "#504945",
+    subtext1: "#665c54", overlay0: "#a89984", overlay1: "#7c6f64",
+    surface0: "#ebdbb2", surface1: "#d5c4a1", surface2: "#bdae93",
+    base: "#fbf1c7", mantle: "#f9f5d7", crust: "#f2e5bc",
+  },
+  status: {
+    idle: "#a89984", running: "#b57614", "tool-running": "#458588", done: "#79740e",
+    error: "#9d0006", waiting: "#076678", interrupted: "#af3a03", stale: "#b57614",
+  },
+  icons: CATPPUCCIN_MOCHA.icons,
+};
+
 const GRUVBOX_DARK: Theme = {
   palette: {
     blue: "#83a598", lavender: "#d3869b", pink: "#d3869b", mauve: "#d3869b",
@@ -359,6 +375,7 @@ export const BUILTIN_THEMES: Record<string, Theme> = {
   "catppuccin-macchiato": CATPPUCCIN_MACCHIATO,
   "tokyo-night": TOKYO_NIGHT,
   "gruvbox-dark": GRUVBOX_DARK,
+  "gruvbox-light": GRUVBOX_LIGHT,
   "nord": NORD,
   "dracula": DRACULA,
   "github-dark": GITHUB_DARK,
