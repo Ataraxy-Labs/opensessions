@@ -16,7 +16,7 @@ function runHelper(body: string): string {
   const result = Bun.spawnSync(
     [
       "sh",
-      "-lc",
+      "-c",
       `. '${helperPath}'
 ${body}`,
     ],
