@@ -1,0 +1,102 @@
+import { describe, test, expect } from "bun:test";
+import type { ClientCommand } from "../src/shared";
+import { readFileSync } from "fs";
+import { resolve } from "path";
+
+describe("close-sidebar command", () => {
+  test("ClientCommand union accepts close-sidebar type", () => {
+    const cmd: ClientCommand = { type: "close-sidebar" };
+    expect(cmd.type).toBe("close-sidebar");
+  });
+
+  test("ClientCommand union still accepts the legacy global quit type", () => {
+    const cmd: ClientCommand = { type: "quit" };
+    expect(cmd.type).toBe("quit");
+  });
+});
+
+// These tests guard the security-sensitive contract that the TUI's `q`
+// keystroke must NOT trigger the global `quit` path (which calls
+// process.exit(0) on the server and tears down every sidebar across every
+// session). They check the source files directly to avoid spinning up the
+// server in tests. See ai_logs/02-harden-tui-input.md for the full context.
+describe("server: close-sidebar wiring", () => {
+  const serverPath = resolve(__dirname, "../src/server/index.ts");
+  const serverSrc = readFileSync(serverPath, "utf-8");
+
+  test("server registers a close-sidebar WS command handler", () => {
+    expect(serverSrc).toMatch(/case "close-sidebar":/);
+    expect(serverSrc).toMatch(/closeLocalSidebar\(ws\)/);
+  });
+
+  test("close-sidebar handler is scoped to one client's pane", () => {
+    expect(serverSrc).toMatch(/function closeLocalSidebar\(ws: any\): void/);
+    // Must read the per-client paneId map populated via identify-pane.
+    expect(serverSrc).toMatch(/clientPaneIds\.get\(ws\)/);
+  });
+
+  test("close-sidebar handler does NOT exit the process or touch other sidebars globally", () => {
+    const fnMatch = serverSrc.match(/function closeLocalSidebar[\s\S]*?\n  \}\n/);
+    expect(fnMatch).not.toBeNull();
+    const body = fnMatch![0];
+    expect(body).not.toMatch(/process\.exit/);
+    // Must not delegate to quitAll, which kills every sidebar pane.
+    expect(body).not.toMatch(/quitAll\(/);
+  });
+
+  test("identify-pane records paneId so close-sidebar can scope to it", () => {
+    expect(serverSrc).toMatch(/clientPaneIds\.set\(ws, cmd\.paneId\)/);
+  });
+});
+
+describe("TUI: q keystroke wiring", () => {
+  const tuiPath = resolve(__dirname, "../../../apps/tui/src/index.tsx");
+  const tuiSrc = readFileSync(tuiPath, "utf-8");
+
+  test("q opens a confirm-quit modal — does NOT immediately send quit", () => {
+    // Find the q case in the keyboard switch
+    const qCaseMatch = tuiSrc.match(/case "q":[\s\S]*?break;/);
+    expect(qCaseMatch).not.toBeNull();
+    const qCase = qCaseMatch![0];
+    expect(qCase).toMatch(/setModal\("confirm-quit"\)/);
+    expect(qCase).not.toMatch(/send\(\{ type: "quit" \}\)/);
+    expect(qCase).not.toMatch(/fetch.*\/quit/);
+  });
+
+  test("confirm-quit modal accepts ONLY Enter, sends close-sidebar (not quit)", () => {
+    const confirmQuitMatch = tuiSrc.match(/if \(currentModal === "confirm-quit"\)[\s\S]*?return;\s*\}/);
+    expect(confirmQuitMatch).not.toBeNull();
+    const block = confirmQuitMatch![0];
+    expect(block).toMatch(/key\.name === "return"/);
+    expect(block).toMatch(/send\(\{ type: "close-sidebar" \}\)/);
+    expect(block).not.toMatch(/send\(\{ type: "quit" \}\)/);
+  });
+
+  test("confirm-kill modal requires Enter, not bare 'y'", () => {
+    const confirmKillMatch = tuiSrc.match(/if \(currentModal === "confirm-kill"\)[\s\S]*?return;\s*\}/);
+    expect(confirmKillMatch).not.toBeNull();
+    const block = confirmKillMatch![0];
+    expect(block).toMatch(/key\.name === "return"/);
+    expect(block).not.toMatch(/key\.name === "y"/);
+  });
+
+  test("destructive shortcuts are gated on paneHasTerminalFocus", () => {
+    expect(tuiSrc).toMatch(/if \(!paneHasTerminalFocus\(\)\) return/);
+  });
+
+  test("focus-event tracking is wired up via DECSET 1004", () => {
+    expect(tuiSrc).toMatch(/\\x1b\[\?1004h/);
+    expect(tuiSrc).toMatch(/\\x1b\[\?1004l/);
+    expect(tuiSrc).toMatch(/setPaneHasTerminalFocus\(true\)/);
+    expect(tuiSrc).toMatch(/setPaneHasTerminalFocus\(false\)/);
+  });
+});
+
+describe("tmux provider: focus-events forwarding", () => {
+  const providerPath = resolve(__dirname, "../../mux/providers/tmux/src/provider.ts");
+  const providerSrc = readFileSync(providerPath, "utf-8");
+
+  test("setupHooks enables tmux focus-events option globally", () => {
+    expect(providerSrc).toMatch(/set-option.*focus-events.*on/);
+  });
+});
