@@ -52,7 +52,13 @@ export const SERVER_HOST = process.env.OPENSESSIONS_HOST?.trim() || DEFAULT_SERV
 // whichever address SERVER_HOST is bound to.
 export const LOCAL_CLIENT_HOST = "127.0.0.1";
 export const PID_FILE = resolvePidFile(SERVER_KEY);
-export const SERVER_IDLE_TIMEOUT_MS = 30_000;
+// 30s was too aggressive: any time the server is restarted (manual respawn,
+// tmux plugin update, code change) the TUI clients live inside sidebar panes
+// that haven't been recreated yet. By the time the user presses the toggle
+// key to spawn a sidebar, the new server has already self-terminated. 5min
+// gives the user a usable window to bring the sidebar up after a restart
+// without leaving zombie servers running indefinitely.
+export const SERVER_IDLE_TIMEOUT_MS = 5 * 60_000;
 export const STUCK_RUNNING_TIMEOUT_MS = 3 * 60 * 1000;
 
 export interface LocalLink {
@@ -77,7 +83,12 @@ export interface SessionData {
   uptime: string;
   agentState: AgentEvent | null;
   agents: AgentEvent[];
-  eventTimestamps: number[];
+  /**
+   * Internal-only diagnostic — server-side tracker uses these for stale/active
+   * heuristics. Optional in the wire shape because the TUI does not read them
+   * and shipping them on every agent emit defeats broadcast deduplication.
+   */
+  eventTimestamps?: number[];
   metadata?: SessionMetadata | null;
 }
 
