@@ -7,6 +7,7 @@ import type {
   WindowCapable,
   SidebarCapable,
   BatchCapable,
+  AsyncReadCapable,
 } from "@opensessions/mux";
 import { TmuxClient } from "./client";
 import { appendFileSync } from "fs";
@@ -36,7 +37,7 @@ function rawTmux(args: string[]): string {
 const STASH_SESSION = "_os_stash";
 const SIDEBAR_PANE_TITLE = "opensessions-sidebar";
 
-export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapable, BatchCapable {
+export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapable, BatchCapable, AsyncReadCapable {
   readonly specificationVersion = "v1" as const;
   readonly name: string;
 
@@ -56,12 +57,37 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     }));
   }
 
+  /**
+   * Async sibling of listSessions(). Runs the two tmux subprocesses
+   * (list-sessions + active-session-dirs) in parallel, and uses non-blocking
+   * spawn so the bun event loop can serve other HTTP requests while tmux
+   * runs. Used by the runtime in computeState() to avoid blocking on every
+   * agent-emit broadcast.
+   */
+  async listSessionsAsync(): Promise<MuxSessionInfo[]> {
+    const [rawSessions, activeDirs] = await Promise.all([
+      tmux.listSessionsAsync(),
+      tmux.getActiveSessionDirsAsync(),
+    ]);
+    const sessions = rawSessions.filter((s) => s.name !== STASH_SESSION);
+    return sessions.map((s) => ({
+      name: s.name,
+      createdAt: s.createdAt,
+      dir: activeDirs.get(s.name) ?? s.dir,
+      windows: s.windowCount,
+    }));
+  }
+
   switchSession(name: string, clientTty?: string): void {
     tmux.switchClient(name, clientTty ? { clientTty } : undefined);
   }
 
   getCurrentSession(): string | null {
     return tmux.getCurrentSession();
+  }
+
+  async getCurrentSessionAsync(): Promise<string | null> {
+    return tmux.getCurrentSessionAsync();
   }
 
   getSessionDir(name: string): string {
@@ -123,6 +149,10 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
 
   getAllPaneCounts(): Map<string, number> {
     return tmux.getAllPaneCounts();
+  }
+
+  async getAllPaneCountsAsync(): Promise<Map<string, number>> {
+    return tmux.getAllPaneCountsAsync();
   }
 
   listActiveWindows(): ActiveWindow[] {

@@ -95,6 +95,18 @@ export interface BatchCapable {
   getAllPaneCounts(): Map<string, number>;
 }
 
+/**
+ * Async-capable read methods for hot paths in the runtime. Providers that
+ * implement these allow the server to await tmux/mux subprocess work
+ * instead of blocking the event loop. The sync siblings remain available
+ * as fallbacks for non-async call sites.
+ */
+export interface AsyncReadCapable {
+  listSessionsAsync(): Promise<MuxSessionInfo[]>;
+  getCurrentSessionAsync(): Promise<string | null>;
+  getAllPaneCountsAsync?(): Promise<Map<string, number>>;
+}
+
 // ─── Composite types ─────────────────────────────────────────────────────────
 
 /**
@@ -108,7 +120,7 @@ export type FullMuxProvider = MuxProviderV1 & WindowCapable & SidebarCapable & B
  *
  * Like ai-sdk's LanguageModel = V2 | V3 | V4 — accepts any level of capability.
  */
-export type MuxProvider = MuxProviderV1 & Partial<WindowCapable & SidebarCapable & BatchCapable>;
+export type MuxProvider = MuxProviderV1 & Partial<WindowCapable & SidebarCapable & BatchCapable & AsyncReadCapable>;
 
 // ─── Type guards ─────────────────────────────────────────────────────────────
 // Runtime narrowing — like ai-sdk's isInstance() pattern, but for capabilities.
@@ -134,6 +146,11 @@ export function isSidebarCapable(p: MuxProvider): p is MuxProviderV1 & SidebarCa
 /** Check if a provider supports batch operations */
 export function isBatchCapable(p: MuxProvider): p is MuxProviderV1 & BatchCapable {
   return typeof p.getAllPaneCounts === "function";
+}
+
+/** Check if a provider implements the async read API */
+export function isAsyncReadCapable(p: MuxProvider): p is MuxProviderV1 & AsyncReadCapable {
+  return typeof p.listSessionsAsync === "function" && typeof p.getCurrentSessionAsync === "function";
 }
 
 /** Check if a provider supports full sidebar management (window + sidebar) */

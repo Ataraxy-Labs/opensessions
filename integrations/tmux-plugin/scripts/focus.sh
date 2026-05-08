@@ -21,7 +21,7 @@ ensure_server || exit 0
 
 CTX="$(tmux display-message -p '#{client_tty}|#{session_name}|#{window_id}' 2>/dev/null)"
 
-curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"
+curl -s -o /dev/null -m 1.5 --connect-timeout 0.3 -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX" >/dev/null 2>&1 || true
 
 attempt=0
 while [ "$attempt" -lt 20 ]; do

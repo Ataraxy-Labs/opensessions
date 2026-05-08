@@ -43,11 +43,17 @@ else
   PID_FILE="/tmp/opensessions.pid"
 fi
 
-PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
-PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-BUN_PATH="${BUN_PATH:-$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")}"
-SERVER_ENTRY="$PLUGIN_DIR/apps/server/src/main.ts"
+# Defer plugin-dir / bun lookup until the cold-start path actually needs it.
+# tmux show-environment forks tmux (~10-20ms); command -v bun is cheap but
+# the conditional below ensures hot paths (alive cache hit) skip both.
 SERVER_LOG="/tmp/opensessions-server.log"
+
+resolve_cold_start_paths() {
+  PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
+  PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
+  BUN_PATH="${BUN_PATH:-$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")}"
+  SERVER_ENTRY="$PLUGIN_DIR/apps/server/src/main.ts"
+}
 
 show_startup_error() {
   message="$1"
@@ -59,10 +65,35 @@ server_alive() {
   curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
 }
 
+# Cache the alive-check result. If we confirmed the server alive within
+# ALIVE_CACHE_TTL_S seconds, trust it and skip the ~80ms curl. Hot keypress
+# paths (switch-index, focus, toggle) all call ensure_server first; without
+# this they each pay the curl tax even though the server is fine.
+ALIVE_CACHE_FILE="${PID_FILE%.pid}.alive"
+ALIVE_CACHE_TTL_S=5
+
+alive_cache_fresh() {
+  [ -f "$ALIVE_CACHE_FILE" ] || return 1
+  # Cross-platform mtime delta. macOS stat -f %m, Linux stat -c %Y.
+  now=$(date +%s)
+  mtime=$(stat -f %m "$ALIVE_CACHE_FILE" 2>/dev/null || stat -c %Y "$ALIVE_CACHE_FILE" 2>/dev/null)
+  [ -n "$mtime" ] || return 1
+  delta=$((now - mtime))
+  [ "$delta" -lt "$ALIVE_CACHE_TTL_S" ]
+}
+
 ensure_server() {
-  if server_alive; then
+  if alive_cache_fresh; then
     return 0
   fi
+
+  if server_alive; then
+    : > "$ALIVE_CACHE_FILE" 2>/dev/null
+    return 0
+  fi
+
+  # Cold start: only now do we need plugin dir + bun resolution
+  resolve_cold_start_paths
 
   if [ ! -x "$BUN_PATH" ]; then
     show_startup_error "opensessions: bun not found. Install bun and retry."
@@ -75,6 +106,7 @@ ensure_server() {
   while [ "$attempt" -lt 30 ]; do
     sleep 0.1
     if server_alive; then
+      : > "$ALIVE_CACHE_FILE" 2>/dev/null
       return 0
     fi
     attempt=$((attempt + 1))

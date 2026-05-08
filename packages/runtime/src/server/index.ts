@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync, appendFileSync, watch, type FSWatcher } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import type { MuxProvider } from "../contracts/mux";
-import { isFullSidebarCapable, isBatchCapable } from "../contracts/mux";
+import type { MuxProvider, BatchCapable } from "../contracts/mux";
+import { isFullSidebarCapable, isBatchCapable, isAsyncReadCapable } from "../contracts/mux";
 import type { AgentEvent, AgentStatus, PanePresenceInput } from "../contracts/agent";
 import type { AgentThreadOwner, AgentWatcher, AgentWatcherContext } from "../contracts/agent-watcher";
 import { AgentTracker } from "../agents/tracker";
@@ -25,6 +25,12 @@ import {
 import { loadConfig, saveConfig } from "../config";
 import type { SessionFilterMode } from "../config";
 import {
+  readMacSystemAppearance,
+  themeForSystemMode,
+  watchMacSystemAppearance,
+  type SystemAppearanceWatcher,
+} from "../system-theme";
+import {
   clampSidebarWidth,
 } from "./sidebar-width-sync";
 import {
@@ -36,6 +42,7 @@ import {
   SERVER_HOST,
   LOCAL_CLIENT_HOST,
   PID_FILE,
+  ORDERING_FILE,
   SERVER_IDLE_TIMEOUT_MS,
   STUCK_RUNNING_TIMEOUT_MS,
 } from "../shared";
@@ -304,6 +311,12 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const config = loadConfig();
   let currentTheme: string | undefined = typeof config.theme === "string" ? config.theme : undefined;
   let currentFilter: SessionFilterMode | undefined = config.sessionFilter;
+  let systemThemeWatcher: SystemAppearanceWatcher | null = null;
+  // Tracks the most recently observed macOS appearance while auto-follow is active.
+  // Used by the `set-theme` handler so a manual override is persisted to the
+  // appearance-specific slot, not to `theme` (which would be clobbered next poll).
+  let autoThemeFollowing = false;
+  let currentSystemMode: "dark" | "light" | undefined;
   const initialSidebarWidth = clampSidebarWidth(config.sidebarWidth ?? 26);
   let sidebarPosition: "left" | "right" = config.sidebarPosition ?? "left";
   const sidebarCoordinator = createSidebarCoordinator({ width: initialSidebarWidth });
@@ -630,11 +643,18 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     return null;
   }
 
-  function computeState(): ServerState {
-    // Merge sessions from all providers
+  async function computeState(): Promise<ServerState> {
+    // Merge sessions from all providers. Run async-capable providers in
+    // parallel so the bun event loop keeps serving HTTP during the tmux
+    // forks. Falls back to sync listSessions() for providers that don't
+    // implement the async API (e.g. legacy zellij).
+    const sessionLists = await Promise.all(
+      allProviders.map((p) => isAsyncReadCapable(p) ? p.listSessionsAsync() : Promise.resolve(p.listSessions())),
+    );
     const allMuxSessions: (import("../contracts/mux").MuxSessionInfo & { provider: MuxProvider })[] = [];
-    for (const p of allProviders) {
-      for (const s of p.listSessions()) {
+    for (let i = 0; i < allProviders.length; i++) {
+      const p = allProviders[i]!;
+      for (const s of sessionLists[i]!) {
         allMuxSessions.push({ ...s, provider: p });
       }
     }
@@ -643,7 +663,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       return a.name.localeCompare(b.name);
     });
 
-    const currentSession = getCurrentSession();
+    const currentSession = getCachedCurrentSession();
 
     // Sync custom ordering with current session list
     sessionOrder.sync(allMuxSessions.map((s) => s.name));
@@ -657,12 +677,17 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     const orderedMuxSessions = orderedNames.map((n) => sessionByName.get(n)!);
     const portlessState = loadPortlessState();
 
-    // Batch pane counts per provider (uses BatchCapable type guard)
+    // Batch pane counts per provider in parallel via async API where
+    // available; sync fallback for legacy providers.
+    const batchProviders = allProviders.filter((p): p is typeof p & BatchCapable => isBatchCapable(p));
+    const paneCountResults = await Promise.all(batchProviders.map((p) =>
+      isAsyncReadCapable(p) && p.getAllPaneCountsAsync
+        ? p.getAllPaneCountsAsync()
+        : Promise.resolve(p.getAllPaneCounts()),
+    ));
     const paneCountMaps = new Map<MuxProvider, Map<string, number>>();
-    for (const p of allProviders) {
-      if (isBatchCapable(p)) {
-        paneCountMaps.set(p, p.getAllPaneCounts());
-      }
+    for (let i = 0; i < batchProviders.length; i++) {
+      paneCountMaps.set(batchProviders[i]!, paneCountResults[i]!);
     }
 
     const sessions: SessionData[] = orderedMuxSessions.map(({ name, createdAt, windows, dir, provider }) => {
@@ -697,7 +722,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         uptime,
         agentState: tracker.getState(name),
         agents: tracker.getAgents(name),
-        eventTimestamps: tracker.getEventTimestamps(name),
+        // eventTimestamps intentionally omitted from the wire payload —
+        // not consumed by the TUI, but a fresh number per agent-emit
+        // would defeat the broadcast hash-dedup and re-fan-out to every
+        // WS client on a sub-second cadence when agents are chatty.
         metadata: metadataStore.get(name),
       };
     });
@@ -726,25 +754,78 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     };
   }
 
-  let broadcastPending = false;
+  // Hash of the last bytes published to "sidebar". Many call sites trigger
+  // broadcastState() but most do not actually change observable state (e.g.
+  // theme polls, focus moves that resolve to the same session, agent
+  // updates that produce identical metadata). Hashing the serialized
+  // payload and skipping the publish when unchanged kills redundant fan-out
+  // to all WS clients without changing the wire protocol.
+  let lastBroadcastHash: bigint | null = null;
 
+  // 30ms debounce window — below human perception (~100ms) but enough to
+  // coalesce bursts of agent-emit broadcasts (e.g. hermes pushing
+  // tool-running → running → tool-running within the same render frame).
+  // Each broadcastStateImmediate() forks tmux 3+ times via computeState();
+  // collapsing 5 events to 1 within 30ms saves ~12 tmux forks per burst.
+  const BROADCAST_DEBOUNCE_MS = 30;
+  let broadcastDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   function broadcastState() {
-    if (broadcastPending) return;
-    broadcastPending = true;
-    queueMicrotask(() => {
-      broadcastPending = false;
+    if (broadcastDebounceTimer) return;
+    broadcastDebounceTimer = setTimeout(() => {
+      broadcastDebounceTimer = null;
       broadcastStateImmediate();
-    });
+    }, BROADCAST_DEBOUNCE_MS);
   }
 
-  function broadcastStateImmediate() {
-    invalidateCurrentSessionCache();
-    tracker.pruneStuck(STUCK_RUNNING_TIMEOUT_MS);
-    tracker.pruneTerminal();
-    lastState = computeState();
-    syncGitWatchers(lastState.sessions, broadcastState);
-    const msg = JSON.stringify(lastState);
-    server.publish("sidebar", msg);
+  // Coalesce concurrent broadcastStateImmediate calls — if a broadcast is
+  // already in flight (awaiting computeState), don't kick off another one.
+  // The trailing call sets a flag to re-broadcast once the in-flight one
+  // resolves, ensuring we capture state changes that arrive mid-compute.
+  let broadcastInFlight = false;
+  let broadcastTrailing = false;
+  async function broadcastStateImmediate(): Promise<void> {
+    if (broadcastInFlight) {
+      broadcastTrailing = true;
+      return;
+    }
+    broadcastInFlight = true;
+    try {
+      // Note: do NOT invalidate currentSession cache here. The cache is only
+      // 500ms TTL and is explicitly invalidated on real focus changes via
+      // handleFocus(). Invalidating on every broadcast (which is per
+      // agent-emit, i.e. dozens/sec under chatty watchers like hermes)
+      // forces a tmux subprocess fork inside computeState() and saturates
+      // the bun event loop.
+      tracker.pruneStuck(STUCK_RUNNING_TIMEOUT_MS);
+      tracker.pruneTerminal();
+      lastState = await computeState();
+      syncGitWatchers(lastState.sessions, broadcastState);
+      const msg = JSON.stringify(lastState);
+      const hash = Bun.hash(msg);
+      if (hash !== lastBroadcastHash) {
+        lastBroadcastHash = hash;
+        server.publish("sidebar", msg);
+      }
+      // Write the visible session ordering to a tmpfile for the tmux
+      // keybinding scripts to read. This lets switch-index.sh call
+      // `tmux switch-client -t <name>` directly without round-tripping
+      // through the server — the user-perceived latency drops to just
+      // tmux's own switch time (~30-50ms) instead of waiting on the
+      // server to fork its own tmux subprocess.
+      try {
+        const orderedNames = lastState.sessions.map((s) => s.name).join("\n");
+        writeFileSync(ORDERING_FILE, orderedNames + "\n");
+      } catch { /* non-fatal */ }
+    } finally {
+      broadcastInFlight = false;
+      if (broadcastTrailing) {
+        broadcastTrailing = false;
+        // Re-enter — without a microtask break this would unbound-recurse
+        // on persistent broadcast pressure; queueMicrotask gives the event
+        // loop a chance to process pending I/O between iterations.
+        queueMicrotask(() => { void broadcastStateImmediate(); });
+      }
+    }
   }
 
   // Lightweight current-session cache — avoids a tmux subprocess per focus update
@@ -844,11 +925,26 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     broadcastFocusOnly(sender);
   }
 
+  // Coalesce refreshPaneAgents() calls during rapid focus changes. Each
+  // call shells out to `tmux list-panes -a` plus a process-tree match
+  // (50-200ms total). When the user fires 5 rapid switches, this would
+  // serialize 5 expensive scans on the event loop. The 250ms debounce
+  // collapses bursts into one scan.
+  const REFRESH_PANE_AGENTS_DEBOUNCE_MS = 250;
+  let refreshPaneAgentsTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleRefreshPaneAgents(): void {
+    if (refreshPaneAgentsTimer) return;
+    refreshPaneAgentsTimer = setTimeout(() => {
+      refreshPaneAgentsTimer = null;
+      refreshPaneAgents();
+    }, REFRESH_PANE_AGENTS_DEBOUNCE_MS);
+  }
+
   function handleFocus(name: string): void {
     focusedSession = name;
     invalidateCurrentSessionCache();
-    // Rescan pane agents when session focus changes
-    refreshPaneAgents();
+    // Rescan pane agents when session focus changes (debounced)
+    scheduleRefreshPaneAgents();
     const hadUnseen = tracker.handleFocus(name);
     if (hadUnseen && lastState) {
       // Patch unseen flags in-place — avoids a full computeState with many subprocesses
@@ -1075,7 +1171,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       // 1. Current active window (instant)
       // 2. Other windows in the current session
       // 3. Windows in other sessions (staggered)
-      const curSession = ctx?.session ?? getCurrentSession();
+      const curSession = ctx?.session ?? getCachedCurrentSession();
 
       // Track max delay to know when all spawns are done
       let maxDelay = 0;
@@ -1160,7 +1256,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       return;
     }
 
-    const curSession = ctx?.session ?? getCurrentSession();
+    const curSession = ctx?.session ?? getCachedCurrentSession();
     if (!curSession) {
       log("ensure", "SKIP — no current session");
       return;
@@ -1210,8 +1306,10 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     // Always enforce width — session switches can change window width,
     // causing tmux to proportionally redistribute pane sizes.
     // Call directly (not scheduled) since we're already behind debouncedEnsureSidebar.
+    // reuseCache: we just listed panes above (line 1206) and the 300ms TTL
+    // cache is fresh; the inner enforce can skip its own list-panes call.
     suppressWidthReports();
-    enforceSidebarWidth();
+    enforceSidebarWidth(undefined, { reuseCache: true });
   }
 
   // Debounced ensure-sidebar — collapses rapid hook-fired calls during fast
@@ -1447,7 +1545,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   let enforcing = false;
 
-  function enforceSidebarWidth(skipWindowId?: string) {
+  function enforceSidebarWidth(skipWindowId?: string, opts?: { reuseCache?: boolean }) {
     if (enforcing) {
       log("enforce", "SKIPPED — re-entrancy guard");
       return;
@@ -1460,7 +1558,12 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       widthReportsSuppressed: areWidthReportsSuppressed(getSidebarState()),
     });
     try {
-      invalidateSidebarPaneCache();
+      // Callers that have just listed panes (e.g. ensureSidebarInWindow) can
+      // pass reuseCache to skip the invalidation and let the 300ms TTL
+      // serve a cache hit, avoiding a redundant `tmux list-panes -a` call.
+      // Each list-panes hits 50-200ms on a busy tmux; halving the calls per
+      // session switch is the largest single perf win on the hot path.
+      if (!opts?.reuseCache) invalidateSidebarPaneCache();
       for (const { provider, panes } of listSidebarPanesByProvider()) {
         for (const pane of panes) {
           if (pane.width === sidebarWidth) continue;
@@ -2059,7 +2162,16 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         break;
       case "set-theme":
         currentTheme = cmd.theme;
-        saveConfig({ theme: cmd.theme });
+        if (autoThemeFollowing) {
+          // When auto-follow is active, persist the manual choice to the
+          // appearance-specific slot so the next poll cycle does not silently
+          // overwrite it. Falls back to `theme` if mode hasn't been read yet.
+          if (currentSystemMode === "dark") saveConfig({ darkTheme: cmd.theme });
+          else if (currentSystemMode === "light") saveConfig({ lightTheme: cmd.theme });
+          else saveConfig({ theme: cmd.theme });
+        } else {
+          saveConfig({ theme: cmd.theme });
+        }
         broadcastState();
         break;
       case "set-filter":
@@ -2158,13 +2270,13 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   function cleanup() {
     for (const w of allWatchers) w.stop();
-    if (watcherBroadcastTimer) clearTimeout(watcherBroadcastTimer);
     if (debounceTimer) clearTimeout(debounceTimer);
     if (sidebarEnforceTimer) clearTimeout(sidebarEnforceTimer);
     clearClientResizeSyncTimer();
     clearProgrammaticAdjustmentTimer();
     if (portPollTimer) clearInterval(portPollTimer);
     if (paneScanTimer) clearInterval(paneScanTimer);
+    if (systemThemeWatcher) systemThemeWatcher.stop();
     for (const timer of pendingHighlightResets.values()) clearTimeout(timer);
     pendingHighlightResets.clear();
     for (const watcher of gitHeadWatchers.values()) watcher.close();
@@ -2178,7 +2290,27 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     for (const p of allProviders) p.cleanupHooks();
   }
 
-  // --- Write PID + start server ---
+  // --- Singleton guard + Write PID + start server ---
+
+  // If a previous server is already alive, bail out cleanly instead of
+  // racing it. Without this, every M-s during the brief TIME_WAIT window
+  // could spawn an additional server (especially with reusePort), leading
+  // to multiple processes sharing 7391 with disjoint in-memory state.
+  try {
+    const existingPidStr = readFileSync(PID_FILE, "utf8").trim();
+    const existingPid = Number(existingPidStr);
+    if (Number.isFinite(existingPid) && existingPid > 0 && existingPid !== process.pid) {
+      try {
+        process.kill(existingPid, 0); // probe; throws if dead
+        console.error(`opensessions: another server is already running (pid ${existingPid}). Exiting.`);
+        process.exit(0);
+      } catch {
+        // PID file exists but process is dead — stale, proceed.
+      }
+    }
+  } catch {
+    // No PID file or unreadable — first start, proceed.
+  }
 
   writeFileSync(PID_FILE, String(process.pid));
 
@@ -2303,7 +2435,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
             return new Response("invalid pi runtime payload", { status: 400 });
           }
           piLiveResolver.upsert(parsed);
-          if (clientCount > 0) refreshPaneAgents();
+          if (clientCount > 0) scheduleRefreshPaneAgents();
           return new Response(null, { status: 204 });
         } catch {
           return new Response("invalid json", { status: 400 });
@@ -2317,7 +2449,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
             return new Response("missing pid", { status: 400 });
           }
           piLiveResolver.delete(body.pid);
-          if (clientCount > 0) refreshPaneAgents();
+          if (clientCount > 0) scheduleRefreshPaneAgents();
           return new Response(null, { status: 204 });
         } catch {
           return new Response("invalid json", { status: 400 });
@@ -2605,6 +2737,37 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   }
 
   startIdleTimerIfNeeded("server booted without clients");
+
+  // --- macOS system-appearance follower -----------------------------------
+  // When `autoThemeFollowsSystem` is set, watch the macOS Appearance plist
+  // and flip between the configured dark/light themes on change. Push-based
+  // (kqueue) — replaces the previous 3-second polling loop that spawned a
+  // `defaults` subprocess on every tick.
+  if (config.autoThemeFollowsSystem && process.platform === "darwin") {
+    autoThemeFollowing = true;
+    const darkTheme = config.darkTheme ?? "catppuccin-mocha";
+    const lightTheme = config.lightTheme ?? "catppuccin-latte";
+
+    async function syncSystemTheme(mode?: "dark" | "light") {
+      const observed = mode ?? (await readMacSystemAppearance());
+      currentSystemMode = observed;
+      // Re-read the per-mode theme each cycle so a manual override via the
+      // `set-theme` handler (which writes to `darkTheme` / `lightTheme`) is
+      // honoured on the next event instead of being silently overwritten.
+      const fresh = loadConfig();
+      const dark = fresh.darkTheme ?? darkTheme;
+      const light = fresh.lightTheme ?? lightTheme;
+      const desired = themeForSystemMode(observed, dark, light);
+      if (desired === currentTheme) return;
+      log("system-theme", "switching", { mode: observed, from: currentTheme, to: desired });
+      currentTheme = desired;
+      broadcastState();
+    }
+
+    systemThemeWatcher = watchMacSystemAppearance((mode) => { void syncSystemTheme(mode); });
+    log("system-theme", "watcher started", { darkTheme, lightTheme });
+  }
+  // ------------------------------------------------------------------------
 
   process.on("SIGINT", () => { cleanup(); process.exit(0); });
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
