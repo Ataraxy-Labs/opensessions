@@ -44,6 +44,11 @@ function resolvePidFile(serverKey: string | null): string {
   return `/tmp/opensessions.${serverKey}.pid`;
 }
 
+function resolveOrderingFile(serverKey: string | null): string {
+  if (!serverKey) return "/tmp/opensessions.ordering";
+  return `/tmp/opensessions.${serverKey}.ordering`;
+}
+
 export const SERVER_KEY = resolveServerKey();
 export const SERVER_PORT = resolveServerPort(SERVER_KEY);
 export const SERVER_HOST = process.env.OPENSESSIONS_HOST?.trim() || DEFAULT_SERVER_HOST;
@@ -52,6 +57,7 @@ export const SERVER_HOST = process.env.OPENSESSIONS_HOST?.trim() || DEFAULT_SERV
 // whichever address SERVER_HOST is bound to.
 export const LOCAL_CLIENT_HOST = "127.0.0.1";
 export const PID_FILE = resolvePidFile(SERVER_KEY);
+export const ORDERING_FILE = resolveOrderingFile(SERVER_KEY);
 // 30s was too aggressive: any time the server is restarted (manual respawn,
 // tmux plugin update, code change) the TUI clients live inside sidebar panes
 // that haven't been recreated yet. By the time the user presses the toggle

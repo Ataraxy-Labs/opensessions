@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync, appendFileSync, watch, type FSWatcher } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import type { MuxProvider } from "../contracts/mux";
-import { isFullSidebarCapable, isBatchCapable } from "../contracts/mux";
+import type { MuxProvider, BatchCapable } from "../contracts/mux";
+import { isFullSidebarCapable, isBatchCapable, isAsyncReadCapable } from "../contracts/mux";
 import type { AgentEvent, AgentStatus, PanePresenceInput } from "../contracts/agent";
 import type { AgentThreadOwner, AgentWatcher, AgentWatcherContext } from "../contracts/agent-watcher";
 import { AgentTracker } from "../agents/tracker";
@@ -42,6 +42,7 @@ import {
   SERVER_HOST,
   LOCAL_CLIENT_HOST,
   PID_FILE,
+  ORDERING_FILE,
   SERVER_IDLE_TIMEOUT_MS,
   STUCK_RUNNING_TIMEOUT_MS,
 } from "../shared";
@@ -642,11 +643,18 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     return null;
   }
 
-  function computeState(): ServerState {
-    // Merge sessions from all providers
+  async function computeState(): Promise<ServerState> {
+    // Merge sessions from all providers. Run async-capable providers in
+    // parallel so the bun event loop keeps serving HTTP during the tmux
+    // forks. Falls back to sync listSessions() for providers that don't
+    // implement the async API (e.g. legacy zellij).
+    const sessionLists = await Promise.all(
+      allProviders.map((p) => isAsyncReadCapable(p) ? p.listSessionsAsync() : Promise.resolve(p.listSessions())),
+    );
     const allMuxSessions: (import("../contracts/mux").MuxSessionInfo & { provider: MuxProvider })[] = [];
-    for (const p of allProviders) {
-      for (const s of p.listSessions()) {
+    for (let i = 0; i < allProviders.length; i++) {
+      const p = allProviders[i]!;
+      for (const s of sessionLists[i]!) {
         allMuxSessions.push({ ...s, provider: p });
       }
     }
@@ -655,7 +663,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       return a.name.localeCompare(b.name);
     });
 
-    const currentSession = getCurrentSession();
+    const currentSession = getCachedCurrentSession();
 
     // Sync custom ordering with current session list
     sessionOrder.sync(allMuxSessions.map((s) => s.name));
@@ -669,12 +677,17 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     const orderedMuxSessions = orderedNames.map((n) => sessionByName.get(n)!);
     const portlessState = loadPortlessState();
 
-    // Batch pane counts per provider (uses BatchCapable type guard)
+    // Batch pane counts per provider in parallel via async API where
+    // available; sync fallback for legacy providers.
+    const batchProviders = allProviders.filter((p): p is typeof p & BatchCapable => isBatchCapable(p));
+    const paneCountResults = await Promise.all(batchProviders.map((p) =>
+      isAsyncReadCapable(p) && p.getAllPaneCountsAsync
+        ? p.getAllPaneCountsAsync()
+        : Promise.resolve(p.getAllPaneCounts()),
+    ));
     const paneCountMaps = new Map<MuxProvider, Map<string, number>>();
-    for (const p of allProviders) {
-      if (isBatchCapable(p)) {
-        paneCountMaps.set(p, p.getAllPaneCounts());
-      }
+    for (let i = 0; i < batchProviders.length; i++) {
+      paneCountMaps.set(batchProviders[i]!, paneCountResults[i]!);
     }
 
     const sessions: SessionData[] = orderedMuxSessions.map(({ name, createdAt, windows, dir, provider }) => {
@@ -741,7 +754,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     };
   }
 
-  let broadcastPending = false;
   // Hash of the last bytes published to "sidebar". Many call sites trigger
   // broadcastState() but most do not actually change observable state (e.g.
   // theme polls, focus moves that resolve to the same session, agent
@@ -750,26 +762,70 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // to all WS clients without changing the wire protocol.
   let lastBroadcastHash: bigint | null = null;
 
+  // 30ms debounce window — below human perception (~100ms) but enough to
+  // coalesce bursts of agent-emit broadcasts (e.g. hermes pushing
+  // tool-running → running → tool-running within the same render frame).
+  // Each broadcastStateImmediate() forks tmux 3+ times via computeState();
+  // collapsing 5 events to 1 within 30ms saves ~12 tmux forks per burst.
+  const BROADCAST_DEBOUNCE_MS = 30;
+  let broadcastDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   function broadcastState() {
-    if (broadcastPending) return;
-    broadcastPending = true;
-    queueMicrotask(() => {
-      broadcastPending = false;
+    if (broadcastDebounceTimer) return;
+    broadcastDebounceTimer = setTimeout(() => {
+      broadcastDebounceTimer = null;
       broadcastStateImmediate();
-    });
+    }, BROADCAST_DEBOUNCE_MS);
   }
 
-  function broadcastStateImmediate() {
-    invalidateCurrentSessionCache();
-    tracker.pruneStuck(STUCK_RUNNING_TIMEOUT_MS);
-    tracker.pruneTerminal();
-    lastState = computeState();
-    syncGitWatchers(lastState.sessions, broadcastState);
-    const msg = JSON.stringify(lastState);
-    const hash = Bun.hash(msg);
-    if (hash === lastBroadcastHash) return;
-    lastBroadcastHash = hash;
-    server.publish("sidebar", msg);
+  // Coalesce concurrent broadcastStateImmediate calls — if a broadcast is
+  // already in flight (awaiting computeState), don't kick off another one.
+  // The trailing call sets a flag to re-broadcast once the in-flight one
+  // resolves, ensuring we capture state changes that arrive mid-compute.
+  let broadcastInFlight = false;
+  let broadcastTrailing = false;
+  async function broadcastStateImmediate(): Promise<void> {
+    if (broadcastInFlight) {
+      broadcastTrailing = true;
+      return;
+    }
+    broadcastInFlight = true;
+    try {
+      // Note: do NOT invalidate currentSession cache here. The cache is only
+      // 500ms TTL and is explicitly invalidated on real focus changes via
+      // handleFocus(). Invalidating on every broadcast (which is per
+      // agent-emit, i.e. dozens/sec under chatty watchers like hermes)
+      // forces a tmux subprocess fork inside computeState() and saturates
+      // the bun event loop.
+      tracker.pruneStuck(STUCK_RUNNING_TIMEOUT_MS);
+      tracker.pruneTerminal();
+      lastState = await computeState();
+      syncGitWatchers(lastState.sessions, broadcastState);
+      const msg = JSON.stringify(lastState);
+      const hash = Bun.hash(msg);
+      if (hash !== lastBroadcastHash) {
+        lastBroadcastHash = hash;
+        server.publish("sidebar", msg);
+      }
+      // Write the visible session ordering to a tmpfile for the tmux
+      // keybinding scripts to read. This lets switch-index.sh call
+      // `tmux switch-client -t <name>` directly without round-tripping
+      // through the server — the user-perceived latency drops to just
+      // tmux's own switch time (~30-50ms) instead of waiting on the
+      // server to fork its own tmux subprocess.
+      try {
+        const orderedNames = lastState.sessions.map((s) => s.name).join("\n");
+        writeFileSync(ORDERING_FILE, orderedNames + "\n");
+      } catch { /* non-fatal */ }
+    } finally {
+      broadcastInFlight = false;
+      if (broadcastTrailing) {
+        broadcastTrailing = false;
+        // Re-enter — without a microtask break this would unbound-recurse
+        // on persistent broadcast pressure; queueMicrotask gives the event
+        // loop a chance to process pending I/O between iterations.
+        queueMicrotask(() => { void broadcastStateImmediate(); });
+      }
+    }
   }
 
   // Lightweight current-session cache — avoids a tmux subprocess per focus update
@@ -869,11 +925,26 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     broadcastFocusOnly(sender);
   }
 
+  // Coalesce refreshPaneAgents() calls during rapid focus changes. Each
+  // call shells out to `tmux list-panes -a` plus a process-tree match
+  // (50-200ms total). When the user fires 5 rapid switches, this would
+  // serialize 5 expensive scans on the event loop. The 250ms debounce
+  // collapses bursts into one scan.
+  const REFRESH_PANE_AGENTS_DEBOUNCE_MS = 250;
+  let refreshPaneAgentsTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleRefreshPaneAgents(): void {
+    if (refreshPaneAgentsTimer) return;
+    refreshPaneAgentsTimer = setTimeout(() => {
+      refreshPaneAgentsTimer = null;
+      refreshPaneAgents();
+    }, REFRESH_PANE_AGENTS_DEBOUNCE_MS);
+  }
+
   function handleFocus(name: string): void {
     focusedSession = name;
     invalidateCurrentSessionCache();
-    // Rescan pane agents when session focus changes
-    refreshPaneAgents();
+    // Rescan pane agents when session focus changes (debounced)
+    scheduleRefreshPaneAgents();
     const hadUnseen = tracker.handleFocus(name);
     if (hadUnseen && lastState) {
       // Patch unseen flags in-place — avoids a full computeState with many subprocesses
@@ -1100,7 +1171,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       // 1. Current active window (instant)
       // 2. Other windows in the current session
       // 3. Windows in other sessions (staggered)
-      const curSession = ctx?.session ?? getCurrentSession();
+      const curSession = ctx?.session ?? getCachedCurrentSession();
 
       // Track max delay to know when all spawns are done
       let maxDelay = 0;
@@ -1185,7 +1256,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       return;
     }
 
-    const curSession = ctx?.session ?? getCurrentSession();
+    const curSession = ctx?.session ?? getCachedCurrentSession();
     if (!curSession) {
       log("ensure", "SKIP — no current session");
       return;
@@ -2364,7 +2435,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
             return new Response("invalid pi runtime payload", { status: 400 });
           }
           piLiveResolver.upsert(parsed);
-          if (clientCount > 0) refreshPaneAgents();
+          if (clientCount > 0) scheduleRefreshPaneAgents();
           return new Response(null, { status: 204 });
         } catch {
           return new Response("invalid json", { status: 400 });
@@ -2378,7 +2449,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
             return new Response("missing pid", { status: 400 });
           }
           piLiveResolver.delete(body.pid);
-          if (clientCount > 0) refreshPaneAgents();
+          if (clientCount > 0) scheduleRefreshPaneAgents();
           return new Response(null, { status: 204 });
         } catch {
           return new Response("invalid json", { status: 400 });

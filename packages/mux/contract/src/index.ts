@@ -10,6 +10,7 @@ export type {
   WindowCapable,
   SidebarCapable,
   BatchCapable,
+  AsyncReadCapable,
   FullMuxProvider,
   MuxProvider,
   MuxProviderSettings,
@@ -20,5 +21,6 @@ export {
   isWindowCapable,
   isSidebarCapable,
   isBatchCapable,
+  isAsyncReadCapable,
   isFullSidebarCapable,
 } from "./types";

@@ -136,6 +136,20 @@ export interface SplitWindowOptions {
 /** Field delimiter — tab character, universally supported by tmux */
 const SEP = "\t";
 
+/** Shared parser used by getActiveSessionDirs() sync + async variants */
+function parseActiveSessionDirsOutput(stdout: string, dirs: Map<string, string>): Map<string, string> {
+  if (!stdout) return dirs;
+  for (const line of stdout.split("\n")) {
+    if (!line) continue;
+    const sep = line.indexOf(SEP);
+    if (sep < 0) continue;
+    const session = line.slice(0, sep);
+    const cwd = line.slice(sep + 1);
+    if (!dirs.has(session)) dirs.set(session, cwd);
+  }
+  return dirs;
+}
+
 type Parser<T> = (raw: string) => T;
 
 const str: Parser<string> = (s) => s;
@@ -270,10 +284,51 @@ export class TmuxClient {
     }
   }
 
+  /**
+   * Async sibling of run(). Uses Bun.spawn (non-blocking) so callers can
+   * await the tmux subprocess without blocking the bun event loop. Used by
+   * hot read-only paths in the runtime where sync would block all incoming
+   * HTTP traffic during the tmux fork.
+   */
+  async runAsync(args: readonly string[], options?: { throwOnError?: boolean }): Promise<TmuxRunResult> {
+    const fullArgs = [this.bin, ...this.globalArgs, ...args];
+    const shouldThrow = options?.throwOnError ?? this.throwOnError;
+
+    try {
+      const proc = Bun.spawn(fullArgs, { stdout: "pipe", stderr: "pipe" });
+      const exitCode = await proc.exited;
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      const out: TmuxRunResult = {
+        args: fullArgs,
+        exitCode,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        ok: exitCode === 0,
+      };
+      if (!out.ok && shouldThrow) throw new TmuxError(out);
+      return out;
+    } catch (e) {
+      if (e instanceof TmuxError) throw e;
+      return {
+        args: fullArgs,
+        exitCode: -1,
+        stdout: "",
+        stderr: e instanceof Error ? e.message : String(e),
+        ok: false,
+      };
+    }
+  }
+
   // ─── Sessions ──────────────────────────────────────
 
   listSessions(): SessionInfo[] {
     const { stdout } = this.run(["list-sessions", "-F", SESSION_FORMAT]);
+    return parseRows(SESSION_SPEC, stdout);
+  }
+
+  async listSessionsAsync(): Promise<SessionInfo[]> {
+    const { stdout } = await this.runAsync(["list-sessions", "-F", SESSION_FORMAT]);
     return parseRows(SESSION_SPEC, stdout);
   }
 
@@ -322,6 +377,20 @@ export class TmuxClient {
     }
     args.push("-F", PANE_FORMAT);
     const { stdout } = this.run(args);
+    return parseRows(PANE_SPEC, stdout);
+  }
+
+  async listPanesAsync(options?: PaneScope): Promise<PaneInfo[]> {
+    const args = ["list-panes"];
+    if (!options || !options.scope || options.scope === "all") {
+      args.push("-a");
+    } else if (options.scope === "session") {
+      args.push("-s", "-t", options.target);
+    } else if (options.scope === "window") {
+      args.push("-t", options.target);
+    }
+    args.push("-F", PANE_FORMAT);
+    const { stdout } = await this.runAsync(args);
     return parseRows(PANE_SPEC, stdout);
   }
 
@@ -381,8 +450,17 @@ export class TmuxClient {
     return parseRows(CLIENT_SPEC, stdout);
   }
 
+  async listClientsAsync(): Promise<ClientInfo[]> {
+    const { stdout } = await this.runAsync(["list-clients", "-F", CLIENT_FORMAT]);
+    return parseRows(CLIENT_SPEC, stdout);
+  }
+
   private getInteractiveClients(): ClientInfo[] {
     return this.listClients().filter((client) => client.tty.length > 0);
+  }
+
+  private async getInteractiveClientsAsync(): Promise<ClientInfo[]> {
+    return (await this.listClientsAsync()).filter((client) => client.tty.length > 0);
   }
 
   switchClient(target: string, options?: { clientTty?: string }): void {
@@ -421,6 +499,12 @@ export class TmuxClient {
     return clients[0]!.sessionName || null;
   }
 
+  async getCurrentSessionAsync(): Promise<string | null> {
+    const clients = await this.getInteractiveClientsAsync();
+    if (clients.length === 0) return null;
+    return clients[0]!.sessionName || null;
+  }
+
   /**
    * Get the client TTY for the current client
    */
@@ -455,16 +539,17 @@ export class TmuxClient {
       "-f", "#{&&:#{window_active},#{!=:#{pane_title},opensessions-sidebar}}",
       "-F", `#{session_name}${SEP}#{pane_current_path}`,
     ]);
-    if (!stdout) return dirs;
-    for (const line of stdout.split("\n")) {
-      if (!line) continue;
-      const sep = line.indexOf(SEP);
-      if (sep < 0) continue;
-      const session = line.slice(0, sep);
-      const cwd = line.slice(sep + 1);
-      if (!dirs.has(session)) dirs.set(session, cwd);
-    }
-    return dirs;
+    return parseActiveSessionDirsOutput(stdout, dirs);
+  }
+
+  async getActiveSessionDirsAsync(): Promise<Map<string, string>> {
+    const dirs = new Map<string, string>();
+    const { stdout } = await this.runAsync([
+      "list-panes", "-a",
+      "-f", "#{&&:#{window_active},#{!=:#{pane_title},opensessions-sidebar}}",
+      "-F", `#{session_name}${SEP}#{pane_current_path}`,
+    ]);
+    return parseActiveSessionDirsOutput(stdout, dirs);
   }
 
   /**
@@ -474,6 +559,15 @@ export class TmuxClient {
   getAllPaneCounts(): Map<string, number> {
     const counts = new Map<string, number>();
     const panes = this.listPanes({ scope: "all" });
+    for (const p of panes) {
+      counts.set(p.sessionName, (counts.get(p.sessionName) ?? 0) + 1);
+    }
+    return counts;
+  }
+
+  async getAllPaneCountsAsync(): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    const panes = await this.listPanesAsync({ scope: "all" });
     for (const p of panes) {
       counts.set(p.sessionName, (counts.get(p.sessionName) ?? 0) + 1);
     }

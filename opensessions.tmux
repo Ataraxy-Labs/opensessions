@@ -44,7 +44,7 @@ bind_global_key() {
   local key="$1"
   local command="$2"
   [ -n "$key" ] || return
-  tmux bind-key -n "$key" run-shell "$command"
+  tmux bind-key -n "$key" run-shell -b "$command"
 }
 
 bind_global_index_keys() {
@@ -52,7 +52,7 @@ bind_global_index_keys() {
   local key
   for key in $INDEX_KEYS; do
     [ "$index" -le 9 ] || break
-    tmux bind-key -n "$key" run-shell "sh '$SCRIPTS_DIR/switch-index.sh' $index"
+    tmux bind-key -n "$key" run-shell -b "sh '$SCRIPTS_DIR/switch-index.sh' $index '#{client_tty}|#{session_name}|#{window_id}'"
     index=$((index + 1))
   done
 }
@@ -88,21 +88,23 @@ fi
 if [ -n "$PREFIX_KEY" ]; then
   tmux bind-key "$PREFIX_KEY" switch-client -T "$COMMAND_TABLE"
   tmux bind-key -T "$COMMAND_TABLE" Any switch-client -T root
-  tmux bind-key -T "$COMMAND_TABLE" s run-shell "sh '$SCRIPTS_DIR/focus.sh'"
-  tmux bind-key -T "$COMMAND_TABLE" t run-shell "sh '$SCRIPTS_DIR/toggle.sh'"
-  tmux bind-key -T "$COMMAND_TABLE" e run-shell "sh '$SCRIPTS_DIR/even-horizontal.sh' '#{window_id}' '#{pane_id}'"
+  tmux bind-key -T "$COMMAND_TABLE" s run-shell -b "sh '$SCRIPTS_DIR/focus.sh'"
+  tmux bind-key -T "$COMMAND_TABLE" t run-shell -b "sh '$SCRIPTS_DIR/toggle.sh'"
+  tmux bind-key -T "$COMMAND_TABLE" e run-shell -b "sh '$SCRIPTS_DIR/even-horizontal.sh' '#{window_id}' '#{pane_id}'"
+  # Pass tmux-expanded ctx as $2 so the script doesn't need to fork
+  # `tmux display-message`. Then immediately reset keytable.
   for i in 1 2 3 4 5 6 7 8 9; do
-    tmux bind-key -T "$COMMAND_TABLE" "$i" run-shell "sh '$SCRIPTS_DIR/switch-index.sh' $i"
+    tmux bind-key -T "$COMMAND_TABLE" "$i" run-shell -b "sh '$SCRIPTS_DIR/switch-index.sh' $i '#{client_tty}|#{session_name}|#{window_id}'" \; switch-client -T root
   done
 fi
 
 # Direct prefix bindings for programmatic use (terminal emulator shortcuts).
 # C-s/C-t are single-byte Ctrl codes; M-1..9 are 2-byte Alt sequences.
 # Both are safe to send as text from terminal emulators without timing issues.
-tmux bind-key C-s run-shell "sh '$SCRIPTS_DIR/focus.sh'"
-tmux bind-key C-t run-shell "sh '$SCRIPTS_DIR/toggle.sh'"
+tmux bind-key C-s run-shell -b "sh '$SCRIPTS_DIR/focus.sh'"
+tmux bind-key C-t run-shell -b "sh '$SCRIPTS_DIR/toggle.sh'"
 for i in 1 2 3 4 5 6 7 8 9; do
-  tmux bind-key "M-$i" run-shell "sh '$SCRIPTS_DIR/switch-index.sh' $i"
+  tmux bind-key "M-$i" run-shell -b "sh '$SCRIPTS_DIR/switch-index.sh' $i '#{client_tty}|#{session_name}|#{window_id}'"
 done
 
 bind_global_key "$FOCUS_GLOBAL_KEY" "sh '$SCRIPTS_DIR/focus.sh'"
