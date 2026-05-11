@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, unlinkSync, writeFileSync, appendFileSync, watch, type FSWatcher } from "fs";
+import { randomBytes } from "crypto";
 import { join } from "path";
 import { homedir } from "os";
 import type { MuxProvider } from "../contracts/mux";
@@ -23,6 +24,7 @@ import {
   readSidebarCoordinatorState,
 } from "./sidebar-coordinator";
 import { isLastLiveOpensessionsInstance } from "./server-instance-scope";
+import { isAuthorizedToken, isLivenessProbe } from "./server-auth";
 import { loadConfig, saveConfig } from "../config";
 import type { SessionFilterMode } from "../config";
 import {
@@ -37,6 +39,8 @@ import {
   SERVER_HOST,
   LOCAL_CLIENT_HOST,
   PID_FILE,
+  TOKEN_FILE,
+  AUTH_TOKEN_HEADER,
   SERVER_IDLE_TIMEOUT_MS,
   STUCK_RUNNING_TIMEOUT_MS,
 } from "../shared";
@@ -2283,6 +2287,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     clearResizeStaggerTimers();
     sidebarCoordinator.stop();
     try { unlinkSync(PID_FILE); } catch {}
+    try { unlinkSync(TOKEN_FILE); } catch {}
     // Global tmux hooks are shared by every opensessions server on this
     // machine. Only unset them when this is the last live instance — otherwise
     // we'd kneecap a sibling server (e.g. one bound to a different tmux
@@ -2303,12 +2308,35 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // --- Write PID + start server ---
 
   writeFileSync(PID_FILE, String(process.pid));
+  // 32 random bytes = 256 bits of entropy, hex-encoded so it can ride
+  // unmodified through tmux command lines, environment variables, and
+  // `curl -H` arguments.
+  const authToken = randomBytes(32).toString("hex");
+  writeFileSync(TOKEN_FILE, authToken, { mode: 0o600 });
 
   const server = Bun.serve({
     port: SERVER_PORT,
     hostname: SERVER_HOST,
     async fetch(req, server) {
       const url = new URL(req.url);
+
+      // Allow unauthenticated liveness probe on GET / (used by the
+      // tmux-plugin server-common.sh to decide whether to start the
+      // server). Block WebSocket upgrades on the same path so they
+      // can't bypass auth.
+      if (isLivenessProbe(req.method, url.pathname, !!req.headers.get("upgrade"))) {
+        return new Response("opensessions server", { status: 200 });
+      }
+
+      if (
+        !isAuthorizedToken({
+          expected: authToken,
+          headerToken: req.headers.get(AUTH_TOKEN_HEADER),
+          queryToken: url.searchParams.get("token"),
+        })
+      ) {
+        return new Response("unauthorized", { status: 401 });
+      }
 
       if (req.method === "POST" && url.pathname === "/refresh") {
         broadcastState();
@@ -2661,7 +2689,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // Local tmux hooks always curl loopback, regardless of what address
   // the server binds to. SERVER_HOST may be 0.0.0.0 or a bridge IP to
   // accept remote POSTs, but in-process hooks should never use that.
-  for (const p of allProviders) p.setupHooks(LOCAL_CLIENT_HOST, SERVER_PORT);
+  for (const p of allProviders) p.setupHooks(LOCAL_CLIENT_HOST, SERVER_PORT, TOKEN_FILE);
   // Older builds stashed hidden tmux sidebars in _os_stash and kept them
   // running. Clear any legacy stash session on startup so hidden panes do not
   // keep bloating the tmux server after upgrades.

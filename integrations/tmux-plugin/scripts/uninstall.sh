@@ -37,9 +37,17 @@ tmux kill-session -t "_os_stash" 2>/dev/null || true
 echo "  ✓ removed stash session"
 
 # --- Kill the server ---
-PORT="${OPENSESSIONS_PORT:-7391}"
-HOST="${OPENSESSIONS_HOST:-127.0.0.1}"
-curl -s -o /dev/null -X POST "http://${HOST}:${PORT}/shutdown" 2>/dev/null || true
+# Source server-common.sh so we resolve the per-instance PORT/HOST and
+# token the same way the runtime does. Use a subshell to keep `set -e`
+# from aborting the rest of the uninstall if the server's already gone.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+(
+  set +e
+  . "$SCRIPT_DIR/server-common.sh"
+  # /quit is the canonical "tear down this server instance" endpoint;
+  # /shutdown was a leftover that never existed in the runtime.
+  auth_post "/quit" >/dev/null 2>&1 || true
+) || true
 echo "  ✓ stopped server (if running)"
 
 # --- Remove keybindings ---

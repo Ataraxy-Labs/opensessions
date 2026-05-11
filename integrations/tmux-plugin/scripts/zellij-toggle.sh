@@ -15,6 +15,10 @@ set -euo pipefail
 
 PORT="${OPENSESSIONS_PORT:-7391}"
 HOST="${OPENSESSIONS_HOST:-127.0.0.1}"
+# Zellij never sets $TMUX, so SERVER_KEY is empty and the server uses
+# the unkeyed defaults. Honor explicit overrides for parity with
+# server-common.sh.
+TOKEN_FILE="${OPENSESSIONS_TOKEN_FILE:-/tmp/opensessions.token}"
 
 OPENSESSIONS_DIR="${OPENSESSIONS_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 BUN_PATH="${BUN_PATH:-$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")}"
@@ -50,4 +54,12 @@ except: print('0')" 2>/dev/null || echo "0")
 fi
 
 CTX="|${SESSION_NAME}|${TAB_ID}"
-curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"
+TOKEN=""
+if [ -f "$TOKEN_FILE" ]; then
+    TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+fi
+if [ -n "$TOKEN" ]; then
+    curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 \
+        -X POST -H "x-opensessions-token: $TOKEN" \
+        "http://${HOST}:${PORT}/toggle" -d "$CTX"
+fi

@@ -88,7 +88,7 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     tmux.killSession(name);
   }
 
-  setupHooks(serverHost: string, serverPort: number): void {
+  setupHooks(serverHost: string, serverPort: number, tokenFile?: string): void {
     // Enable terminal focus reporting forwarding so the sidebar TUI can
     // distinguish real keystrokes (delivered with focus-in escape sequences)
     // from `tmux send-keys` injection (which delivers raw bytes without
@@ -97,9 +97,19 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     try { rawTmux(["set-option", "-g", "focus-events", "on"]); } catch {}
 
     const base = `http://${serverHost}:${serverPort}`;
+    // tmux passes the run-shell body to /bin/sh at hook fire time; we resolve
+    // the token via `cat` inside that shell so a server restart that rotates
+    // the token doesn't require re-installing every hook. The single-quoted
+    // header prefix is concatenated (shell-style) with the `$(cat ...)`
+    // expansion. If the token file is missing the header value is empty and
+    // the server returns 401 — the curl no-ops via `|| true`, which is the
+    // right behaviour while the token is being written during startup.
+    const authHeader = tokenFile
+      ? ` -H 'x-opensessions-token: '$(cat ${tokenFile} 2>/dev/null)`
+      : "";
     const hookPost = (path: string, data?: string) => {
       const body = data ? ` -d '${data}'` : "";
-      return `run-shell -b "curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST ${base}${path}${body} >/dev/null 2>&1 || true"`;
+      return `run-shell -b "curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST${authHeader} ${base}${path}${body} >/dev/null 2>&1 || true"`;
     };
     // tmux expands #{} formats at hook-fire time — no need for $(tmux display-message)
     // Use | as field separator (safe for session names, window IDs, TTYs)

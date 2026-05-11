@@ -1,5 +1,5 @@
 import { render } from "@opentui/solid";
-import { appendFileSync } from "fs";
+import { appendFileSync, readFileSync } from "fs";
 import { createSignal, createEffect, onCleanup, onMount, batch, For, Show, createMemo, createSelector, type Accessor } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { useKeyboard, useRenderer } from "@opentui/solid";
@@ -17,6 +17,7 @@ import {
   TERMINAL_STATUSES,
   SERVER_PORT,
   SERVER_HOST,
+  TOKEN_FILE,
   BUILTIN_THEMES,
   loadConfig,
   resolveTheme,
@@ -631,7 +632,13 @@ function App() {
       }
     });
 
-    const socket = new WebSocket(`ws://${SERVER_HOST}:${SERVER_PORT}`);
+    // Read the per-instance auth token written by the server at startup.
+    // Empty string falls through to a 401 on the upgrade — server logs make
+    // that obvious, and the reconnect loop will retry once the file lands.
+    let authToken = "";
+    try { authToken = readFileSync(TOKEN_FILE, "utf-8").trim(); } catch {}
+    const wsQuery = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+    const socket = new WebSocket(`ws://${SERVER_HOST}:${SERVER_PORT}/${wsQuery}`);
     ws = socket;
 
     socket.onopen = () => {
