@@ -299,4 +299,64 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
       }
     }
   }
+
+  /**
+   * spawn-shell counterpart to killOrphanedSidebarPanes. For each window
+   * where a sidebar is the only pane left, spawn a fresh shell pane on
+   * the opposite side so the window stays usable. Then defensively dedupe
+   * any duplicate sidebars in windows that already have neighbours.
+   *
+   * Idempotent: re-running on a window that already has a shell + sidebar
+   * is a no-op (the lonely-sidebar branch never fires there).
+   */
+  protectOrphanedSidebars(): void {
+    const allPanes = tmux.listPanes();
+    const windowPaneCounts = new Map<string, number>();
+    const sidebarsByWindow = new Map<string, typeof allPanes>();
+    for (const p of allPanes) {
+      if (p.sessionName === STASH_SESSION) continue;
+      windowPaneCounts.set(p.windowId, (windowPaneCounts.get(p.windowId) ?? 0) + 1);
+      if (p.title !== SIDEBAR_PANE_TITLE) continue;
+      const panes = sidebarsByWindow.get(p.windowId) ?? [];
+      panes.push(p);
+      sidebarsByWindow.set(p.windowId, panes);
+    }
+
+    for (const [windowId, sidebars] of sidebarsByWindow) {
+      const totalPanes = windowPaneCounts.get(windowId) ?? 0;
+      if (totalPanes === 1 && sidebars.length === 1) {
+        const sidebar = sidebars[0]!;
+        // Sidebar at column 0 → it's anchored left → put the new shell to
+        // its right (before=false). Otherwise it's anchored right → put
+        // the new shell to its left (before=true).
+        const before = sidebar.left !== 0;
+        plog("protectOrphanedSidebars: spawning shell next to lonely sidebar", {
+          windowId,
+          sidebarId: sidebar.id,
+          before,
+        });
+        const spawned = tmux.splitWindow({
+          target: sidebar.id,
+          direction: "horizontal",
+          before,
+        });
+        if (!spawned) {
+          // splitWindow failed (e.g. window too narrow). Fall back to the
+          // kill behaviour so we don't leave a broken state.
+          plog("protectOrphanedSidebars: splitWindow FAILED, falling back to kill", {
+            sidebarId: sidebar.id,
+          });
+          tmux.killPane(sidebar.id);
+        }
+        continue;
+      }
+      if (sidebars.length <= 1) continue;
+      // Same defensive duplicate cleanup as killOrphanedSidebarPanes —
+      // multi-sidebar windows never benefit from spawn-shell.
+      for (const pane of sidebars.slice(1)) {
+        plog("protectOrphanedSidebars: killing duplicate sidebar", { paneId: pane.id, windowId });
+        tmux.killPane(pane.id);
+      }
+    }
+  }
 }

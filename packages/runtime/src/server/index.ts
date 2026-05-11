@@ -25,8 +25,8 @@ import {
 } from "./sidebar-coordinator";
 import { isLastLiveOpensessionsInstance } from "./server-instance-scope";
 import { isAuthorizedToken, isLivenessProbe } from "./server-auth";
-import { loadConfig, saveConfig } from "../config";
-import type { SessionFilterMode } from "../config";
+import { loadConfig, resolveLonelySidebarPolicy, saveConfig } from "../config";
+import type { LonelySidebarPolicy, SessionFilterMode } from "../config";
 import {
   clampSidebarWidth,
 } from "./sidebar-width-sync";
@@ -311,6 +311,11 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   let currentFilter: SessionFilterMode | undefined = config.sessionFilter;
   const initialSidebarWidth = clampSidebarWidth(config.sidebarWidth ?? 26);
   let sidebarPosition: "left" | "right" = config.sidebarPosition ?? "left";
+  // Env var wins over config so smoke tests / one-off invocations don't have
+  // to mutate ~/.config. Falls back to the config value, then the default.
+  const lonelySidebarPolicy: LonelySidebarPolicy = resolveLonelySidebarPolicy(
+    process.env.OPENSESSIONS_LONELY_SIDEBAR_POLICY?.trim() || config.lonelySidebarPolicy,
+  );
   const sidebarCoordinator = createSidebarCoordinator({ width: initialSidebarWidth });
 
   // The sidebar launcher lives with the TUI app, not the tmux integration layer.
@@ -323,7 +328,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   log("server", "config loaded", {
     sidebarWidth: initialSidebarWidth, sidebarPosition, scriptsDir,
-    theme: currentTheme, configKeys: Object.keys(config),
+    theme: currentTheme, lonelySidebarPolicy, configKeys: Object.keys(config),
   });
 
   // Bootstrap active sessions
@@ -2435,12 +2440,18 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         return new Response("ok", { status: 200 });
       }
 
-      // pane-exited hook: a pane closed — kill orphaned sidebar panes
+      // pane-exited hook: a pane closed — apply the configured lonely-
+      // sidebar policy ("kill" by default, or "spawn-shell" to keep the
+      // window alive by inserting a fresh shell next to the sidebar).
       if (req.method === "POST" && url.pathname === "/pane-exited") {
         if (isSidebarVisible()) {
           invalidateSidebarPaneCache();
           for (const { provider } of listSidebarPanesByProvider()) {
-            provider.killOrphanedSidebarPanes();
+            if (lonelySidebarPolicy === "spawn-shell" && provider.protectOrphanedSidebars) {
+              provider.protectOrphanedSidebars();
+            } else {
+              provider.killOrphanedSidebarPanes();
+            }
           }
         }
         // Drop pane ids from our owned set when their tmux pane is gone, so
@@ -2702,7 +2713,15 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const sidebarPresence = reconcileSidebarPresence();
   if (sidebarPresence.visible) {
     for (const { provider } of listSidebarPanesByProvider()) {
-      provider.killOrphanedSidebarPanes();
+      // Apply the same lonely-sidebar policy at startup — restored sidebars
+      // from tmux-resurrect/continuum or a previous opensessions run can
+      // leave windows with nothing but a sidebar, and "spawn-shell" users
+      // expect that to be protected, not killed.
+      if (lonelySidebarPolicy === "spawn-shell" && provider.protectOrphanedSidebars) {
+        provider.protectOrphanedSidebars();
+      } else {
+        provider.killOrphanedSidebarPanes();
+      }
     }
     const panesByProvider = reconcileSidebarPresence();
     if (panesByProvider.visible) {

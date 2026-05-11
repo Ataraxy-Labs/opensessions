@@ -25,6 +25,33 @@ export interface OpensessionsConfig {
   detailPanelHeights?: Record<string, number>;
   /** Default session filter: "all" (default), "active" (any agent), "running" (running agents only) */
   sessionFilter?: SessionFilterMode;
+  /**
+   * What to do when a sidebar pane is the only pane left in its window
+   * (e.g. the user closed their last shell). Default "kill" matches tmux's
+   * native "closing the last pane closes the window" feel. "spawn-shell"
+   * inserts a fresh shell pane next to the sidebar so the window stays
+   * alive — useful if you treat the sidebar as window chrome and want a
+   * recovery path after accidentally exiting your shell.
+   */
+  lonelySidebarPolicy?: LonelySidebarPolicy;
+}
+
+/**
+ * Policy for what happens when a sidebar pane becomes the only pane in a
+ * window. See `OpensessionsConfig.lonelySidebarPolicy`.
+ */
+export type LonelySidebarPolicy = "kill" | "spawn-shell";
+
+export const DEFAULT_LONELY_SIDEBAR_POLICY: LonelySidebarPolicy = "kill";
+
+/**
+ * Parses an arbitrary value into a valid LonelySidebarPolicy, falling back
+ * to the default for null/undefined/unknown values. Centralised so the
+ * server, tests, and any future CLI override path stay consistent.
+ */
+export function resolveLonelySidebarPolicy(value: unknown): LonelySidebarPolicy {
+  if (value === "kill" || value === "spawn-shell") return value;
+  return DEFAULT_LONELY_SIDEBAR_POLICY;
 }
 
 const DEFAULTS: OpensessionsConfig = {
