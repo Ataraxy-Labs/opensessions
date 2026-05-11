@@ -123,23 +123,51 @@ function hashServerKey(input: string): number {
   return hash;
 }
 
-function resolveServerPort(): number {
+function resolveServerKey(): string | null {
+  const explicit = process.env.OPENSESSIONS_SERVER_KEY?.trim();
+  if (explicit) return explicit;
+  const tmux = process.env.TMUX?.trim();
+  if (!tmux) return null;
+  const socketPath = tmux.split(",", 1)[0];
+  if (!socketPath) return null;
+  return String(hashServerKey(socketPath));
+}
+
+function resolveServerPort(serverKey: string | null): number {
   const explicit = Number.parseInt(process.env.OPENSESSIONS_PORT ?? "", 10);
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
-
-  const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
-  if (explicitKey) return 17000 + Number.parseInt(explicitKey, 10);
-
-  const tmux = process.env.TMUX?.trim();
-  if (tmux) {
-    const socketPath = tmux.split(",", 1)[0];
-    if (socketPath) return 17000 + hashServerKey(socketPath);
-  }
+  if (serverKey) return 17000 + Number.parseInt(serverKey, 10);
   return DEFAULT_SERVER_PORT;
 }
 
-const SERVER_URL = process.env.OPENSESSIONS_URL ?? `http://127.0.0.1:${resolveServerPort()}`;
+function resolveTokenFile(serverKey: string | null): string {
+  const explicit = process.env.OPENSESSIONS_TOKEN_FILE?.trim();
+  if (explicit) return explicit;
+  if (serverKey) return `/tmp/opensessions.${serverKey}.token`;
+  return "/tmp/opensessions.token";
+}
+
+const SERVER_KEY = resolveServerKey();
+const SERVER_URL = process.env.OPENSESSIONS_URL ?? `http://127.0.0.1:${resolveServerPort(SERVER_KEY)}`;
 const ENDPOINT = `${SERVER_URL}/api/agent-event`;
+const TOKEN_FILE = resolveTokenFile(SERVER_KEY);
+const AUTH_TOKEN_HEADER = "x-opensessions-token";
+
+/**
+ * Reads the server's per-instance auth token from disk on every call so a
+ * server restart that rotates the token doesn't require restarting Amp.
+ * Returns null if the file is missing — `post()` then skips the request and
+ * logs the skip rather than emitting an unauthenticated POST that would
+ * 401-spam the server log.
+ */
+function readAuthToken(): string | null {
+  try {
+    const raw = readFileSync(TOKEN_FILE, "utf-8").trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
 
 plog(`plugin loaded endpoint=${ENDPOINT} ampUrl=${AMP_URL} apiKey=${API_KEY ? "set" : "missing"} tmux=${process.env.TMUX ?? "none"} cwd=${process.cwd()} pid=${process.pid}`);
 
@@ -154,10 +182,22 @@ async function resolveTmuxSession($: PluginAPI["$"]): Promise<string | null> {
 }
 
 async function post(payload: EventPayload): Promise<void> {
+  const token = readAuthToken();
+  if (!token) {
+    // Server isn't running, or it's a pre-token build — drop the event
+    // silently rather than 401-spam the server log. The next event will
+    // retry; that's fine because agent-status events are inherently lossy
+    // (they describe a state, not a transaction).
+    plog(`POST status=${payload.status} thread=${payload.threadId?.slice(0, 8)} SKIP no-token (file=${TOKEN_FILE})`);
+    return;
+  }
   try {
     const res = await fetch(ENDPOINT, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        [AUTH_TOKEN_HEADER]: token,
+      },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(POST_TIMEOUT_MS),
     });
