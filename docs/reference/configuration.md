@@ -33,8 +33,18 @@ If the file does not exist, opensessions falls back to defaults.
 | `theme` | `string` | `catppuccin-mocha` | active | Built-in theme name persisted by the TUI |
 | `sidebarWidth` | `number` | `26` | active | Sidebar width in columns |
 | `sidebarPosition` | `"left" | "right"` | `"left"` | active | Sidebar placement |
+| `lonelySidebarPolicy` | `"kill" | "spawn-shell"` | `"kill"` | active | What to do when the sidebar is the only pane left in a window — see below |
 | `port` | `number` | none | parsed only | Present in the config type, but the current server and TUI still use the fixed `7391` constant |
 | `keybinding` | `string` | none | parsed only | Present in the config type, but keybindings are configured outside this file today |
+
+## Lonely Sidebar Policy
+
+When you close the last non-sidebar pane in a window (e.g. `exit` your shell), the sidebar is briefly the only pane left. `lonelySidebarPolicy` controls what happens next:
+
+- `"kill"` (default) — kill the lonely sidebar. The window then closes itself the way native tmux behaves when the last pane exits. Best when you treat the sidebar like just another pane.
+- `"spawn-shell"` — insert a fresh shell pane next to the sidebar so the window stays alive. Useful if you treat the sidebar as window chrome and want a recovery path after accidentally closing your shell.
+
+The setting can also be supplied via the `OPENSESSIONS_LONELY_SIDEBAR_POLICY` environment variable, which takes precedence over the config file (handy for one-off testing without editing `~/.config/opensessions/config.json`).
 
 ## Built-In Themes
 

@@ -90,6 +90,18 @@ export interface SidebarCapable {
   /** Kill sidebar panes that are the only pane left in their window (orphaned). */
   killOrphanedSidebarPanes(): void;
   /**
+   * Optional counterpart to `killOrphanedSidebarPanes` for the
+   * `spawn-shell` lonely-sidebar policy. Instead of killing a sidebar
+   * that's the only pane left in its window, spawn a fresh shell pane
+   * next to it so the window stays alive. Providers that don't implement
+   * this fall back to the kill behaviour.
+   *
+   * Implementations must be idempotent (the hook can fire multiple times
+   * for one logical close) and must not spawn a shell next to a sidebar
+   * that already has neighbours.
+   */
+  protectOrphanedSidebars?(): void;
+  /**
    * Kill stale sidebar panes — panes that retain the sidebar title (e.g. restored
    * by tmux-resurrect/continuum after a system restart) but no longer have the
    * TUI process running. Should be called once at server startup.
