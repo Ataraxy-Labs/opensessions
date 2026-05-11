@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { readFileSync } from "fs";
 
 interface PiRuntimePayload {
   pid: number;
@@ -12,6 +13,7 @@ interface PiRuntimePayload {
 
 const DEFAULT_SERVER_PORT = 7391;
 const HEARTBEAT_MS = 5_000;
+const AUTH_TOKEN_HEADER = "x-opensessions-token";
 
 /**
  * Mirror opensessions `packages/runtime/src/shared.ts` port resolution. The
@@ -26,25 +28,52 @@ function hashServerKey(input: string): number {
   return hash;
 }
 
-function resolveServerPort(): number {
+function resolveServerKey(): string | null {
+  const explicit = process.env.OPENSESSIONS_SERVER_KEY?.trim();
+  if (explicit) return explicit;
+  const tmux = process.env.TMUX?.trim();
+  if (!tmux) return null;
+  const socketPath = tmux.split(",", 1)[0];
+  if (!socketPath) return null;
+  return String(hashServerKey(socketPath));
+}
+
+function resolveServerPort(serverKey: string | null): number {
   const explicit = Number.parseInt(process.env.OPENSESSIONS_PORT ?? "", 10);
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
-
-  const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
-  if (explicitKey) return 17000 + Number.parseInt(explicitKey, 10);
-
-  const tmux = process.env.TMUX?.trim();
-  if (tmux) {
-    const socketPath = tmux.split(",", 1)[0];
-    if (socketPath) return 17000 + hashServerKey(socketPath);
-  }
+  if (serverKey) return 17000 + Number.parseInt(serverKey, 10);
   return DEFAULT_SERVER_PORT;
 }
+
+function resolveTokenFile(serverKey: string | null): string {
+  const explicit = process.env.OPENSESSIONS_TOKEN_FILE?.trim();
+  if (explicit) return explicit;
+  if (serverKey) return `/tmp/opensessions.${serverKey}.token`;
+  return "/tmp/opensessions.token";
+}
+
+const SERVER_KEY = resolveServerKey();
+const TOKEN_FILE = resolveTokenFile(SERVER_KEY);
 
 function getServerUrl(): string {
   const explicit = process.env.OPENSESSIONS_URL;
   if (explicit) return explicit.replace(/\/+$/, "");
-  return `http://127.0.0.1:${resolveServerPort()}`;
+  return `http://127.0.0.1:${resolveServerPort(SERVER_KEY)}`;
+}
+
+/**
+ * Reads the server's per-instance auth token from disk on every call so a
+ * server restart that rotates the token is picked up without restarting pi.
+ * Returns null if the file is missing — `post()` then skips the request,
+ * matching the previous "opensessions may not be running yet" semantics.
+ */
+function readAuthToken(): string | null {
+  try {
+    const raw = readFileSync(TOKEN_FILE, "utf-8").trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
 }
 
 export default function opensessionsRuntime(pi: ExtensionAPI) {
@@ -64,14 +93,24 @@ export default function opensessionsRuntime(pi: ExtensionAPI) {
   }
 
   async function post(path: string, body: unknown): Promise<void> {
+    const token = readAuthToken();
+    if (!token) {
+      // opensessions may not be running yet (or this is a pre-token build);
+      // skip silently rather than 401-spam the server log. Heartbeat will
+      // retry on the next tick.
+      return;
+    }
     try {
       await fetch(`${getServerUrl()}${path}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          [AUTH_TOKEN_HEADER]: token,
+        },
         body: JSON.stringify(body),
       });
     } catch {
-      // opensessions may not be running yet; retry on next heartbeat
+      // network blip or server bouncing; next heartbeat will retry
     }
   }
 
