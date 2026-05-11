@@ -44,6 +44,13 @@ function resolvePidFile(serverKey: string | null): string {
   return `/tmp/opensessions.${serverKey}.pid`;
 }
 
+function resolveTokenFile(serverKey: string | null): string {
+  const explicit = process.env.OPENSESSIONS_TOKEN_FILE?.trim();
+  if (explicit) return explicit;
+  if (!serverKey) return "/tmp/opensessions.token";
+  return `/tmp/opensessions.${serverKey}.token`;
+}
+
 export const SERVER_KEY = resolveServerKey();
 export const SERVER_PORT = resolveServerPort(SERVER_KEY);
 export const SERVER_HOST = process.env.OPENSESSIONS_HOST?.trim() || DEFAULT_SERVER_HOST;
@@ -52,6 +59,11 @@ export const SERVER_HOST = process.env.OPENSESSIONS_HOST?.trim() || DEFAULT_SERV
 // whichever address SERVER_HOST is bound to.
 export const LOCAL_CLIENT_HOST = "127.0.0.1";
 export const PID_FILE = resolvePidFile(SERVER_KEY);
+// Per-instance shared-secret file for authenticating loopback callers
+// (tmux hooks, the TUI, integrations). Written 0o600 by the server at
+// startup, removed on cleanup. See packages/runtime/src/server/index.ts.
+export const TOKEN_FILE = resolveTokenFile(SERVER_KEY);
+export const AUTH_TOKEN_HEADER = "x-opensessions-token";
 export const SERVER_IDLE_TIMEOUT_MS = 30_000;
 export const STUCK_RUNNING_TIMEOUT_MS = 3 * 60 * 1000;
 

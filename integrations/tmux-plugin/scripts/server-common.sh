@@ -42,6 +42,34 @@ elif [ -n "$SERVER_KEY" ]; then
 else
   PID_FILE="/tmp/opensessions.pid"
 fi
+if [ -n "$OPENSESSIONS_TOKEN_FILE" ]; then
+  TOKEN_FILE="$OPENSESSIONS_TOKEN_FILE"
+elif [ -n "$SERVER_KEY" ]; then
+  TOKEN_FILE="/tmp/opensessions.${SERVER_KEY}.token"
+else
+  TOKEN_FILE="/tmp/opensessions.token"
+fi
+
+# Reads the per-server-instance auth token written by the server at
+# startup (mode 0600). Empty if the file is missing — callers should
+# treat that as "the server isn't running" and let the request fail
+# naturally rather than retrying without auth.
+read_token() {
+  [ -f "$TOKEN_FILE" ] && cat "$TOKEN_FILE" 2>/dev/null || printf ''
+}
+
+# Issues an authenticated POST to the server. Pass the path (without
+# the http://host:port prefix) and any extra curl args (e.g. -d "$CTX").
+# Silently no-ops if the token isn't readable yet.
+auth_post() {
+  path="$1"
+  shift
+  token="$(read_token)"
+  [ -n "$token" ] || return 0
+  curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 \
+    -X POST -H "x-opensessions-token: $token" \
+    "http://${HOST}:${PORT}${path}" "$@"
+}
 
 PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"

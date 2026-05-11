@@ -56,7 +56,11 @@ export interface MuxProviderV1 {
   killSession(name: string): void;
 
   // Hooks
-  setupHooks(serverHost: string, serverPort: number): void;
+  // tokenFile (optional): absolute path to the per-instance auth-token
+  // file; providers that wire up out-of-band callbacks (e.g. tmux hooks
+  // running curl) must include this token on each request so the
+  // server doesn't reject them.
+  setupHooks(serverHost: string, serverPort: number, tokenFile?: string): void;
   cleanupHooks(): void;
 }
 

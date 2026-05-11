@@ -33,7 +33,7 @@ restore_focus() {
 
 suppress_sidebar_width_reports() {
   server_alive || return 0
-  curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST "http://${HOST}:${PORT}/suppress-width-reports?ms=2000" >/dev/null 2>&1 || true
+  auth_post "/suppress-width-reports?ms=2000" >/dev/null 2>&1 || true
 }
 
 WINDOW_ID="${1:-$(current_window_id)}"
