@@ -370,7 +370,7 @@ describe("AgentTracker", () => {
       expect(agents[0]!.liveness).toBeUndefined(); // still unknown
     });
 
-    test("pruneStuck skips alive agents", () => {
+    test("pruneStuck marks alive agents stale instead of preserving running animation", () => {
       const oldTs = Date.now() - 10 * 60 * 1000;
       tracker.applyEvent(event({ session: "sess-1", agent: "claude-code", threadId: "abc", status: "running", ts: oldTs }));
 
@@ -380,10 +380,15 @@ describe("AgentTracker", () => {
       ]);
 
       // Prune with a timeout that would normally remove it
-      tracker.pruneStuck(3 * 60 * 1000);
+      const changed = tracker.pruneStuck(3 * 60 * 1000);
 
-      // Should survive because it's alive
-      expect(tracker.getAgents("sess-1").length).toBe(1);
+      // It should survive because the pane is alive, but should no longer
+      // look actively running forever if the watcher/plugin went silent.
+      expect(changed).toBe(true);
+      const agents = tracker.getAgents("sess-1");
+      expect(agents.length).toBe(1);
+      expect(agents[0]!.status).toBe("stale");
+      expect(agents[0]!.liveness).toBe("alive");
     });
 
     test("pruneStuck removes exited agents", () => {
