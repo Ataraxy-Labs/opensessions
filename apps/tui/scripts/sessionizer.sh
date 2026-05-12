@@ -57,11 +57,48 @@ fi
 # Derive session name from directory basename, replacing dots with underscores
 session_name=$(basename "$selected" | tr '.' '_')
 
+notify_opensessions() {
+  local target_session="$1"
+  local token=""
+  local client_tty=""
+  local window_id=""
+  local server_host="${OPENSESSIONS_HOST:-127.0.0.1}"
+  local server_port="${OPENSESSIONS_PORT:-7391}"
+  local token_file="${OPENSESSIONS_TOKEN_FILE:-}"
+
+  if [ -z "$token_file" ] || [ ! -r "$token_file" ]; then
+    return 0
+  fi
+  token=$(cat "$token_file" 2>/dev/null || true)
+  if [ -z "$token" ]; then
+    return 0
+  fi
+
+  client_tty=$(tmux display-message -p '#{client_tty}' 2>/dev/null || true)
+  window_id=$(tmux display-message -p -t "=$target_session:" '#{window_id}' 2>/dev/null || true)
+  if [ -z "$window_id" ]; then
+    return 0
+  fi
+
+  curl -s -o /dev/null -m 0.5 --connect-timeout 0.1 \
+    -X POST \
+    -H "x-opensessions-token: $token" \
+    "http://$server_host:$server_port/refresh" >/dev/null 2>&1 || true
+
+  curl -s -o /dev/null -m 0.5 --connect-timeout 0.1 \
+    -X POST \
+    -H "x-opensessions-token: $token" \
+    -d "$client_tty|$target_session|$window_id" \
+    "http://$server_host:$server_port/ensure-sidebar" >/dev/null 2>&1 || true
+}
+
 # If session already exists, just switch to it
 if tmux has-session -t "=$session_name" 2>/dev/null; then
   tmux switch-client -t "$session_name"
+  notify_opensessions "$session_name"
   exit 0
 fi
 
 tmux new-session -d -s "$session_name" -c "$selected"
 tmux switch-client -t "$session_name"
+notify_opensessions "$session_name"

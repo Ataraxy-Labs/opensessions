@@ -566,6 +566,11 @@ function App() {
       title: " new session ",
       width: "60%",
       height: "60%",
+      env: {
+        OPENSESSIONS_HOST: SERVER_HOST,
+        OPENSESSIONS_PORT: String(SERVER_PORT),
+        OPENSESSIONS_TOKEN_FILE: TOKEN_FILE,
+      },
       closeOnExit: true,
     });
   }

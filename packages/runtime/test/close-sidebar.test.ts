@@ -92,6 +92,29 @@ describe("TUI: q keystroke wiring", () => {
   });
 });
 
+describe("TUI: sessionizer sidebar restore", () => {
+  const tuiPath = resolve(__dirname, "../../../apps/tui/src/index.tsx");
+  const tuiSrc = readFileSync(tuiPath, "utf-8");
+  const sessionizerPath = resolve(__dirname, "../../../apps/tui/scripts/sessionizer.sh");
+  const sessionizerSrc = readFileSync(sessionizerPath, "utf-8");
+
+  test("new-session popup passes server connection details to the sessionizer", () => {
+    const createSessionMatch = tuiSrc.match(/function createNewSession\(\)[\s\S]*?\n  \}/);
+    expect(createSessionMatch).not.toBeNull();
+    const block = createSessionMatch![0];
+    expect(block).toMatch(/OPENSESSIONS_HOST: SERVER_HOST/);
+    expect(block).toMatch(/OPENSESSIONS_PORT: String\(SERVER_PORT\)/);
+    expect(block).toMatch(/OPENSESSIONS_TOKEN_FILE: TOKEN_FILE/);
+  });
+
+  test("sessionizer asks the server to refresh and ensure the sidebar after switching", () => {
+    expect(sessionizerSrc).toMatch(/notify_opensessions\(\)/);
+    expect(sessionizerSrc).toMatch(/\/refresh/);
+    expect(sessionizerSrc).toMatch(/\/ensure-sidebar/);
+    expect(sessionizerSrc).toMatch(/notify_opensessions "\$session_name"/);
+  });
+});
+
 describe("tmux provider: focus-events forwarding", () => {
   const providerPath = resolve(__dirname, "../../mux/providers/tmux/src/provider.ts");
   const providerSrc = readFileSync(providerPath, "utf-8");
