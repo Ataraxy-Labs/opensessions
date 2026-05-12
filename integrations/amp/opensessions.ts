@@ -16,7 +16,8 @@
  *   agent.start   → running
  *   agent.end     → done | error | interrupted  (from event.status)
  *   tool.call     → tool-running
- *   tool.result   → error on failure, interrupted on cancel (no-op on success)
+ *   tool.result   → tool-running while other tools are active; otherwise
+ *                   running on success, error on failure, interrupted on cancel
  *
  * Session identity:
  *   1. `tmux display-message -p '#S'` — works when Amp is launched inside a
@@ -217,16 +218,13 @@ export default function (amp: PluginAPI) {
   });
 
   /**
-   * ctx.thread.id is documented as "available when in the current invocation
-   * context" — in practice it's present for session.start and tool.call but
-   * often missing for agent.start, agent.end, and tool.result. The plugin
-   * process is shared across concurrent threads, so we can't just stash a
-   * single "current threadId" globally. Instead we correlate tool.result
-   * with the preceding tool.call via toolUseID, and fall back to whatever
-   * ctx.thread.id gives us otherwise.
+   * The plugin process can serve multiple threads concurrently, so all state
+   * must be keyed by thread id. Current Amp docs expose `event.thread.id` for
+   * every lifecycle/tool event. We still keep the toolUseID map as a defensive
+   * fallback for older builds that omitted `thread` from `tool.result`.
    */
   const threadByToolUseID = new Map<string, string>();
-  let lastKnownThreadId: string | undefined;
+  const inFlightToolsByThread = new Map<string, Set<string>>();
 
   // Title cache. On first encounter of a thread we fire an async cloud fetch
   // so subsequent events carry the title. Titles are typed shortly after the
@@ -255,18 +253,53 @@ export default function (amp: PluginAPI) {
     return undefined;
   };
 
-  const rememberThreadId = (threadId: string | undefined): void => {
-    if (threadId) lastKnownThreadId = threadId;
+  const resolveThreadId = (
+    eventThreadId: string | undefined,
+    ctxThreadId: string | undefined,
+    toolUseID?: string,
+  ): string | undefined => eventThreadId ?? ctxThreadId ?? (toolUseID ? threadByToolUseID.get(toolUseID) : undefined);
+
+  const activeToolCount = (threadId: string): number => inFlightToolsByThread.get(threadId)?.size ?? 0;
+
+  const rememberToolStart = (threadId: string, toolUseID: string | undefined): void => {
+    if (!toolUseID) return;
+    threadByToolUseID.set(toolUseID, threadId);
+    let active = inFlightToolsByThread.get(threadId);
+    if (!active) {
+      active = new Set<string>();
+      inFlightToolsByThread.set(threadId, active);
+    }
+    active.add(toolUseID);
+  };
+
+  const rememberToolEnd = (threadId: string | undefined, toolUseID: string | undefined): void => {
+    if (toolUseID) threadByToolUseID.delete(toolUseID);
+    if (!threadId || !toolUseID) return;
+    const active = inFlightToolsByThread.get(threadId);
+    if (!active) return;
+    active.delete(toolUseID);
+    if (active.size === 0) inFlightToolsByThread.delete(threadId);
+  };
+
+  const clearThreadTools = (threadId: string | undefined): void => {
+    if (!threadId) return;
+    const active = inFlightToolsByThread.get(threadId);
+    if (active) {
+      for (const toolUseID of active) threadByToolUseID.delete(toolUseID);
+    }
+    inFlightToolsByThread.delete(threadId);
   };
 
   const send = async (status: Status, threadId: string | undefined): Promise<void> => {
-    rememberThreadId(threadId);
-    const tid = threadId ?? lastKnownThreadId;
+    if (!threadId) {
+      plog(`SKIP status=${status} missing-thread-id`);
+      return;
+    }
     await post({
       agent: "amp",
       status,
-      threadId: tid,
-      threadName: resolveTitle(tid),
+      threadId,
+      threadName: resolveTitle(threadId),
       tmuxSession: tmuxSession ?? undefined,
       projectDir,
       ts: Date.now(),
@@ -275,42 +308,54 @@ export default function (amp: PluginAPI) {
 
   amp.on("session.start", async (event, ctx) => {
     if (!tmuxSession) tmuxSession = await resolveTmuxSession(ctx.$);
-    await send("idle", event.thread?.id ?? ctx.thread?.id);
+    const threadId = resolveThreadId(event.thread?.id, ctx.thread?.id);
+    clearThreadTools(threadId);
+    await send("idle", threadId);
   });
 
-  amp.on("agent.start", async (_event, ctx) => {
-    await send("running", ctx.thread?.id);
+  amp.on("agent.start", async (event, ctx) => {
+    const threadId = resolveThreadId(event.thread?.id, ctx.thread?.id);
+    clearThreadTools(threadId);
+    await send("running", threadId);
     return {};
   });
 
   amp.on("agent.end", async (event, ctx) => {
+    const threadId = resolveThreadId(event.thread?.id, ctx.thread?.id);
+    clearThreadTools(threadId);
     const status: Status =
       event.status === "done" ? "done" :
       event.status === "error" ? "error" :
       "interrupted";
-    await send(status, ctx.thread?.id);
+    await send(status, threadId);
   });
 
   amp.on("tool.call", async (event, ctx) => {
-    const threadId = event.thread?.id ?? ctx.thread?.id;
-    if (threadId && event.toolUseID) threadByToolUseID.set(event.toolUseID, threadId);
+    const threadId = resolveThreadId(event.thread?.id, ctx.thread?.id, event.toolUseID);
+    if (threadId) rememberToolStart(threadId, event.toolUseID);
     await send("tool-running", threadId);
+
+    // `tool.call` is a request event; observability plugins must return an
+    // explicit result. We allow the original call unchanged and never modify,
+    // synthesize, or reject tool execution.
     return { action: "allow" };
   });
 
   amp.on("tool.result", async (event, ctx) => {
-    // Recover threadId from the matching tool.call since tool.result doesn't
-    // carry one on the event payload.
-    const threadId = ctx.thread?.id ?? (event.toolUseID ? threadByToolUseID.get(event.toolUseID) : undefined);
-    if (event.toolUseID) threadByToolUseID.delete(event.toolUseID);
+    const threadId = resolveThreadId(event.thread?.id, ctx.thread?.id, event.toolUseID);
+    rememberToolEnd(threadId, event.toolUseID);
 
     if (event.status === "error") {
+      clearThreadTools(threadId);
       await send("error", threadId);
     } else if (event.status === "cancelled") {
+      clearThreadTools(threadId);
       await send("interrupted", threadId);
+    } else if (threadId && activeToolCount(threadId) > 0) {
+      await send("tool-running", threadId);
     } else {
-      // Tool finished successfully. The agent is now streaming the reply, so
-      // flip back to "running" — otherwise the UI stays pinned at
+      // Last tool finished successfully. The agent is now streaming the reply,
+      // so flip back to "running" — otherwise the UI stays pinned at
       // "tool-running" until the next agent.end.
       await send("running", threadId);
     }

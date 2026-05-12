@@ -18,21 +18,40 @@ back to polling.
 
 ## Install
 
-Copy (or symlink) `opensessions.ts` into `~/.config/amp/plugins/`:
+Amp loads system plugins from `~/.config/amp/plugins/*.ts` and project plugins
+from `.amp/plugins/*.ts`. For normal opensessions usage, install the plugin as
+a system plugin from the checkout that is actually running the opensessions
+server.
+
+If you use the TPM install as the runtime (the usual local setup), copy from
+that installed checkout:
+
+```sh
+mkdir -p ~/.config/amp/plugins
+cp ~/.tmux/plugins/opensessions/integrations/amp/opensessions.ts ~/.config/amp/plugins/opensessions.ts
+```
+
+When developing from this source checkout, copy (or symlink) the edited file:
 
 ```sh
 mkdir -p ~/.config/amp/plugins
 cp integrations/amp/opensessions.ts ~/.config/amp/plugins/opensessions.ts
 ```
 
-Restart Amp. A recent Amp build that exposes `ctx.thread.id` on `session.start`
-is required.
+Reload Amp plugins with `plugins: reload` from the Amp command palette (or
+restart Amp). A recent Amp build that exposes `event.thread.id` on lifecycle
+and tool events is required.
 
 ## Environment
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `OPENSESSIONS_URL` | `http://127.0.0.1:7391` | opensessions server base URL |
+| `OPENSESSIONS_TOKEN_FILE` | `/tmp/opensessions.<server-key>.token` | server auth token file |
+
+The plugin logs diagnostics to `/tmp/opensessions-plugin.log`. Server-side
+event handling and Amp watcher decisions are logged in `/tmp/opensessions-debug.log`
+when debug logging is enabled.
 
 ## Event mapping
 
@@ -46,7 +65,8 @@ is required.
 | `tool.call` | `tool-running` |
 | `tool.result` (`status=error`) | `error` |
 | `tool.result` (`status=cancelled`) | `interrupted` |
-| `tool.result` (success) | `running` (agent streaming the reply) |
+| `tool.result` (success, other tools still running) | `tool-running` |
+| `tool.result` (success, no other tools running) | `running` (agent streaming the reply) |
 
 ## Session resolution
 
