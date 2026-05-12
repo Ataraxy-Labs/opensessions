@@ -1995,6 +1995,8 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
       }
     }
 
+    if (tracker.pruneStuck(STUCK_RUNNING_TIMEOUT_MS)) changed = true;
+
     if (changed) broadcastState();
   }
 
