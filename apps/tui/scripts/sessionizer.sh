@@ -45,11 +45,14 @@ fzf_output=$(find "${valid_dirs[@]}" -mindepth 1 -maxdepth "$MAXDEPTH" -type d -
 query=$(echo "$fzf_output" | sed -n '1p')
 match=$(echo "$fzf_output" | sed -n '2p')
 
-# Prefer the selected match; fall back to typed query if it's a valid directory
-if [ -n "$match" ]; then
-  selected="$match"
-elif [ -d "$query" ]; then
+# Prefer a typed valid directory. fzf still returns the currently highlighted
+# match as line 2 when Enter is pressed after typing an absolute path; using
+# that match first can create a session in an unrelated filtered/highlighted
+# directory instead of the user's explicit path.
+if [ -n "$query" ] && [ -d "$query" ]; then
   selected="$query"
+elif [ -n "$match" ]; then
+  selected="$match"
 else
   exit 0
 fi
