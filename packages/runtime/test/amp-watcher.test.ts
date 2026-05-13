@@ -572,13 +572,18 @@ describe("AmpAgentWatcher", () => {
     expect((watcher as any).wsConnections.size).toBe(0);
   });
 
-  test("skips WebSocket when DTW token request fails", async () => {
-    setThread("T-ws-notoken", { env: mkEnv("/projects/myapp") });
+  test("treats DTW 404 as non-DTW and falls back to detail polling", async () => {
+    setThread("T-ws-notoken", {
+      env: mkEnv("/projects/myapp"),
+      messages: [{ role: "user" }],
+    });
 
     await startWatcher();
 
     expect(MockWebSocket.instances.length).toBe(0);
     expect((watcher as any).threads.has("T-ws-notoken")).toBe(true);
+    expect((watcher as any).nonDtwThreads.has("T-ws-notoken")).toBe(true);
+    expect(events.some((e) => e.status === "running" && e.threadId === "T-ws-notoken")).toBe(true);
   });
 
   test("non-DTW thread falls back to detail fetch for status", async () => {

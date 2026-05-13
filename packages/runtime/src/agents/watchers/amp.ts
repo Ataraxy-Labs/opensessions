@@ -100,9 +100,15 @@ interface ApiThreadDetail {
 
 /** POST /api/durable-thread-workers response */
 interface DtwTokenResponse {
-  wsToken: string;
+  wsToken?: string;
   threadVersion?: number;
   usesDtw?: boolean;
+}
+
+interface JsonFetchResult<T> {
+  ok: boolean;
+  status: number;
+  body: T | null;
 }
 
 /** cf_agent_state WebSocket message */
@@ -497,7 +503,7 @@ export class AmpAgentWatcher implements AgentWatcher {
     const connection = this.wsConnections.get(threadId);
     if (!this.isActive(lifecycle) || !connection || connection.gen !== gen) return;
 
-    if (!dtwResult || !dtwResult.wsToken) {
+    if (!dtwResult) {
       this.wsConnections.delete(threadId);
       this.scheduleRetry(threadId);
       return;
@@ -508,6 +514,12 @@ export class AmpAgentWatcher implements AgentWatcher {
       this.nonDtwThreads.add(threadId);
       this.clearRetry(threadId);
       void this.processNonDtwThread(threadId, null, Date.now(), lifecycle);
+      return;
+    }
+
+    if (!dtwResult.wsToken) {
+      this.wsConnections.delete(threadId);
+      this.scheduleRetry(threadId);
       return;
     }
 
@@ -646,7 +658,7 @@ export class AmpAgentWatcher implements AgentWatcher {
     if (statusChanged || titleChanged || projectDirChanged) this.emitStatus(threadId, snapshot);
   }
 
-  private async fetchJson<T>(url: string, init: RequestInit = {}, lifecycle = this.lifecycle): Promise<T | null> {
+  private async fetchJsonWithStatus<T>(url: string, init: RequestInit = {}, lifecycle = this.lifecycle): Promise<JsonFetchResult<T> | null> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this._fetchTimeoutMs);
     this.requestControllers.add(controller);
@@ -656,8 +668,9 @@ export class AmpAgentWatcher implements AgentWatcher {
 
     try {
       const res = await this._fetch(url, { ...init, headers, signal: controller.signal });
-      if (!this.isActive(lifecycle) || !res.ok) return null;
-      return await res.json() as T;
+      if (!this.isActive(lifecycle)) return null;
+      if (!res.ok) return { ok: false, status: res.status, body: null };
+      return { ok: true, status: res.status, body: await res.json() as T };
     } catch {
       return null;
     } finally {
@@ -666,9 +679,14 @@ export class AmpAgentWatcher implements AgentWatcher {
     }
   }
 
+  private async fetchJson<T>(url: string, init: RequestInit = {}, lifecycle = this.lifecycle): Promise<T | null> {
+    const result = await this.fetchJsonWithStatus<T>(url, init, lifecycle);
+    return result?.ok ? result.body : null;
+  }
+
   private async fetchDtwToken(threadId: string, lifecycle = this.lifecycle): Promise<DtwTokenResponse | null> {
     // Try configured ampUrl first; fall back to ampcode.com if it doesn't support this endpoint
-    const result = await this.fetchJson<DtwTokenResponse>(`${this.ampUrl}/api/durable-thread-workers`, {
+    const result = await this.fetchJsonWithStatus<DtwTokenResponse>(`${this.ampUrl}/api/durable-thread-workers`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
@@ -676,16 +694,18 @@ export class AmpAgentWatcher implements AgentWatcher {
       },
       body: JSON.stringify({ threadId }),
     }, lifecycle);
-    if (result) return result;
+    if (result?.ok && result.body) return result.body;
 
     // Fall back to ampcode.com if configured URL doesn't have this endpoint
     const fallbackUrl = "https://ampcode.com";
-    if (this.ampUrl === fallbackUrl) return null;
+    if (this.ampUrl === fallbackUrl) {
+      return result?.status === 404 ? { usesDtw: false } : null;
+    }
 
     const fallbackKey = await loadApiKey(fallbackUrl);
-    if (!fallbackKey) return null;
+    if (!fallbackKey) return result?.status === 404 ? { usesDtw: false } : null;
 
-    return this.fetchJson<DtwTokenResponse>(`${fallbackUrl}/api/durable-thread-workers`, {
+    const fallbackResult = await this.fetchJsonWithStatus<DtwTokenResponse>(`${fallbackUrl}/api/durable-thread-workers`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${fallbackKey}`,
@@ -693,6 +713,8 @@ export class AmpAgentWatcher implements AgentWatcher {
       },
       body: JSON.stringify({ threadId }),
     }, lifecycle);
+    if (fallbackResult?.ok && fallbackResult.body) return fallbackResult.body;
+    return fallbackResult?.status === 404 || result?.status === 404 ? { usesDtw: false } : null;
   }
 
   private async fetchThreadList(lifecycle = this.lifecycle): Promise<ApiThreadSummary[] | null> {

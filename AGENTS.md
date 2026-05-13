@@ -105,6 +105,20 @@ interface AgentWatcher {
 - **Never call `process.exit()` directly in TUI**: Use `renderer.destroy()`.
 - **AI session logs**: Always write AI-assisted dev session logs to `ai_logs/` at the project root (this directory — `~/repos/github/opensessions/ai_logs/`), not inside any TPM-installed clone (e.g. `~/.tmux/plugins/opensessions/`). Use the `ai-session-logger` skill's `NN-kebab-case-name.md` convention.
 
+## Local Runtime vs Source Checkout
+
+- **Keep the installed runtime and source checkout separate.** For local tmux usage, the running TPM install is expected to live at `~/.tmux/plugins/opensessions`, while this repository checkout (`~/repos/github/opensessions`) is the development/source tree.
+- **Do not assume tests against the sidebar are using this checkout.** Before debugging live runtime behavior, verify the active install with `tmux show-environment -g OPENSESSIONS_DIR` and `ps -axo pid,ppid,command | grep opensessions/apps/server`.
+- **When live behavior depends on new source changes**, update the TPM clone intentionally (for example, fast-forward `~/.tmux/plugins/opensessions` to the desired branch/commit), run `bun install --frozen-lockfile` there if dependencies changed, and restart opensessions from the installed location.
+- **Current server builds use per-instance auth tokens.** Integration clients such as the Amp plugin should read `/tmp/opensessions.<server-key>.token` (or `OPENSESSIONS_TOKEN_FILE`) and send it as `x-opensessions-token`; unauthenticated runtime POSTs are expected to return `401`.
+
+## Amp Integration Notes
+
+- The Amp plugin belongs in Amp's plugin search path, usually `~/.config/amp/plugins/opensessions.ts` for a system-wide local install or `.amp/plugins/opensessions.ts` for a project-local install. After edits, reload Amp plugins from the command palette with `plugins: reload`.
+- Prefer installing/copying the plugin from the runtime checkout that is actually serving opensessions when doing live sidebar tests, typically `~/.tmux/plugins/opensessions/integrations/amp/opensessions.ts`.
+- Useful diagnostics: `cat /tmp/opensessions-plugin.log` for plugin POST/auth/thread resolution and `grep -i "agent-event\|amp-watcher" /tmp/opensessions-debug.log` for server-side watcher/plugin ownership behavior.
+- Amp Neo may return `404` for the old `/api/durable-thread-workers` path even when `GET /api/threads/:id` works. The built-in Amp watcher must treat that as a non-DTW thread and fall back to thread-detail polling rather than retrying DTW forever.
+
 ## Common Commands
 
 ```bash
