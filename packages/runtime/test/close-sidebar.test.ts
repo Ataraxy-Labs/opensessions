@@ -113,6 +113,15 @@ describe("TUI: sessionizer sidebar restore", () => {
     expect(sessionizerSrc).toMatch(/\/ensure-sidebar/);
     expect(sessionizerSrc).toMatch(/notify_opensessions "\$session_name"/);
   });
+
+  test("sessionizer prefers a typed valid directory over fzf's highlighted match", () => {
+    const queryCheck = sessionizerSrc.indexOf('[ -n "$query" ] && [ -d "$query" ]');
+    const matchCheck = sessionizerSrc.indexOf('[ -n "$match" ]');
+
+    expect(queryCheck).toBeGreaterThan(-1);
+    expect(matchCheck).toBeGreaterThan(-1);
+    expect(queryCheck).toBeLessThan(matchCheck);
+  });
 });
 
 describe("tmux provider: focus-events forwarding", () => {
