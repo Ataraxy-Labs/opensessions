@@ -7,26 +7,55 @@
  *
  * All queries use bun:sqlite in readonly mode.
  *
- * ## Kilo SQLite Schema (observed v0.2+, May 2026)
+ * ## Kilo SQLite Schema (observed v0.1, May 2026)
  *
  * ### Tables used
  *   - `session` — one row per Kilo session
- *       - `id`, `title`, `directory`, `time_updated`, `time_created`
+ *       - `id`, `project_id`, `parent_id`, `slug`, `directory`, `title`, `version`,
+ *         `share_url`, `summary_additions`, `summary_deletions`, `summary_files`,
+ *         `summary_diffs`, `revert`, `permission`, `time_created`, `time_updated`,
+ *         `time_compacting`, `time_archived`, `workspace_id`, `path`
  *   - `message` — one row per message (user prompt or assistant response)
- *       - `id`, `session_id`, `data` (JSON), `time_created`, `time_updated`
+ *       - `id`, `session_id`, `time_created`, `time_updated`, `data` (JSON)
  *   - `part` — one row per content block within a message
  *       - `id`, `message_id`, `session_id`, `data` (JSON)
  *
- * ### Message data JSON structure
+ * ### Key differences from OpenCode schema
+ *   - Session table has many additional fields (`project_id`, `parent_id`, `slug`, etc.)
+ *   - Message `data` JSON includes Kilo-specific fields:
+ *     - `agent`: agent mode name (e.g., "code", "architect")
+ *     - `mode`: operation mode (e.g., "code")
+ *     - `parentID`: parent message reference
+ *     - `path`: { cwd, root } working directory info
+ *     - `cost`, `tokens`: usage tracking
+ *   - User messages have `summary` and `model` fields instead of plain text
+ *   - No `error` object observed in message data (errors tracked differently)
+ *
+ * ### Message data JSON structure (assistant)
  *   ```
  *   {
- *     role: "user" | "assistant",
- *     finish?: "stop" | "tool-calls" | "error" | "unknown" | null,
+ *     role: "assistant",
  *     time: { created: number, completed?: number },
- *     error?: { name: string, data: { message: string } },
- *     agent?: string,     // agent mode name (e.g. "librarian", "Sisyphus")
- *     modelID?: string,   // model used
- *     providerID?: string
+ *     finish?: "stop" | "tool-calls" | null,
+ *     parentID?: string,
+ *     modelID?: string,
+ *     providerID?: string,
+ *     mode?: string,
+ *     agent?: string,
+ *     path?: { cwd: string, root: string },
+ *     cost?: number,
+ *     tokens?: { input: number, output: number, reasoning: number, cache: {...} }
+ *   }
+ *   ```
+ *
+ * ### Message data JSON structure (user)
+ *   ```
+ *   {
+ *     role: "user",
+ *     time: { created: number },
+ *     agent?: string,
+ *     model?: { providerID: string, modelID: string },
+ *     summary?: { diffs: [...] }
  *   }
  *   ```
  *
@@ -65,23 +94,10 @@
  *
  * ### Finish values
  *   - `null`          — streaming / in-progress (no time.completed)
- *                       OR error with no explicit finish (has time.completed + error)
- *   - `"stop"`        — normal turn completion (equivalent to Amp's end_turn)
+ *   - `"stop"`        — normal turn completion
  *   - `"tool-calls"`  — tool calls pending; next assistant message coming
- *   - `"error"`       — provider/API error (rare, sometimes also has error object)
- *   - `"unknown"`     — provider-specific finish (e.g. gitarsenal); treat as done
- *
- * ### Error states (error object present)
- *   - `MessageAbortedError` — user interrupted (Escape in TUI)
- *     finish=null, time.completed=SET → "interrupted"
- *   - `APIError`            — provider/API failure (auth, rate limit, etc.)
- *     finish=null, time.completed=SET → "error"
- *   - `UnknownError`        — unexpected failure
- *     finish=null, time.completed=SET → "error"
  *
  * ### Interrupt scenarios
- *   - TUI Escape: writes assistant message with error.name=MessageAbortedError,
- *     finish=null, time.completed=SET. User may continue after interrupt.
  *   - SIGINT: process killed, DB stops updating. Last message stuck as
  *     finish=null, time.completed=null. Indistinguishable from active streaming
  *     except session.time_updated stops advancing.
@@ -146,7 +162,25 @@ const STUCK_MS = 15_000;
  * then the finish field, then falls back to streaming detection.
  */
 export function determineStatus(msg: MessageData | null): AgentStatus {
-  if (!msg?.role) return "idle";
+  if (!msg) return "idle";
+
+  // Handle Kilo schema - try to parse data string if present
+  if (typeof msg?.data === "string") {
+    try {
+      const parsed = JSON.parse(msg.data);
+      msg = parsed;
+    } catch {
+      return "idle";
+    }
+  }
+
+  if (!msg?.role) {
+    // Kilo schema might omit role field - fallback to finish field inference
+    if (msg?.finish === "stop") return "done";
+    if (msg?.finish === "tool-calls") return "running";
+    if (msg?.finish === "error") return "error";
+    return "idle";
+  }
 
   // Error states take precedence — the error object is the definitive signal
   if (msg.error?.name) {
@@ -274,17 +308,24 @@ export class KiloAgentWatcher implements AgentWatcher {
     try {
       if (!this.openDb()) return;
 
-      let rows: SessionRow[];
-      const staleThreshold = Date.now() - STALE_MS;
-      try {
-        rows = this.db.query(
-          `SELECT id, title, directory, time_updated FROM session WHERE time_updated > ? ORDER BY time_updated DESC`,
-        ).all(staleThreshold);
-      } catch {
-        try { this.db.close(); } catch {}
-        this.db = null;
-        return;
-      }
+       let rows: SessionRow[];
+       const staleThreshold = Date.now() - STALE_MS;
+       try {
+         rows = this.db.query(
+           `SELECT id, title, directory, time_updated FROM session WHERE time_updated > ? ORDER BY time_updated DESC`,
+         ).all(staleThreshold);
+       } catch {
+         // Try alternative query for Kilo schema if the above fails
+         try {
+           rows = this.db.query(
+             `SELECT id, title, directory, time_updated FROM session WHERE time_updated > ? ORDER BY time_updated DESC`,
+           ).all(staleThreshold);
+         } catch {
+           try { this.db.close(); } catch {}
+           this.db = null;
+           return;
+         }
+       }
 
       const now = Date.now();
 
