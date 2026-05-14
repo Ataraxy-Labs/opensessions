@@ -29,22 +29,42 @@ opensessions/
 │   ├── amp/                # Amp helper integration
 │   └── pi-extension/       # Pi runtime helper integration
 ├── packages/
-│   ├── runtime-rs/         # Shared Rust runtime: config, protocol, tracker, tmux provider, watchers
-│   └── sidebar-core-rs/    # Sidebar app state, input handling, rendering, layout, hit testing
-├── CONTRACTS.md            # Supported agent event and runtime integration contracts
-├── opensessions.tmux       # Root TPM entrypoint
-├── Cargo.toml              # Rust workspace root
-└── package.json            # Release version used by npm/TPM download helpers
+│   ├── runtime/       # @opensessions/runtime — runtime, watcher logic, config, plugins, server internals
+│   │   ├── src/
+│   │   │   ├── contracts/   # AgentEvent, AgentStatus, AgentWatcher, MuxProvider, MuxSessionInfo
+│   │   │   ├── agents/      # AgentTracker (state management for agent events)
+│   │   │   │   └── watchers/  # Built-in agent watchers
+│   │   │   │       ├── amp.ts
+│   │   │   │       ├── claude-code.ts
+│   │   │   │       ├── codex.ts
+│   │   │   │       ├── opencode.ts
+│   │   │   │       ├── kilo.ts
+│   │   │   │       └── pi.ts
+│   │   │   ├── mux/         # Mux registry and detection helpers
+│   │   │   ├── server/      # WebSocket server internals and launcher
+│   │   │   ├── shared.ts    # Shared types, constants, palette
+│   │   │   └── index.ts     # Barrel export
+│   │   └── test/            # Tests (bun:test)
+│   └── mux/
+│       ├── contract/        # @opensessions/mux — mux contracts and capability guards
+│       ├── providers/
+│       │   ├── tmux/        # @opensessions/mux-tmux — tmux provider
+│       │   └── zellij/      # @opensessions/mux-zellij — experimental zellij provider
+│       └── tmux-sdk/        # @opensessions/tmux-sdk — lower-level tmux command wrapper
+├── CONTRACTS.md       # Agent integration guide (Amp, Claude Code, OpenCode, Kilo, Aider, Pi)
+├── turbo.json         # Turborepo config
+├── opensessions.tmux  # Root TPM entrypoint
+└── package.json       # Bun workspace root
 ```
 
 ## Key Architecture Decisions
 
-1. **Rust-first runtime**: the supported server and TUI are Rust crates in `apps/*-rs` and `packages/*-rs`.
-2. **Ratatui sidebar**: rendering is immediate-mode Ratatui/Crossterm. Shared UI logic lives in `packages/sidebar-core-rs` so renderer, input, tests, and E2E flows use one source of truth.
-3. **Built-in agent watchers**: the Rust server scans Amp, Claude Code, Codex, OpenCode, Pi, and Droid state directly and converts it into `AgentEvent`s.
-4. **External agent events via HTTP**: third-party agents should POST to `/api/agent-event` or use the metadata endpoints. TypeScript plugin loading is not a supported runtime path right now.
-5. **Tmux is the supported mux**: abstractions remain mux-shaped, but tmux is the only documented supported provider. Older zellij helper code is not part of the support promise.
-6. **Release binaries, not local builds**: TPM users get prebuilt `opensessions-sidebar`, `opensessions-server`, and `lazydiff` binaries in `bin/`. `cargo build --release` is for development or unsupported platforms.
+1. **Monorepo**: Turborepo + Bun workspaces, with `apps/` for runnable entrypoints and `packages/` for reusable libraries.
+2. **Built-in agent watchers**: Core ships with `AmpAgentWatcher`, `ClaudeCodeAgentWatcher`, `CodexAgentWatcher`, `OpenCodeAgentWatcher`, `KiloAgentWatcher` and `PiAgentWatcher` that watch agent data directories directly. External agents integrate via the `AgentWatcher` plugin interface.
+3. **Mux-agnostic**: `MuxProvider` interface abstracts all mux operations. `TmuxProvider` is the reference implementation.
+4. **MuxProvider is SYNC**: All methods use `Bun.spawnSync` — matches the existing pattern and keeps the server simple.
+5. **Auto-detect mux**: `detectMux()` checks `$TMUX`, `$ZELLIJ_SESSION_NAME` env vars. Config file override planned.
+6. **TDD**: All contracts and tracker logic have tests. Use `bun test` in `packages/runtime/`.
 
 ## Contracts
 
@@ -90,11 +110,12 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 ## Development Guidelines
 
 - **TDD**: Red-green-refactor, vertical slices, one test at a time. Tests verify behavior through public interfaces.
-- **Sync tmux calls**: keep mux provider methods synchronous unless the architecture changes deliberately.
-- **Preserve optimizations**: batched tmux calls, git cache with HEAD watchers, lightweight focus-only broadcasts, fixed-width sidebar repair, and per-client focus state.
-- **Sidebar resize work**: before changing sidebar spawning, width sync, tmux resize handling, or `sidebar-coordinator`, read `docs/explanation/sidebar-behavior.md` and preserve those invariants unless you update the doc in the same change.
-- **Built-in watchers in Rust runtime/server**: Amp, Claude Code, Codex, OpenCode, Pi, and Droid watcher parsing lives in `packages/runtime-rs/src/agent_watchers.rs` and server scanning lives in `apps/server-rs/src/lib.rs`.
-- **Do not reintroduce pane-derived agent status**: panes can help focus/kill/routing, but watcher/API events are the source of agent status.
+- **Sync mux calls**: MuxProvider methods are synchronous. Don't make them async.
+- **Preserve optimizations**: Batched tmux calls, 5s git cache with HEAD watchers, lightweight focus-only broadcasts.
+- **Sidebar resize work**: Before changing sidebar spawning, width sync, tmux resize handling, or `sidebar-coordinator`, read `docs/explanation/sidebar-behavior.md` and preserve those invariants unless you update the doc in the same change.
+- **Built-in watchers in runtime**: Amp, Claude Code, Codex, OpenCode, Kilo and Pi have built-in watchers in `packages/runtime/src/agents/watchers/`. Community agents use the `AgentWatcher` plugin interface.
+- **OpenTUI Solid**: JSX needs `bunfig.toml` preload and `jsxImportSource: "@opentui/solid"` in tsconfig. Build needs `solidPlugin`.
+- **Never call `process.exit()` directly in TUI**: Use `renderer.destroy()`.
 
 ## Common Commands
 

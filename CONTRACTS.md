@@ -8,7 +8,7 @@ For end-user setup, start with [README.md](./README.md).
 
 ## Built-In Watchers
 
-The Rust server scans these agent data sources directly:
+opensessions currently registers six built-in watchers at server startup.
 
 ### Amp
 
@@ -33,10 +33,19 @@ The Rust server scans these agent data sources directly:
 - Polls `~/.local/share/opencode/opencode.db` or `$OPENCODE_DB_PATH`.
 - Resolves sessions from the OpenCode session row's `directory` field.
 
-### Pi and Droid
+### Kilo
 
-- The Rust server includes scanner/parser support for Pi and Droid runtime/session state.
-- Pi integrations can also use the Pi runtime API exposed by the server.
+- Polls `~/.local/share/kilo/kilo.db` or `$KILO_DB_PATH`.
+- Uses `bun:sqlite` in read-only mode.
+- Polls every 3 seconds.
+- Resolves mux sessions from the Kilo session row's `directory` field.
+
+### Pi
+
+- Watches `~/.pi/agent/sessions/<encoded-path>/<timestamp>_<id>.jsonl`.
+- Uses recursive `fs.watch` plus a 2 second polling pass.
+- Skips stale transcript files older than 5 minutes.
+- Resolves mux sessions from the `cwd` recorded on the `session` header entry.
 
 ## Agent Event HTTP API
 

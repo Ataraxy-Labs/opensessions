@@ -133,6 +133,7 @@ All other tmux options fall back to the defaults shown in the table above.
 | Variable | Used by | Notes |
 | --- | --- | --- |
 | `OPENCODE_DB_PATH` | OpenCode watcher | Overrides the default SQLite path |
+| `KILO_DB_PATH` | Kilo watcher | Overrides the default SQLite path |
 | `OPENSESSIONS_DIR` | tmux helper scripts and server | Helps helper scripts find the repo checkout |
 | `OPENSESSIONS_HOST` | server, sidebar, helper shell scripts | Runtime host override; normally `127.0.0.1` |
 | `OPENSESSIONS_PORT` | server, sidebar, helper shell scripts | Runtime port override; normally derived from the tmux socket/server key |
