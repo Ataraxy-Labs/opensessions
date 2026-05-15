@@ -47,6 +47,16 @@ describe("server: close-sidebar wiring", () => {
   test("identify-pane records paneId so close-sidebar can scope to it", () => {
     expect(serverSrc).toMatch(/clientPaneIds\.set\(ws, cmd\.paneId\)/);
   });
+
+  test("refresh only broadcasts state and does not fan out sidebar spawns", () => {
+    const refreshRouteMatch = serverSrc.match(/url\.pathname === "\/refresh"\)[\s\S]*?return new Response\("ok", \{ status: 200 \}\);/);
+    expect(refreshRouteMatch).not.toBeNull();
+    const refreshRoute = refreshRouteMatch![0];
+
+    expect(refreshRoute).toMatch(/broadcastState\(\)/);
+    expect(refreshRoute).not.toMatch(/ensureSidebar|debouncedEnsureSidebar|queueEnsureSidebarAcrossAllWindows/);
+    expect(serverSrc).not.toMatch(/function queueEnsureSidebarAcrossAllWindows/);
+  });
 });
 
 describe("TUI: q keystroke wiring", () => {

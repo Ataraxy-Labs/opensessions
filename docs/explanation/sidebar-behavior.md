@@ -106,6 +106,7 @@ These are non-negotiable:
 - do not use `after-resize-pane` as width authority for this feature; it was tried before and led to sync difficulty and resize loops
 - do not refocus the main pane immediately after sidebar spawn/restore; let the TUI refocus after capability detection settles so escape sequences do not leak into the main pane
 - invalidate cached sidebar pane listings before logic that depends on just-spawned or just-hidden panes
+- topology refresh hooks such as `session-created` should refresh state only; they must not fan out sidebar spawning into every new background session/window created by unrelated tmux automation
 
 ## Regressions We Already Paid For
 

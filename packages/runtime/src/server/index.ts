@@ -1287,15 +1287,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
    }, 150);
   }
 
-  function queueEnsureSidebarAcrossAllWindows(): void {
-    if (!isSidebarVisible()) return;
-    for (const provider of getProvidersWithSidebar()) {
-      for (const window of provider.listActiveWindows()) {
-        debouncedEnsureSidebar({ session: window.sessionName, windowId: window.id });
-      }
-    }
-  }
-
   // Debounced width enforcement — collapses resize storms (monitor switch,
   // terminal resize) into a single tmux resize pass.
   let sidebarEnforceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2347,7 +2338,6 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
       if (req.method === "POST" && url.pathname === "/refresh") {
         broadcastState();
-        queueEnsureSidebarAcrossAllWindows();
         return new Response("ok", { status: 200 });
       }
 
