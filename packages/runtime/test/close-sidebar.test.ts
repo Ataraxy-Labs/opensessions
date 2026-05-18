@@ -141,4 +141,25 @@ describe("tmux provider: focus-events forwarding", () => {
   test("setupHooks enables tmux focus-events option globally", () => {
     expect(providerSrc).toMatch(/set-option.*focus-events.*on/);
   });
+
+  test("switching sessions leaves focus on a non-sidebar pane", () => {
+    const switchMatch = providerSrc.match(/switchSession\(name: string, clientTty\?: string\): void \{[\s\S]*?\n  \}/);
+    expect(switchMatch).not.toBeNull();
+    expect(switchMatch![0]).toMatch(/this\.selectMainPane\(name\)/);
+
+    const helperMatch = providerSrc.match(/private selectMainPane\(sessionName: string\): void \{[\s\S]*?\n  \}/);
+    expect(helperMatch).not.toBeNull();
+    expect(helperMatch![0]).toMatch(/p\.title !== SIDEBAR_PANE_TITLE/);
+    expect(helperMatch![0]).toMatch(/tmux\.selectPane\(mainPane\.id\)/);
+  });
+});
+
+describe("tmux plugin: focus shortcut restore", () => {
+  const focusPath = resolve(__dirname, "../../../integrations/tmux-plugin/scripts/focus.sh");
+  const focusSrc = readFileSync(focusPath, "utf-8");
+
+  test("prefix o s reveals hidden sidebars and restores missing visible sidebars", () => {
+    expect(focusSrc).toMatch(/auth_post "\/ensure-sidebar\?reveal=1" -d "\$CTX"/);
+    expect(focusSrc).not.toMatch(/auth_post "\/toggle" -d "\$CTX"/);
+  });
 });
