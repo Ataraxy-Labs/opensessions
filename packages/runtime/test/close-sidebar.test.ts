@@ -109,6 +109,16 @@ describe("TUI: q keystroke wiring", () => {
     expect(block).toMatch(/if \(refocusMainPane\(\)\)/);
     expect(block).toMatch(/setPaneHasTerminalFocus\(false\)/);
   });
+
+  test("single-letter shortcuts are delayed and canceled by printable bursts", () => {
+    expect(tuiSrc).toMatch(/PRINTABLE_SHORTCUT_DELAY_MS/);
+    expect(tuiSrc).toMatch(/PRINTABLE_BURST_SUPPRESSION_MS/);
+    expect(tuiSrc).toMatch(/function handlePrintableBurstGuard\(key: KeyEvent\): boolean/);
+    expect(tuiSrc).toMatch(/if \(printableShortcutTimer\) \{/);
+    expect(tuiSrc).toMatch(/clearPendingPrintableShortcut\(\)/);
+    expect(tuiSrc).toMatch(/isBurstGuardedShortcut\(key\)/);
+    expect(tuiSrc).toMatch(/handleNormalKey\(pending\)/);
+  });
 });
 
 describe("TUI: sessionizer sidebar restore", () => {

@@ -31,6 +31,8 @@ type MuxContext =
   | { type: "zellij"; sessionName: string; paneId: string }
   | { type: "none" };
 
+type BufferedShortcutKey = Pick<KeyEvent, "name" | "number" | "shift" | "meta" | "option">;
+
 function detectMuxContext(): MuxContext {
   if (process.env.TMUX_PANE && process.env.TMUX) {
     return { type: "tmux", sdk: new TmuxClient(), paneId: process.env.TMUX_PANE };
@@ -52,6 +54,8 @@ const UNSEEN_ICON = "●";
 const BOLD = TextAttributes.BOLD;
 const DIM = TextAttributes.DIM;
 const SPARK_BLOCKS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+const PRINTABLE_SHORTCUT_DELAY_MS = 45;
+const PRINTABLE_BURST_SUPPRESSION_MS = 180;
 
 const THEME_NAMES = Object.keys(BUILTIN_THEMES);
 const DEFAULT_DETAIL_PANEL_HEIGHT = 10;
@@ -89,6 +93,26 @@ function logResizeDebug(message: string, data?: Record<string, unknown>): void {
   try {
     appendFileSync(RESIZE_DEBUG_LOG, `[${ts}] [pid:${process.pid}] ${message}${extra}\n`);
   } catch {}
+}
+
+function cloneShortcutKey(key: KeyEvent): BufferedShortcutKey {
+  return {
+    name: key.name,
+    number: key.number,
+    shift: key.shift,
+    meta: key.meta,
+    option: key.option,
+  };
+}
+
+function isPlainPrintableKey(key: BufferedShortcutKey): boolean {
+  return !key.meta && !key.option && key.name.length === 1;
+}
+
+function isBurstGuardedShortcut(key: BufferedShortcutKey): boolean {
+  if (!isPlainPrintableKey(key)) return false;
+  if (key.number) return true;
+  return ["c", "d", "f", "n", "q", "r", "t", "u", "x"].includes(key.name);
 }
 
 function clampDetailPanelHeight(height: number): number {
@@ -806,52 +830,19 @@ function App() {
     });
   });
 
-  useKeyboard((key) => {
-    const currentModal = modal();
+  let printableShortcutTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingPrintableShortcut: BufferedShortcutKey | null = null;
+  let suppressPrintableShortcutsUntil = 0;
 
-    // --- Theme picker modal: input handles all keys via onKeyDown ---
-    if (currentModal === "theme-picker") {
-      return;
-    }
+  function clearPendingPrintableShortcut() {
+    if (printableShortcutTimer) clearTimeout(printableShortcutTimer);
+    printableShortcutTimer = null;
+    pendingPrintableShortcut = null;
+  }
 
-    // --- Confirm kill modal: Enter confirms, anything else cancels ---
-    // Previously a single `y` keystroke confirmed, which made `tmux send-keys`
-    // a one-shot kill-session attack vector once the modal was open. Requiring
-    // Enter means injected printable text can no longer slip through.
-    if (currentModal === "confirm-kill") {
-      if (key.name === "return") {
-        const target = killTarget();
-        if (target) send({ type: "kill-session", name: target });
-      }
-      setKillTarget(null);
-      setModal("none");
-      return;
-    }
+  onCleanup(clearPendingPrintableShortcut);
 
-    // --- Confirm quit modal: Enter confirms close-sidebar, anything else cancels ---
-    if (currentModal === "confirm-quit") {
-      if (key.name === "return") {
-        // Local-only close: kills only THIS sidebar pane via the server's
-        // close-sidebar handler. Other sessions' sidebars stay alive and the
-        // server keeps running. Compare to the legacy `quit` path which tore
-        // down every sidebar globally and called process.exit(0).
-        send({ type: "close-sidebar" });
-        // Tear down the local renderer so the pane closes promptly even if
-        // the server reply lags. Don't fire-and-forget HTTP /quit anymore —
-        // it triggers the destructive global path.
-        setTimeout(() => renderer.destroy(), 250);
-      }
-      setModal("none");
-      return;
-    }
-
-    // --- Defense against tmux send-keys injection ---
-    // If terminal focus reporting tells us this pane is NOT focused, ignore
-    // every shortcut. This drops accidental keystrokes from `tmux send-keys`
-    // targeting another pane in the sidebar's window. See the comment on
-    // paneHasTerminalFocus above for the trust model.
-    if (!paneHasTerminalFocus()) return;
-
+  function handleNormalKey(key: BufferedShortcutKey) {
     // --- Normal mode keybindings ---
     // Alt+Up / Alt+Down → reorder session
     if ((key.meta || key.option) && (key.name === "up" || key.name === "down")) {
@@ -979,6 +970,84 @@ function App() {
         break;
       }
     }
+  }
+
+  function handlePrintableBurstGuard(key: KeyEvent): boolean {
+    if (!isPlainPrintableKey(key)) return false;
+
+    if (printableShortcutTimer) {
+      clearPendingPrintableShortcut();
+      suppressPrintableShortcutsUntil = Date.now() + PRINTABLE_BURST_SUPPRESSION_MS;
+      return true;
+    }
+
+    if (Date.now() < suppressPrintableShortcutsUntil) {
+      suppressPrintableShortcutsUntil = Date.now() + PRINTABLE_BURST_SUPPRESSION_MS;
+      return true;
+    }
+
+    if (!isBurstGuardedShortcut(key)) return false;
+
+    pendingPrintableShortcut = cloneShortcutKey(key);
+    printableShortcutTimer = setTimeout(() => {
+      const pending = pendingPrintableShortcut;
+      printableShortcutTimer = null;
+      pendingPrintableShortcut = null;
+      if (!pending || Date.now() < suppressPrintableShortcutsUntil) return;
+      handleNormalKey(pending);
+    }, PRINTABLE_SHORTCUT_DELAY_MS);
+
+    return true;
+  }
+
+  useKeyboard((key) => {
+    const currentModal = modal();
+
+    // --- Theme picker modal: input handles all keys via onKeyDown ---
+    if (currentModal === "theme-picker") {
+      return;
+    }
+
+    // --- Confirm kill modal: Enter confirms, anything else cancels ---
+    // Previously a single `y` keystroke confirmed, which made `tmux send-keys`
+    // a one-shot kill-session attack vector once the modal was open. Requiring
+    // Enter means injected printable text can no longer slip through.
+    if (currentModal === "confirm-kill") {
+      if (key.name === "return") {
+        const target = killTarget();
+        if (target) send({ type: "kill-session", name: target });
+      }
+      setKillTarget(null);
+      setModal("none");
+      return;
+    }
+
+    // --- Confirm quit modal: Enter confirms close-sidebar, anything else cancels ---
+    if (currentModal === "confirm-quit") {
+      if (key.name === "return") {
+        // Local-only close: kills only THIS sidebar pane via the server's
+        // close-sidebar handler. Other sessions' sidebars stay alive and the
+        // server keeps running. Compare to the legacy `quit` path which tore
+        // down every sidebar globally and called process.exit(0).
+        send({ type: "close-sidebar" });
+        // Tear down the local renderer so the pane closes promptly even if
+        // the server reply lags. Don't fire-and-forget HTTP /quit anymore —
+        // it triggers the destructive global path.
+        setTimeout(() => renderer.destroy(), 250);
+      }
+      setModal("none");
+      return;
+    }
+
+    // --- Defense against tmux send-keys injection ---
+    // If terminal focus reporting tells us this pane is NOT focused, ignore
+    // every shortcut. This drops accidental keystrokes from `tmux send-keys`
+    // targeting another pane in the sidebar's window. See the comment on
+    // paneHasTerminalFocus above for the trust model.
+    if (!paneHasTerminalFocus()) return;
+
+    if (handlePrintableBurstGuard(key)) return;
+    handleNormalKey(key);
   });
 
   const runningCount = createMemo(() =>
