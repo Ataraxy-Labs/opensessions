@@ -62,6 +62,20 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
 
   switchSession(name: string, clientTty?: string): void {
     tmux.switchClient(name, clientTty ? { clientTty } : undefined);
+    this.selectMainPane(name);
+  }
+
+  private selectMainPane(sessionName: string): void {
+    const activeWindow = tmux.listWindows({ scope: "session", target: sessionName })
+      .find((w) => w.active);
+    if (!activeWindow) return;
+
+    const panes = tmux.listPanes({ scope: "window", target: activeWindow.id });
+    const activePane = panes.find((p) => p.active);
+    if (activePane && activePane.title !== SIDEBAR_PANE_TITLE) return;
+
+    const mainPane = panes.find((p) => p.title !== SIDEBAR_PANE_TITLE);
+    if (mainPane) tmux.selectPane(mainPane.id);
   }
 
   getCurrentSession(): string | null {

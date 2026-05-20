@@ -21,7 +21,7 @@ ensure_server || exit 0
 
 CTX="$(tmux display-message -p '#{client_tty}|#{session_name}|#{window_id}' 2>/dev/null)"
 
-auth_post "/toggle" -d "$CTX"
+auth_post "/ensure-sidebar?reveal=1" -d "$CTX"
 
 attempt=0
 while [ "$attempt" -lt 20 ]; do

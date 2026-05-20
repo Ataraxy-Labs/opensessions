@@ -100,6 +100,25 @@ describe("TUI: q keystroke wiring", () => {
     expect(tuiSrc).toMatch(/setPaneHasTerminalFocus\(true\)/);
     expect(tuiSrc).toMatch(/setPaneHasTerminalFocus\(false\)/);
   });
+
+  test("startup refocus marks the sidebar pane unfocused immediately", () => {
+    expect(tuiSrc).toMatch(/function refocusMainPane\(\): boolean/);
+    const refocusMatch = tuiSrc.match(/const doStartupRefocus = \(\) => \{[\s\S]*?\n    \};/);
+    expect(refocusMatch).not.toBeNull();
+    const block = refocusMatch![0];
+    expect(block).toMatch(/if \(refocusMainPane\(\)\)/);
+    expect(block).toMatch(/setPaneHasTerminalFocus\(false\)/);
+  });
+
+  test("single-letter shortcuts are delayed and canceled by printable bursts", () => {
+    expect(tuiSrc).toMatch(/PRINTABLE_SHORTCUT_DELAY_MS/);
+    expect(tuiSrc).toMatch(/PRINTABLE_BURST_SUPPRESSION_MS/);
+    expect(tuiSrc).toMatch(/function handlePrintableBurstGuard\(key: KeyEvent\): boolean/);
+    expect(tuiSrc).toMatch(/if \(printableShortcutTimer\) \{/);
+    expect(tuiSrc).toMatch(/clearPendingPrintableShortcut\(\)/);
+    expect(tuiSrc).toMatch(/isBurstGuardedShortcut\(key\)/);
+    expect(tuiSrc).toMatch(/handleNormalKey\(pending\)/);
+  });
 });
 
 describe("TUI: sessionizer sidebar restore", () => {
@@ -140,5 +159,26 @@ describe("tmux provider: focus-events forwarding", () => {
 
   test("setupHooks enables tmux focus-events option globally", () => {
     expect(providerSrc).toMatch(/set-option.*focus-events.*on/);
+  });
+
+  test("switching sessions leaves focus on a non-sidebar pane", () => {
+    const switchMatch = providerSrc.match(/switchSession\(name: string, clientTty\?: string\): void \{[\s\S]*?\n  \}/);
+    expect(switchMatch).not.toBeNull();
+    expect(switchMatch![0]).toMatch(/this\.selectMainPane\(name\)/);
+
+    const helperMatch = providerSrc.match(/private selectMainPane\(sessionName: string\): void \{[\s\S]*?\n  \}/);
+    expect(helperMatch).not.toBeNull();
+    expect(helperMatch![0]).toMatch(/p\.title !== SIDEBAR_PANE_TITLE/);
+    expect(helperMatch![0]).toMatch(/tmux\.selectPane\(mainPane\.id\)/);
+  });
+});
+
+describe("tmux plugin: focus shortcut restore", () => {
+  const focusPath = resolve(__dirname, "../../../integrations/tmux-plugin/scripts/focus.sh");
+  const focusSrc = readFileSync(focusPath, "utf-8");
+
+  test("prefix o s reveals hidden sidebars and restores missing visible sidebars", () => {
+    expect(focusSrc).toMatch(/auth_post "\/ensure-sidebar\?reveal=1" -d "\$CTX"/);
+    expect(focusSrc).not.toMatch(/auth_post "\/toggle" -d "\$CTX"/);
   });
 });

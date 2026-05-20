@@ -2400,9 +2400,15 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         try {
           const body = await req.text();
           const ctx = parseContext(body) ?? undefined;
+          const reveal = url.searchParams.get("reveal") === "1";
           noteFocusContextChange();
           normalizeTmuxWindowSize(ctx?.windowId);
-          log("http", "POST /ensure-sidebar", { sidebarVisible: isSidebarVisible(), ctx });
+          log("http", "POST /ensure-sidebar", { sidebarVisible: isSidebarVisible(), reveal, ctx });
+          if (!isSidebarVisible() && reveal) {
+            toggleSidebar(ctx);
+            broadcastState();
+            return new Response("ok", { status: 200 });
+          }
           // Enforce width immediately — window switch causes tmux to
           // proportionally redistribute panes, fix it before user sees it.
           if (isSidebarVisible()) enforceSidebarWidth();
