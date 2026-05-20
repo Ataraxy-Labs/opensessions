@@ -152,7 +152,7 @@ function wrapLocalLinks(links: SessionData["localLinks"], maxWidth: number): Ses
 /** Refocus the main (non-sidebar) pane after TUI capability detection finishes.
  *  This must happen from the TUI process — doing it from start.sh races with
  *  capability query responses and leaks escape sequences to the main pane. */
-function refocusMainPane() {
+function refocusMainPane(): boolean {
   if (muxCtx.type === "tmux") {
     try {
       const selfPaneId = muxCtx.paneId;
@@ -165,7 +165,7 @@ function refocusMainPane() {
           ).stdout.toString().trim();
       if (!windowId) {
         logResizeDebug("refocusMainPane:no-window-id", { selfPaneId });
-        return;
+        return false;
       }
       const r = Bun.spawnSync(
         ["tmux", "list-panes", "-t", windowId, "-F", "#{pane_id}"],
@@ -189,7 +189,9 @@ function refocusMainPane() {
             main,
             stderr: sel.stderr.toString().trim(),
           });
+          return false;
         }
+        return true;
       }
     } catch (err) {
       logResizeDebug("refocusMainPane:error", { error: String(err) });
@@ -198,8 +200,11 @@ function refocusMainPane() {
     // Zellij: move focus to the right (away from the sidebar on the left)
     try {
       Bun.spawnSync(["zellij", "action", "move-focus", "right"], { stdout: "pipe", stderr: "pipe" });
+      return true;
     } catch {}
   }
+
+  return false;
 }
 
 function getClientTty(): string {
@@ -590,7 +595,14 @@ function App() {
     const doStartupRefocus = () => {
       if (startupRefocused) return;
       startupRefocused = true;
-      refocusMainPane();
+      if (refocusMainPane()) {
+        // We just selected the main pane away from this TUI. Mark ourselves
+        // unfocused immediately instead of waiting for tmux/terminal focus-out
+        // bytes; otherwise `tmux send-keys -t session:window ...` can target a
+        // stale-active sidebar pane and have printable command text interpreted
+        // as shortcuts such as `n`/`c` (new-session popup).
+        setPaneHasTerminalFocus(false);
+      }
     };
     renderer.on("capabilities", doStartupRefocus);
     // Fallback: if no capability response arrives within 2s, refocus anyway

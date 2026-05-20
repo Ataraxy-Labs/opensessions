@@ -100,6 +100,15 @@ describe("TUI: q keystroke wiring", () => {
     expect(tuiSrc).toMatch(/setPaneHasTerminalFocus\(true\)/);
     expect(tuiSrc).toMatch(/setPaneHasTerminalFocus\(false\)/);
   });
+
+  test("startup refocus marks the sidebar pane unfocused immediately", () => {
+    expect(tuiSrc).toMatch(/function refocusMainPane\(\): boolean/);
+    const refocusMatch = tuiSrc.match(/const doStartupRefocus = \(\) => \{[\s\S]*?\n    \};/);
+    expect(refocusMatch).not.toBeNull();
+    const block = refocusMatch![0];
+    expect(block).toMatch(/if \(refocusMainPane\(\)\)/);
+    expect(block).toMatch(/setPaneHasTerminalFocus\(false\)/);
+  });
 });
 
 describe("TUI: sessionizer sidebar restore", () => {
