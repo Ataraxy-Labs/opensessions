@@ -164,21 +164,11 @@ const STUCK_MS = 15_000;
 export function determineStatus(msg: MessageData | null): AgentStatus {
   if (!msg) return "idle";
 
-  // Handle Kilo schema - try to parse data string if present
-  if (typeof msg?.data === "string") {
-    try {
-      const parsed = JSON.parse(msg.data);
-      msg = parsed;
-    } catch {
-      return "idle";
-    }
-  }
-
-  if (!msg?.role) {
+  if (!msg.role) {
     // Kilo schema might omit role field - fallback to finish field inference
-    if (msg?.finish === "stop") return "done";
-    if (msg?.finish === "tool-calls") return "running";
-    if (msg?.finish === "error") return "error";
+    if (msg.finish === "stop") return "done";
+    if (msg.finish === "tool-calls") return "running";
+    if (msg.finish === "error") return "error";
     return "idle";
   }
 
@@ -308,24 +298,17 @@ export class KiloAgentWatcher implements AgentWatcher {
     try {
       if (!this.openDb()) return;
 
-       let rows: SessionRow[];
-       const staleThreshold = Date.now() - STALE_MS;
-       try {
-         rows = this.db.query(
-           `SELECT id, title, directory, time_updated FROM session WHERE time_updated > ? ORDER BY time_updated DESC`,
-         ).all(staleThreshold);
-       } catch {
-         // Try alternative query for Kilo schema if the above fails
-         try {
-           rows = this.db.query(
-             `SELECT id, title, directory, time_updated FROM session WHERE time_updated > ? ORDER BY time_updated DESC`,
-           ).all(staleThreshold);
-         } catch {
-           try { this.db.close(); } catch {}
-           this.db = null;
-           return;
-         }
-       }
+      let rows: SessionRow[];
+      const staleThreshold = Date.now() - STALE_MS;
+      try {
+        rows = this.db.query(
+          `SELECT id, title, directory, time_updated FROM session WHERE time_updated > ? ORDER BY time_updated DESC`,
+        ).all(staleThreshold);
+      } catch {
+        try { this.db.close(); } catch {}
+        this.db = null;
+        return;
+      }
 
       const now = Date.now();
 
