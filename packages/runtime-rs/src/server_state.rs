@@ -3,9 +3,7 @@ use std::collections::HashMap;
 use crate::git_info::GitInfo;
 use crate::mux::MuxProvider;
 use crate::portless::{PortlessState, build_local_links};
-use crate::protocol::{
-    AgentEvent, AgentPanelScope, ServerState, SessionData, SessionFilterMode, SessionMetadata,
-};
+use crate::protocol::{AgentEvent, ServerState, SessionData, SessionFilterMode, SessionMetadata};
 
 pub struct ReadOnlyStateInput<'a> {
     pub providers: Vec<&'a dyn MuxProvider>,
@@ -19,13 +17,9 @@ pub struct ReadOnlyStateInput<'a> {
     pub ports_by_session: Option<HashMap<String, Vec<u16>>>,
     pub portless_state: Option<PortlessState>,
     pub focused_session: Option<String>,
-    pub current_session_override: Option<String>,
     pub theme: Option<String>,
     pub session_filter: Option<SessionFilterMode>,
-    pub agent_panel_scope: AgentPanelScope,
-    pub collapsed_worktree_groups: Vec<String>,
     pub sidebar_width: u32,
-    pub detail_panel_height: u32,
     pub initializing: bool,
     pub init_label: Option<String>,
     pub now_ms: u64,
@@ -33,7 +27,7 @@ pub struct ReadOnlyStateInput<'a> {
 
 pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
     let now_secs = input.now_ms / 1_000;
-    let provider_current_session = input
+    let current_session = input
         .providers
         .first()
         .and_then(|provider| provider.get_current_session());
@@ -114,9 +108,6 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
                 dir: session.dir,
                 branch: git.branch,
                 dirty: git.dirty,
-                changed_files: git.changed_files,
-                insertions: git.insertions,
-                deletions: git.deletions,
                 is_worktree: git.is_worktree,
                 unseen,
                 panes,
@@ -132,10 +123,6 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
         })
         .collect::<Vec<_>>();
 
-    let current_session = input
-        .current_session_override
-        .filter(|candidate| sessions.iter().any(|session| session.name == *candidate))
-        .or(provider_current_session);
     let focused_session =
         resolve_focused_session(input.focused_session, current_session.as_deref(), &sessions);
 
@@ -145,12 +132,9 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
         current_session,
         theme: input.theme,
         session_filter: input.session_filter,
-        agent_panel_scope: input.agent_panel_scope,
         sidebar_width: input.sidebar_width,
-        detail_panel_height: input.detail_panel_height,
         initializing: input.initializing,
         init_label: input.init_label,
-        collapsed_worktree_groups: input.collapsed_worktree_groups,
         ts: input.now_ms,
     }
 }
@@ -164,16 +148,16 @@ fn resolve_focused_session(
         return None;
     }
 
-    if let Some(focused) = focused_session
-        && sessions.iter().any(|session| session.name == focused)
-    {
-        return Some(focused);
+    if let Some(focused) = focused_session {
+        if sessions.iter().any(|session| session.name == focused) {
+            return Some(focused);
+        }
     }
 
-    if let Some(current) = current_session
-        && sessions.iter().any(|session| session.name == current)
-    {
-        return Some(current.to_string());
+    if let Some(current) = current_session {
+        if sessions.iter().any(|session| session.name == current) {
+            return Some(current.to_string());
+        }
     }
 
     sessions.first().map(|session| session.name.clone())

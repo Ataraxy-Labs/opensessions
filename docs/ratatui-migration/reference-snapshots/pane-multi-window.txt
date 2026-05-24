@@ -1,27 +1,27 @@
-Sessions                          6
 
-   01  plane-feat-edit-pages-from-p
-       feat/edit-pages-from-pi
+   Sessions 6 ⚡1 ● 1
 
-›  02  plane-feat-background-export
-       feat-background-exports
+   1 plane-feat-edit-pages-from-pi
+     feat-edit-pages-from-pi
+     feat/edit-pages-from-pi
 
-   03  learning
-       main
+ ▌ 2 plane-feat-background-exports
+     feat-background-exports
+     feat-background-exports
 
-▌  04  opensessions
-       devpulse
+   3 learning
+     main
 
-   05  plane-pdf-word-formatting
-       chore-relation-pqls
+ ▌ 4 opensessions                ⚙
+     devpulse
 
-   06  dotfiles_public
-       main
+ ▌ 5 plane-pdf-word-formatting   ●
+     pdf-word-formatting
+     chore-relation-pqls
 
-
-
-
-
+   6 dotfiles_public
+     dotfiles.public
+     main
 
 
 
@@ -34,7 +34,6 @@ Sessions                          6
 
 
  ──────────────────────────────────
- agents                   a:current
  …feat-background-exports
 
 
@@ -50,7 +49,8 @@ Sessions                          6
 
 
 
+
  ──────────────────────────────────
- ⇥ cycle  ⏎ go  → agents  f
- filter  d hide  x kill
+ ⇥ cycle  ⏎ go  → agents  f filter
+  d hide  x kill
 

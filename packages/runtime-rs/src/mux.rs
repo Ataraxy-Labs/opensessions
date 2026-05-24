@@ -29,17 +29,8 @@ pub struct SidebarPane {
 pub struct AgentPane {
     pub agent: String,
     pub pane_id: String,
-    pub active: bool,
     pub thread_id: Option<String>,
     pub thread_name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientFocus {
-    pub client_tty: Option<String>,
-    pub session_name: String,
-    pub window_id: String,
-    pub pane_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +58,6 @@ pub trait MuxProvider: Send + Sync {
     fn kill_session(&self, name: &str);
     fn setup_hooks(&self, server_host: &str, server_port: u16);
     fn cleanup_hooks(&self);
-    fn set_sidebar_width_hint(&self, _width: u16) {}
 
     fn is_window_capable(&self) -> bool {
         false
@@ -93,14 +83,6 @@ pub trait MuxProvider: Send + Sync {
         None
     }
 
-    fn get_current_pane_id(&self) -> Option<String> {
-        None
-    }
-
-    fn get_client_focus(&self, _client_tty: Option<&str>) -> Option<ClientFocus> {
-        None
-    }
-
     fn list_sidebar_panes(&self, _session_name: Option<&str>) -> Vec<SidebarPane> {
         Vec::new()
     }
@@ -123,15 +105,8 @@ pub trait MuxProvider: Send + Sync {
     fn hide_sidebar(&self, _pane_id: &str) {}
 
     fn kill_sidebar_pane(&self, _pane_id: &str) {}
-    fn prepare_sidebar_window(&self, _window_id: &str) {}
     fn resize_sidebar_pane(&self, _pane_id: &str, _width: u16) {}
     fn kill_orphaned_sidebar_panes(&self) {}
-    fn kill_orphaned_sidebar_panes_with_fallbacks(
-        &self,
-        _fallback_sessions: &HashMap<String, String>,
-    ) {
-        self.kill_orphaned_sidebar_panes();
-    }
     fn cleanup_sidebar(&self) {}
 
     fn resolve_agent_pane_id(

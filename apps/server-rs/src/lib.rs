@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -14,44 +13,47 @@ use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
     AgentWatcherSnapshot, amp_snapshot_from_thread_json, claude_code_snapshot_from_jsonl,
     codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
-    droid_snapshot_from_jsonl, opencode_snapshot_from_row, parse_codex_session_index,
-    pi_snapshot_from_jsonl,
-};
-use opensessions_runtime::config::{
-    OpensessionsConfig, load_config_from_home, save_config_to_home,
+    opencode_snapshot_from_row, parse_codex_session_index,
 };
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
-use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
+use opensessions_runtime::mux::{MuxProvider, SidebarPosition};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
     build_dir_session_map, resolve_session_for_project_dir,
 };
 use opensessions_runtime::protocol::{
-    AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
-    SessionFilterMode,
+    AgentEvent, AgentLiveness, AgentStatus, MetadataTone, ServerMessage, SessionFilterMode,
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
-use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
+use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarWidthReportInput};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
-use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
+use opensessions_sidebar_core::frame::{FrameDiff, RenderedRows, diff_rows, render_rows};
+use opensessions_sidebar_core::generated::protocol::{
+    ClientCommand as SidebarClientCommand, ServerMessage as SidebarServerMessage,
+};
+use opensessions_sidebar_core::input::{UiKey, apply_ui_key};
+use opensessions_sidebar_protocol::{
+    KeyCode as ShimKeyCode, KeyModifiers as ShimKeyModifiers, ServerToShim, ShimToServer,
+    decode_shim_message, encode_server_message,
+};
 use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
 
-pub const SERVER_VERSION: &str = "0.2.0-alpha.12";
+pub const SERVER_VERSION: &str = "0.2.0-alpha.5";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.12"}"#;
+pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.5"}"#;
 pub const QUIT_JSON: &str = r#"{"type":"quit"}"#;
 
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
@@ -61,42 +63,24 @@ const GIT_CACHE_TTL_MS: u64 = 5_000;
 const PORT_POLL_INTERVAL_MS: u64 = 10_000;
 const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
-const TMUX_STATE_POLL_MS: u64 = 2_000;
-const SIDEBAR_WARMUP_MS: u64 = 1_200;
-const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
+// Mirrors `USER_DRAG_SETTLE_MS` in `packages/runtime/src/server/index.ts`:
+// once a width-report is accepted the coordinator stays in UserDrag for this
+// many milliseconds, then the next snapshot tick clears it so the sidebar
+// stops showing "adjusting…".
+const USER_DRAG_SETTLE_MS: u64 = 600;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
-const DEFAULT_DETAIL_PANEL_HEIGHT: u16 = 10;
-const MIN_DETAIL_PANEL_HEIGHT: u16 = 4;
-const MAX_DETAIL_PANEL_HEIGHT: u16 = 60;
 
-#[derive(Debug, Default)]
-struct ShutdownAnnouncement {
-    announced: AtomicBool,
-}
-
-impl ShutdownAnnouncement {
-    fn announce_once(
-        &self,
-        state_source: &Option<Arc<dyn StateSource>>,
-        state_updates: &broadcast::Sender<String>,
-    ) {
-        if self.announced.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        announce_shutdown(state_source, state_updates);
-    }
-}
-
-/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
-/// so live focus/agent-state issues can be diagnosed without extra env setup;
-/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
+/// Append a single debug line to the path in `OPENSESSIONS_DEBUG_LOG` (defaults
+/// to `/tmp/opensessions-debug.log`). Use sparingly to trace state-machine
+/// transitions in the live tmux A/B harness; the log is rotated by the user
+/// (`: > /tmp/opensessions-debug.log`). Set `OPENSESSIONS_DEBUG_LOG=` (empty)
+/// to silence.
 fn debug_log(line: impl AsRef<str>) {
     use std::io::Write;
     let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .ok()
-        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
+        .unwrap_or_else(|_| "/tmp/opensessions-debug-rs.log".to_string());
     if path.is_empty() {
         return;
     }
@@ -104,22 +88,17 @@ fn debug_log(line: impl AsRef<str>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(
-            file,
-            "[{now}] [server pid={}] {}",
-            std::process::id(),
-            line.as_ref()
-        );
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "[{now}] [server] {}", line.as_ref());
     }
 }
 
 pub trait StateSource: Send + Sync + 'static {
     fn snapshot_json(&self) -> String;
-
-    fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16) {}
-
-    fn cleanup_mux_hooks(&self) {}
 
     fn start_background_tasks(
         self: Arc<Self>,
@@ -161,12 +140,10 @@ pub trait StateSource: Send + Sync + 'static {
         None
     }
 
-    fn handle_http_hook(&self, _path: &str, _body: &str) -> Option<String> {
-        None
-    }
+    fn handle_http_hook(&self, _path: &str, _body: &str) {}
 
-    fn handle_switch_index(&self, _index: u32, _body: &str) -> Option<String> {
-        None
+    fn should_report_sidebar_resize(&self, _context: &ClientConnectionContext) -> bool {
+        false
     }
 
     fn handle_agent_event_json(&self, _body: &Value) -> Result<String, AgentEventError> {
@@ -181,9 +158,7 @@ pub trait StateSource: Send + Sync + 'static {
         Err(PiRuntimeError::MissingPid)
     }
 
-    fn begin_shutdown(&self) -> Option<String> {
-        None
-    }
+    fn handle_switch_index(&self, _index: u32, _body: &str) {}
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -206,15 +181,7 @@ impl AgentEventError {
         match self {
             Self::MissingAgent => ("400 Bad Request", "missing agent"),
             Self::InvalidStatus => ("400 Bad Request", "invalid status"),
-            // Agent events are intentionally broadcast to every opensessions
-            // server in every tmux namespace. A server that cannot map the
-            // event's projectDir/tmuxSession to one of its sessions should
-            // no-op with a non-error status so the plugin can publish once and
-            // let each server decide folder ownership locally. Use 202 (not
-            // 204) so the plugin can distinguish "ignored by this server" from
-            // "applied by an owning server" when deciding whether to retry
-            // during owner-server restarts.
-            Self::CouldNotResolveSession => ("202 Accepted", ""),
+            Self::CouldNotResolveSession => ("404 Not Found", "could not resolve session"),
         }
     }
 }
@@ -311,19 +278,10 @@ impl GitCommandRunner for SystemGitCommandRunner {
             return String::new();
         };
 
-        let Ok(numstat) = process::Command::new("git")
-            .current_dir(dir)
-            .args(["diff", "--numstat", "HEAD", "--"])
-            .output()
-        else {
-            return String::new();
-        };
-
         format!(
-            "{}\n---\n{}\n---NUMSTAT---\n{}",
+            "{}\n---\n{}",
             String::from_utf8_lossy(&rev_parse.stdout).trim(),
-            String::from_utf8_lossy(&status.stdout).trim(),
-            String::from_utf8_lossy(&numstat.stdout).trim()
+            String::from_utf8_lossy(&status.stdout).trim()
         )
     }
 }
@@ -347,18 +305,11 @@ pub struct ReadOnlyMuxStateSource {
     port_snapshot_cache: Mutex<Option<CachedPortSnapshot>>,
     git_command_runner: Arc<dyn GitCommandRunner>,
     git_info_cache: Mutex<HashMap<String, CachedGitInfo>>,
-    // The sidebar coordinator owns the single source of truth for the current
-    // width (`SidebarCoordinator::state().width`), so there is no separate
-    // mirror field to drift out of sync.
     sidebar_coordinator: Mutex<SidebarCoordinator>,
-    detail_panel_height: Mutex<u16>,
-    agent_panel_scope: Mutex<AgentPanelScope>,
+    sidebar_width: Mutex<u32>,
     focused_session: Mutex<Option<String>>,
-    focused_pane_by_session: Mutex<HashMap<String, String>>,
-    focused_client_tty: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
-    collapsed_worktree_groups: Mutex<HashSet<String>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
     agent_tracker: Mutex<AgentTracker>,
@@ -372,14 +323,8 @@ pub fn default_state_source_from_env(
     if env("TMUX").is_some() {
         let provider = Arc::new(TmuxProvider::new(Arc::new(StdCommandRunner::default())));
         let mut source = ReadOnlyMuxStateSource::new(vec![provider]);
-        let config = env("HOME")
-            .map(PathBuf::from)
-            .map(|home| load_config_from_home(&home));
-        if let Some(width) = config.as_ref().and_then(|config| config.sidebar_width) {
+        if let Some(width) = env("OPENSESSIONS_WIDTH").and_then(|width| width.parse::<u16>().ok()) {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
-        }
-        if let Some(height) = config.and_then(|config| config.detail_panel_height) {
-            source = source.with_detail_panel_height(height);
         }
         return Some(source);
     }
@@ -396,14 +341,10 @@ impl ReadOnlyMuxStateSource {
             git_command_runner: Arc::new(SystemGitCommandRunner),
             git_info_cache: Mutex::new(HashMap::new()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
-            detail_panel_height: Mutex::new(DEFAULT_DETAIL_PANEL_HEIGHT),
-            agent_panel_scope: Mutex::new(AgentPanelScope::Current),
+            sidebar_width: Mutex::new(26),
             focused_session: Mutex::new(None),
-            focused_pane_by_session: Mutex::new(HashMap::new()),
-            focused_client_tty: Mutex::new(None),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
-            collapsed_worktree_groups: Mutex::new(HashSet::new()),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
             agent_tracker: Mutex::new(AgentTracker::new()),
@@ -413,64 +354,9 @@ impl ReadOnlyMuxStateSource {
     }
 
     pub fn with_sidebar_width(mut self, sidebar_width: u32) -> Self {
+        self.sidebar_width = Mutex::new(sidebar_width);
         self.sidebar_coordinator = Mutex::new(SidebarCoordinator::new(sidebar_width));
         self
-    }
-
-    pub fn with_detail_panel_height(mut self, height: u16) -> Self {
-        self.detail_panel_height = Mutex::new(clamp_detail_panel_height(height));
-        self
-    }
-
-    /// Current sidebar width from the coordinator (single source of truth),
-    /// clamped to `u16` for the tmux resize APIs.
-    fn current_sidebar_width_u16(&self) -> u16 {
-        self.sidebar_coordinator
-            .lock()
-            .unwrap()
-            .state()
-            .width
-            .min(u16::MAX as u32) as u16
-    }
-
-    fn is_sidebar_visible(&self) -> bool {
-        self.sidebar_coordinator.lock().unwrap().state().visible
-    }
-
-    fn persist_sidebar_width(&self, width: u16) {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            debug_log("set-sidebar-width: skipped config save because HOME is unset");
-            return;
-        };
-        if let Err(err) = save_config_to_home(
-            &home,
-            OpensessionsConfig {
-                sidebar_width: Some(width),
-                ..OpensessionsConfig::default()
-            },
-        ) {
-            debug_log(format!(
-                "set-sidebar-width: failed to save sidebarWidth={width}: {err}"
-            ));
-        }
-    }
-
-    fn persist_detail_panel_height(&self, height: u16) {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            debug_log("set-detail-panel-height: skipped config save because HOME is unset");
-            return;
-        };
-        if let Err(err) = save_config_to_home(
-            &home,
-            OpensessionsConfig {
-                detail_panel_height: Some(height),
-                ..OpensessionsConfig::default()
-            },
-        ) {
-            debug_log(format!(
-                "set-detail-panel-height: failed to save detailPanelHeight={height}: {err}"
-            ));
-        }
     }
 
     pub fn with_now_ms(mut self, now_ms: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
@@ -487,129 +373,9 @@ impl ReadOnlyMuxStateSource {
         self.git_command_runner = runner;
         self
     }
-
-    fn sync_agent_pane_presence(&self) -> bool {
-        let mut presence_by_session = Vec::new();
-        let mut focused_agent_panes = HashMap::<String, String>::new();
-        let focused_client_tty = self.focused_client_tty.lock().unwrap().clone();
-        for provider in &self.providers {
-            let client_focus = provider.get_client_focus(focused_client_tty.as_deref());
-            for session in provider.list_sessions() {
-                let pane_agents = provider
-                    .list_agent_panes(&session.name)
-                    .into_iter()
-                    .map(|pane| {
-                        if client_focus.as_ref().is_some_and(|focus| {
-                            focus.session_name == session.name && focus.pane_id == pane.pane_id
-                        }) {
-                            focused_agent_panes.insert(session.name.clone(), pane.pane_id.clone());
-                        }
-                        PanePresenceInput {
-                            agent: pane.agent,
-                            pane_id: pane.pane_id,
-                            active: pane.active,
-                            thread_id: pane.thread_id,
-                            thread_name: pane.thread_name,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                if !pane_agents.is_empty() {
-                    debug_log(format!(
-                        "agent-pane-presence session={} panes={:?}",
-                        session.name, pane_agents,
-                    ));
-                }
-                presence_by_session.push((session.name, pane_agents));
-            }
-        }
-
-        let mut changed = false;
-        let mut tracker = self.agent_tracker.lock().unwrap();
-        for (session, pane_agents) in presence_by_session {
-            changed = tracker.apply_pane_presence(&session, pane_agents) || changed;
-        }
-        for (session, pane_id) in focused_agent_panes {
-            let previous = self
-                .focused_pane_by_session
-                .lock()
-                .unwrap()
-                .insert(session.clone(), pane_id.clone());
-            let seen_changed = tracker.mark_pane_seen(&session, &pane_id);
-            debug_log(format!(
-                "current-agent-pane-seen session={session} pane={pane_id} previous={previous:?} changed={seen_changed}",
-            ));
-            changed = seen_changed || changed;
-        }
-        changed
-    }
-
-    fn mark_focused_agent_panes_seen(&self) -> bool {
-        let focused = self.focused_pane_by_session.lock().unwrap().clone();
-        if focused.is_empty() {
-            return false;
-        }
-        let mut tracker = self.agent_tracker.lock().unwrap();
-        let mut changed = false;
-        for (session, pane_id) in focused {
-            let pane_changed = tracker.mark_pane_seen(&session, &pane_id);
-            debug_log(format!(
-                "focused-pane-seen-check session={session} pane={pane_id} changed={pane_changed}",
-            ));
-            changed = pane_changed || changed;
-        }
-        changed
-    }
-
-    fn remember_focused_pane(&self, context: &HttpContext) -> bool {
-        if context.pane_active == Some(false) {
-            debug_log(format!(
-                "focus-pane ignored inactive session={} pane={:?}",
-                context.session, context.pane_id,
-            ));
-            return false;
-        }
-        let Some(pane_id) = context
-            .pane_id
-            .as_deref()
-            .filter(|pane_id| !pane_id.is_empty())
-        else {
-            return false;
-        };
-        if context.client_tty.is_some() {
-            *self.focused_client_tty.lock().unwrap() = context.client_tty.clone();
-        }
-        self.focused_pane_by_session
-            .lock()
-            .unwrap()
-            .insert(context.session.clone(), pane_id.to_string());
-        let changed = self
-            .agent_tracker
-            .lock()
-            .unwrap()
-            .mark_pane_seen(&context.session, pane_id);
-        debug_log(format!(
-            "focus-pane session={} pane={} changed={changed}",
-            context.session, pane_id,
-        ));
-        changed
-    }
 }
 
 impl StateSource for ReadOnlyMuxStateSource {
-    fn setup_mux_hooks(&self, server_host: &str, server_port: u16) {
-        let width = self.current_sidebar_width_u16();
-        for provider in &self.providers {
-            provider.set_sidebar_width_hint(width);
-            provider.setup_hooks(server_host, server_port);
-        }
-    }
-
-    fn cleanup_mux_hooks(&self) {
-        for provider in &self.providers {
-            provider.cleanup_hooks();
-        }
-    }
-
     fn start_background_tasks(
         self: Arc<Self>,
         state_updates: broadcast::Sender<String>,
@@ -621,7 +387,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 state_updates.clone(),
                 shutdown.clone(),
             )),
-            tokio::spawn(run_sidebar_lifecycle_loop(
+            tokio::spawn(run_drag_settle_loop(
                 self.clone(),
                 state_updates.clone(),
                 shutdown.clone(),
@@ -631,15 +397,13 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn snapshot_json(&self) -> String {
-        self.sync_agent_pane_presence();
-        self.mark_focused_agent_panes_seen();
-
         let providers = self
             .providers
             .iter()
             .map(|provider| provider.as_ref())
             .collect::<Vec<_>>();
         let visible_session_names = self.visible_session_names();
+        self.refresh_agent_pane_presence(visible_session_names.as_deref());
         let metadata_by_session = visible_session_names.as_ref().map(|names| {
             names
                 .iter()
@@ -678,10 +442,17 @@ impl StateSource for ReadOnlyMuxStateSource {
                 })
                 .unwrap_or((None, None, None));
         let ports_by_session = self.discover_live_ports(visible_session_names.as_deref());
-        let sidebar_state = self.sidebar_coordinator.lock().unwrap().state();
+        let sidebar_state = {
+            let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+            coordinator.tick_user_drag_settle((self.now_ms)(), USER_DRAG_SETTLE_MS);
+            coordinator.state()
+        };
         debug_log(format!(
-            "snapshot_json mode={} init={} width={}",
-            sidebar_state.mode, sidebar_state.initializing, sidebar_state.width,
+            "snapshot_json mode={} init={} authority={:?} width={}",
+            sidebar_state.mode,
+            sidebar_state.initializing,
+            sidebar_state.resize_authority,
+            sidebar_state.width,
         ));
         let state = build_read_only_state(ReadOnlyStateInput {
             providers,
@@ -695,33 +466,15 @@ impl StateSource for ReadOnlyMuxStateSource {
             ports_by_session,
             portless_state: None,
             focused_session: self.focused_session.lock().unwrap().clone(),
-            current_session_override: None,
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
-            agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
-            collapsed_worktree_groups: self
-                .collapsed_worktree_groups
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect(),
-            sidebar_width: sidebar_state.width,
-            detail_panel_height: u32::from(*self.detail_panel_height.lock().unwrap()),
+            sidebar_width: *self.sidebar_width.lock().unwrap(),
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
             now_ms: (self.now_ms)(),
         });
 
         serde_json::to_string(&ServerMessage::State(state)).expect("state must serialize")
-    }
-
-    fn begin_shutdown(&self) -> Option<String> {
-        {
-            let mut coordinator = self.sidebar_coordinator.lock().unwrap();
-            coordinator.begin_closing();
-        }
-        Some(self.snapshot_json())
     }
 
     fn handle_client_command(&self, command: &Value) -> Option<String> {
@@ -746,22 +499,44 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
                 provider.switch_session(name, client_tty);
-                None
+                *self.focused_session.lock().unwrap() = Some(name.to_string());
+                // Visiting a session clears its unseen agents (turns ● back
+                // into ✓). Mirrors `tracker.handleFocus` in
+                // `packages/runtime/src/server/index.ts:1964`.
+                let had_unseen = self.agent_tracker.lock().unwrap().handle_focus(name);
+                if had_unseen {
+                    return Some(self.snapshot_json());
+                }
+                Some(format!(
+                    r#"{{"type":"focus","focusedSession":"{name}","currentSession":"{name}"}}"#
+                ))
             }
             "switch-index" => {
                 let index = command.get("index")?.as_u64()?.min(u32::MAX as u64) as u32;
-                self.switch_visible_index(index, None)
+                self.switch_visible_index(index, None);
+                None
+            }
+            "focus-session" => {
+                let name = command.get("name")?.as_str()?;
+                *self.focused_session.lock().unwrap() = Some(name.to_string());
+                let had_unseen = self.agent_tracker.lock().unwrap().handle_focus(name);
+                if had_unseen {
+                    return Some(self.snapshot_json());
+                }
+                let current_session = provider.get_current_session();
+                Some(format_focus_json(Some(name), current_session.as_deref()))
+            }
+            "move-focus" => {
+                let delta = command.get("delta")?.as_i64()?;
+                let current_session = provider.get_current_session();
+                let focused = self.move_focus(delta, current_session.as_deref())?;
+                Some(format_focus_json(
+                    Some(&focused),
+                    current_session.as_deref(),
+                ))
             }
             "kill-session" => {
                 let name = command.get("name")?.as_str()?;
-                if provider.get_current_session().as_deref() == Some(name)
-                    && let Some(next) = self
-                        .session_before(name)
-                        .or_else(|| self.session_after(name))
-                {
-                    provider.switch_session(&next, None);
-                    *self.focused_session.lock().unwrap() = Some(next);
-                }
                 provider.kill_session(name);
                 Some(self.snapshot_json())
             }
@@ -777,58 +552,13 @@ impl StateSource for ReadOnlyMuxStateSource {
             "reorder-session" => {
                 let name = command.get("name")?.as_str()?;
                 let delta = command.get("delta")?.as_i64()? as i8;
-                if let Some(names) = self.sidebar_reordered_session_names(name, delta) {
-                    self.session_order.lock().unwrap().set_visible_order(names);
-                }
-                Some(self.snapshot_json())
-            }
-            "reorder-worktree-group" => {
-                let key = command.get("key")?.as_str()?;
-                let delta = command.get("delta")?.as_i64()? as i8;
-                if let Some(names) = self.sidebar_reordered_worktree_group_names(key, delta) {
-                    self.session_order.lock().unwrap().set_visible_order(names);
-                }
+                self.session_order.lock().unwrap().reorder(name, delta);
                 Some(self.snapshot_json())
             }
             "set-theme" => {
                 let theme = command.get("theme")?.as_str()?.to_string();
                 *self.theme.lock().unwrap() = Some(theme);
                 Some(self.snapshot_json())
-            }
-            "set-sidebar-width" => {
-                let width = command.get("width")?.as_u64()?.min(u16::MAX as u64) as u16;
-                let width = clamp_sidebar_width(width);
-                self.persist_sidebar_width(width);
-                self.sidebar_coordinator
-                    .lock()
-                    .unwrap()
-                    .set_width(u32::from(width));
-                for provider in &self.providers {
-                    provider.set_sidebar_width_hint(width);
-                }
-                self.enforce_sidebar_width(width);
-                Some(self.snapshot_json())
-            }
-            "set-detail-panel-height" => {
-                let height = command.get("height")?.as_u64()?.min(u16::MAX as u64) as u16;
-                let height = clamp_detail_panel_height(height);
-                *self.detail_panel_height.lock().unwrap() = height;
-                self.persist_detail_panel_height(height);
-                Some(self.snapshot_json())
-            }
-            "set-agent-panel-scope" => {
-                let scope = parse_agent_panel_scope(command.get("scope")?.as_str()?)?;
-                *self.agent_panel_scope.lock().unwrap() = scope;
-                Some(self.snapshot_json())
-            }
-            "repair-width" => {
-                if self.is_sidebar_visible() {
-                    let width = self.current_sidebar_width_u16();
-                    if !self.repair_context_sidebar_width(context, width) {
-                        self.enforce_sidebar_width(width);
-                    }
-                }
-                None
             }
             "set-filter" => {
                 let filter = match command.get("filter")?.as_str()? {
@@ -840,13 +570,45 @@ impl StateSource for ReadOnlyMuxStateSource {
                 *self.session_filter.lock().unwrap() = Some(filter);
                 Some(self.snapshot_json())
             }
-            "toggle-worktree-group" => {
-                let key = command.get("key")?.as_str()?.to_string();
-                let mut collapsed = self.collapsed_worktree_groups.lock().unwrap();
-                if !collapsed.insert(key) {
-                    collapsed.remove(command.get("key")?.as_str()?);
+            "report-width" => {
+                let width = command.get("width")?.as_u64()?.min(u16::MAX as u64) as u16;
+                let width = clamp_sidebar_width(width) as u32;
+                let context = context?;
+                let current_session = provider.get_current_session();
+                let current_window_id = provider.get_current_window_id();
+                let is_active_session =
+                    context.session_name.as_deref() == current_session.as_deref();
+                let is_current_window =
+                    context.window_id.as_deref() == current_window_id.as_deref();
+                let decision = self.sidebar_coordinator.lock().unwrap().apply_width_report(
+                    SidebarWidthReportInput {
+                        width,
+                        session: context.session_name.clone(),
+                        window_id: context.window_id.clone(),
+                        is_active_session,
+                        is_foreground_client: is_active_session && is_current_window,
+                        is_current_window,
+                        now: (self.now_ms)(),
+                        suppress_ms: 500,
+                    },
+                );
+                debug_log(format!(
+                    "report-width width={width} session={:?} window={:?} \
+                     active_session={is_active_session} current_window={is_current_window} \
+                     accepted={} reason={}",
+                    context.session_name,
+                    context.window_id,
+                    decision.accepted,
+                    decision.reason,
+                ));
+                if !decision.accepted {
+                    return None;
                 }
-                drop(collapsed);
+                *self.sidebar_width.lock().unwrap() = decision.next_width;
+                self.enforce_sidebar_width(
+                    decision.next_width.min(u16::MAX as u32) as u16,
+                    context.pane_id.as_deref(),
+                );
                 Some(self.snapshot_json())
             }
             "focus-agent-pane" => {
@@ -854,33 +616,20 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let agent = command.get("agent")?.as_str()?;
                 let thread_id = command.get("threadId").and_then(Value::as_str);
                 let thread_name = command.get("threadName").and_then(Value::as_str);
-                let pane_id = command.get("paneId").and_then(Value::as_str);
-                let mut seen_changed = self
-                    .agent_tracker
-                    .lock()
-                    .unwrap()
-                    .mark_agent_seen(session, agent, thread_id, pane_id);
                 if let Some((provider, pane_id)) =
-                    self.resolve_agent_pane(session, agent, thread_id, thread_name, pane_id)
+                    self.resolve_agent_pane(session, agent, thread_id, thread_name)
                 {
-                    seen_changed = self.agent_tracker.lock().unwrap().mark_agent_seen(
-                        session,
-                        agent,
-                        thread_id,
-                        Some(&pane_id),
-                    ) || seen_changed;
                     provider.focus_pane(&pane_id);
                 }
-                seen_changed.then(|| self.snapshot_json())
+                None
             }
             "kill-agent-pane" => {
                 let session = command.get("session")?.as_str()?;
                 let agent = command.get("agent")?.as_str()?;
                 let thread_id = command.get("threadId").and_then(Value::as_str);
                 let thread_name = command.get("threadName").and_then(Value::as_str);
-                let pane_id = command.get("paneId").and_then(Value::as_str);
                 if let Some((provider, pane_id)) =
-                    self.resolve_agent_pane(session, agent, thread_id, thread_name, pane_id)
+                    self.resolve_agent_pane(session, agent, thread_id, thread_name)
                 {
                     provider.kill_pane(&pane_id);
                 }
@@ -916,24 +665,10 @@ impl StateSource for ReadOnlyMuxStateSource {
             .and_then(Value::as_str)
             .map(ToString::to_string);
         debug_log(format!(
-            "identify-pane session={:?} pane={:?} window={:?} -> acknowledge_sidebar_connected",
+            "identify-pane session={:?} pane={:?} window={:?} -> mark_ready",
             context.session_name, context.pane_id, context.window_id,
         ));
-        self.sidebar_coordinator
-            .lock()
-            .unwrap()
-            .acknowledge_sidebar_connected();
-        if let Some(window_id) = context.window_id.as_deref() {
-            for provider in &self.providers {
-                provider.prepare_sidebar_window(window_id);
-            }
-        }
-        if self.is_sidebar_visible() {
-            let width = self.current_sidebar_width_u16();
-            if !self.repair_context_sidebar_width(Some(context), width) {
-                self.enforce_sidebar_width(width);
-            }
-        }
+        self.sidebar_coordinator.lock().unwrap().mark_ready();
         let client_tty = self.providers.first()?.get_client_tty();
         Some(format!(
             r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
@@ -1036,64 +771,99 @@ impl StateSource for ReadOnlyMuxStateSource {
         if path != "/focus" {
             return None;
         }
-        let context = parse_context(body)?;
-        let name = context.session.clone();
+        let name = parse_context_session(body).or_else(|| parse_legacy_focus_session(body))?;
         *self.focused_session.lock().unwrap() = Some(name.clone());
-        if self.remember_focused_pane(&context) {
+        // Visiting (focusing) a session clears its unseen agents — `●`
+        // (notification) becomes `✓` (done). Mirrors `handleFocus` in
+        // `packages/runtime/src/server/index.ts`.
+        let had_unseen = self.agent_tracker.lock().unwrap().handle_focus(&name);
+        if had_unseen {
             return Some(self.snapshot_json());
         }
-        None
+        let current_session = self.providers.first()?.get_current_session();
+        Some(format_focus_json(Some(&name), current_session.as_deref()))
     }
 
-    fn handle_http_hook(&self, path: &str, body: &str) -> Option<String> {
+    fn handle_http_hook(&self, path: &str, body: &str) {
         match path {
-            "/toggle" => {
-                self.toggle_sidebar();
-                Some(self.snapshot_json())
-            }
-            "/ensure-sidebar" => {
-                let spawned = self.ensure_sidebar(body);
-                parse_context_session(body)
-                    .map(|name| activate_session_json(name, None))
-                    .or_else(|| spawned.then(|| self.snapshot_json()))
-            }
+            "/toggle" => self.toggle_sidebar(),
+            "/ensure-sidebar" => self.ensure_sidebar(body),
             "/pane-exited" => {
-                let fallback_sessions = self
-                    .providers
-                    .iter()
-                    .flat_map(|provider| provider.list_sidebar_panes(None))
-                    .filter_map(|pane| {
-                        let fallback = self
-                            .session_before(&pane.session_name)
-                            .or_else(|| self.session_after(&pane.session_name))?;
-                        Some((pane.session_name, fallback))
-                    })
-                    .collect::<HashMap<_, _>>();
                 for provider in &self.providers {
-                    provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
+                    provider.kill_orphaned_sidebar_panes();
                 }
-                if self.is_sidebar_visible() {
-                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
-                }
-                None
             }
-            "/pane-layout-changed" | "/client-resized" => {
-                if self.is_sidebar_visible() {
-                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
-                }
-                None
+            "/suppress-width-reports" => {
+                self.sidebar_coordinator
+                    .lock()
+                    .unwrap()
+                    .suppress_width_reports((self.now_ms)() + 500);
             }
-            _ => None,
+            "/client-resized" => {
+                let now = (self.now_ms)();
+                self.sidebar_coordinator
+                    .lock()
+                    .unwrap()
+                    .begin_client_resize_sync(now + 500, now + 700);
+                let width = (*self.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
+                self.enforce_sidebar_width(width, None);
+                self.sidebar_coordinator
+                    .lock()
+                    .unwrap()
+                    .finish_client_resize_sync();
+            }
+            _ => {}
         }
     }
 
-    fn handle_switch_index(&self, index: u32, body: &str) -> Option<String> {
+    fn should_report_sidebar_resize(&self, context: &ClientConnectionContext) -> bool {
+        let Some(session_name) = context.session_name.as_deref() else {
+            return false;
+        };
+        let Some(window_id) = context.window_id.as_deref() else {
+            return false;
+        };
+        let Some(provider) = self.providers.first() else {
+            return false;
+        };
+        provider.get_current_session().as_deref() == Some(session_name)
+            && provider.get_current_window_id().as_deref() == Some(window_id)
+    }
+
+    fn handle_switch_index(&self, index: u32, body: &str) {
         let client_tty = parse_context(body).and_then(|context| context.client_tty);
-        self.switch_visible_index(index, client_tty.as_deref())
+        self.switch_visible_index(index, client_tty.as_deref());
     }
 }
 
 impl ReadOnlyMuxStateSource {
+    fn refresh_agent_pane_presence(&self, visible_session_names: Option<&[String]>) {
+        let visible =
+            visible_session_names.map(|names| names.iter().cloned().collect::<HashSet<_>>());
+        let mut tracker = self.agent_tracker.lock().unwrap();
+        for provider in &self.providers {
+            for session in provider.list_sessions() {
+                if visible
+                    .as_ref()
+                    .is_some_and(|visible| !visible.contains(&session.name))
+                {
+                    continue;
+                }
+                let panes = provider
+                    .list_agent_panes(&session.name)
+                    .into_iter()
+                    .map(|pane| PanePresenceInput {
+                        agent: pane.agent,
+                        pane_id: pane.pane_id,
+                        thread_id: pane.thread_id,
+                        thread_name: pane.thread_name,
+                    })
+                    .collect::<Vec<_>>();
+                tracker.apply_pane_presence(&session.name, panes);
+            }
+        }
+    }
+
     fn apply_agent_event(&self, body: &Value) -> Result<(), AgentEventError> {
         let agent = body
             .get("agent")
@@ -1112,12 +882,6 @@ impl ReadOnlyMuxStateSource {
             .get("ts")
             .and_then(Value::as_u64)
             .unwrap_or_else(|| (self.now_ms)());
-        let pane_id = body
-            .get("paneId")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let event_pane_id = pane_id.clone();
-        let event_session = session.clone();
         self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
             agent,
             session,
@@ -1131,94 +895,31 @@ impl ReadOnlyMuxStateSource {
                 .get("threadName")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-            last_user_prompt: body
-                .get("lastUserPrompt")
-                .or_else(|| body.get("last_user_prompt"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
             unseen: None,
-            liveness: pane_id.as_ref().map(|_| AgentLiveness::Alive),
-            pane_id,
+            pane_id: None,
+            liveness: None,
         });
-        if let Some(pane_id) = event_pane_id
-            && self
-                .focused_pane_by_session
-                .lock()
-                .unwrap()
-                .get(&event_session)
-                .is_some_and(|focused_pane| focused_pane == &pane_id)
-        {
-            debug_log(format!(
-                "agent-event-focused-pane session={} pane={} -> mark seen",
-                event_session, pane_id,
-            ));
-            self.agent_tracker
-                .lock()
-                .unwrap()
-                .mark_pane_seen(&event_session, &pane_id);
-        }
         Ok(())
     }
 
     fn apply_agent_watcher_snapshot(&self, snapshot: AgentWatcherSnapshot) -> bool {
         if snapshot.status == AgentStatus::Idle {
-            debug_log(format!(
-                "watcher-snapshot ignored idle agent={} thread_id={:?} thread_name={:?} project_dir={:?}",
-                snapshot.agent, snapshot.thread_id, snapshot.thread_name, snapshot.project_dir,
-            ));
             return false;
         }
         let Some(session) = self.resolve_agent_watcher_session(&snapshot) else {
-            debug_log(format!(
-                "watcher-snapshot unresolved agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
-                snapshot.agent,
-                snapshot.status,
-                snapshot.thread_id,
-                snapshot.thread_name,
-                snapshot.project_dir,
-            ));
             return false;
         };
-        let focused_pane = self
-            .focused_pane_by_session
-            .lock()
-            .unwrap()
-            .get(&session)
-            .cloned();
-        debug_log(format!(
-            "watcher-snapshot applying session={} focused_pane={:?} agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
-            session,
-            focused_pane,
-            snapshot.agent,
-            snapshot.status,
-            snapshot.thread_id,
-            snapshot.thread_name,
-            snapshot.project_dir,
-        ));
-        let event = AgentEvent {
+        self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
             agent: snapshot.agent.to_string(),
-            session: session.clone(),
+            session,
             status: snapshot.status,
             ts: snapshot.ts,
-            thread_id: snapshot.thread_id.clone(),
-            thread_name: snapshot.thread_name.clone(),
-            last_user_prompt: snapshot.last_user_prompt.clone(),
+            thread_id: snapshot.thread_id,
+            thread_name: snapshot.thread_name,
             unseen: None,
             pane_id: None,
             liveness: None,
-        };
-        self.agent_tracker.lock().unwrap().apply_event(event);
-        if let Some(pane_id) = focused_pane {
-            let changed = self
-                .agent_tracker
-                .lock()
-                .unwrap()
-                .mark_pane_seen(&session, &pane_id);
-            debug_log(format!(
-                "watcher-snapshot-focused-pane-seen session={} pane={} agent={} thread_id={:?} thread_name={:?} changed={changed}",
-                session, pane_id, snapshot.agent, snapshot.thread_id, snapshot.thread_name,
-            ));
-        }
+        });
         true
     }
 
@@ -1252,21 +953,19 @@ impl ReadOnlyMuxStateSource {
             .flat_map(|provider| provider.list_sessions())
             .collect::<Vec<_>>();
 
-        if let Some(project_dir) = body.get("projectDir").and_then(Value::as_str) {
-            let dir_session_map = build_dir_session_map(
-                sessions
-                    .iter()
-                    .map(|session| (session.name.clone(), session.dir.clone())),
-            );
-            if let Some(session) = resolve_session_for_project_dir(project_dir, &dir_session_map) {
-                return Some(session);
+        if let Some(tmux_session) = body.get("tmuxSession").and_then(Value::as_str) {
+            if sessions.iter().any(|session| session.name == tmux_session) {
+                return Some(tmux_session.to_string());
             }
         }
 
-        body.get("tmuxSession")
-            .and_then(Value::as_str)
-            .filter(|tmux_session| sessions.iter().any(|session| session.name == *tmux_session))
-            .map(ToString::to_string)
+        let project_dir = body.get("projectDir")?.as_str()?;
+        let dir_session_map = build_dir_session_map(
+            sessions
+                .into_iter()
+                .map(|session| (session.name, session.dir)),
+        );
+        resolve_session_for_project_dir(project_dir, &dir_session_map)
     }
 
     fn resolve_agent_pane(
@@ -1275,13 +974,8 @@ impl ReadOnlyMuxStateSource {
         agent: &str,
         thread_id: Option<&str>,
         thread_name: Option<&str>,
-        pane_id: Option<&str>,
     ) -> Option<(Arc<dyn MuxProvider>, String)> {
         let provider = self.provider_for_session(session)?;
-        if let Some(pane_id) = pane_id {
-            return Some((provider, pane_id.to_string()));
-        }
-        self.sync_agent_pane_presence();
         if let Some(pane_id) = self.resolve_tracked_agent_pane(session, agent, thread_id) {
             return Some((provider, pane_id));
         }
@@ -1310,46 +1004,16 @@ impl ReadOnlyMuxStateSource {
             .and_then(|event| event.pane_id)
     }
 
-    fn sidebar_panes_to_resize(&self, width: u16) -> Vec<String> {
-        let mut pane_ids = Vec::new();
+    fn enforce_sidebar_width(&self, width: u16, except_pane_id: Option<&str>) {
         for provider in &self.providers {
             if !provider.is_sidebar_capable() {
                 continue;
             }
             for pane in provider.list_sidebar_panes(None) {
-                if pane.width == Some(width) {
+                if except_pane_id == Some(pane.pane_id.as_str()) {
                     continue;
                 }
-                pane_ids.push(pane.pane_id);
-            }
-        }
-        pane_ids.reverse();
-        pane_ids
-    }
-
-    fn repair_context_sidebar_width(
-        &self,
-        context: Option<&ClientConnectionContext>,
-        width: u16,
-    ) -> bool {
-        let Some(pane_id) = context.and_then(|context| context.pane_id.as_deref()) else {
-            return false;
-        };
-        debug_log(format!(
-            "width-repair: resize context pane={pane_id} to={width}"
-        ));
-        for provider in &self.providers {
-            provider.resize_sidebar_pane(pane_id, width);
-        }
-        true
-    }
-
-    fn enforce_sidebar_width(&self, width: u16) {
-        let panes = self.sidebar_panes_to_resize(width);
-        for pane_id in panes {
-            debug_log(format!("width-repair: resize pane={pane_id} to={width}",));
-            for provider in &self.providers {
-                provider.resize_sidebar_pane(&pane_id, width);
+                provider.resize_sidebar_pane(&pane.pane_id, width);
             }
         }
     }
@@ -1394,10 +1058,10 @@ impl ReadOnlyMuxStateSource {
         }
 
         let now = (self.now_ms)();
-        if let Some(cached) = self.git_info_cache.lock().unwrap().get(dir).cloned()
-            && now.saturating_sub(cached.ts) < GIT_CACHE_TTL_MS
-        {
-            return cached.info;
+        if let Some(cached) = self.git_info_cache.lock().unwrap().get(dir).cloned() {
+            if now.saturating_sub(cached.ts) < GIT_CACHE_TTL_MS {
+                return cached.info;
+            }
         }
 
         let output = self.git_command_runner.git_info_output(dir);
@@ -1423,11 +1087,12 @@ impl ReadOnlyMuxStateSource {
             .map(|names| names.to_vec())
             .unwrap_or_else(|| self.sorted_session_names());
         let now = (self.now_ms)();
-        if let Some(cached) = self.port_snapshot_cache.lock().unwrap().clone()
-            && cached.session_names == session_names
-            && now.saturating_sub(cached.ts) < PORT_POLL_INTERVAL_MS
-        {
-            return Some(cached.ports_by_session);
+        if let Some(cached) = self.port_snapshot_cache.lock().unwrap().clone() {
+            if cached.session_names == session_names
+                && now.saturating_sub(cached.ts) < PORT_POLL_INTERVAL_MS
+            {
+                return Some(cached.ports_by_session);
+            }
         }
 
         if session_names.is_empty() {
@@ -1497,33 +1162,10 @@ impl ReadOnlyMuxStateSource {
             return;
         }
 
-        let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
-        self.sidebar_coordinator
-            .lock()
-            .unwrap()
-            .begin_warmup_until(warmup_until);
-        let width = self.current_sidebar_width_u16();
+        self.sidebar_coordinator.lock().unwrap().begin_warmup();
+        let width = (*self.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
         for provider in providers {
-            let mut unique_windows = Vec::<ActiveWindow>::new();
             for window in provider.list_active_windows() {
-                if let Some(current) = unique_windows
-                    .iter_mut()
-                    .find(|current| current.id == window.id)
-                {
-                    if !current.active && window.active {
-                        *current = window;
-                    } else {
-                        debug_log(format!(
-                            "toggle_sidebar: skipping duplicate linked window session={} window={}",
-                            window.session_name, window.id,
-                        ));
-                    }
-                    continue;
-                }
-                unique_windows.push(window);
-            }
-
-            for window in unique_windows {
                 debug_log(format!(
                     "toggle_sidebar: spawning in session={} window={} width={width}",
                     window.session_name, window.id,
@@ -1539,18 +1181,8 @@ impl ReadOnlyMuxStateSource {
         }
     }
 
-    fn ensure_sidebar(&self, body: &str) -> bool {
+    fn ensure_sidebar(&self, body: &str) {
         let context = parse_context(body);
-        let width = self.current_sidebar_width_u16();
-        if !self.is_sidebar_visible() {
-            debug_log("ensure_sidebar: ignored spawn while sidebar is hidden");
-            return false;
-        }
-        // A window switch / new window can make tmux proportionally redistribute
-        // panes in that window, so repair existing sidebars before spawning any
-        // missing ones. This is event-driven, not a per-tick width scan.
-        self.enforce_sidebar_width(width);
-        let mut spawned = false;
         for provider in &self.providers {
             if !provider.is_full_sidebar_capable() {
                 continue;
@@ -1567,17 +1199,14 @@ impl ReadOnlyMuxStateSource {
                 continue;
             };
             if provider
-                .list_sidebar_panes(Some(&session_name))
+                .list_sidebar_panes(None)
                 .iter()
                 .any(|pane| pane.window_id == window_id)
             {
                 continue;
             }
-            let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
-            self.sidebar_coordinator
-                .lock()
-                .unwrap()
-                .begin_warmup_until(warmup_until);
+            self.sidebar_coordinator.lock().unwrap().begin_warmup();
+            let width = (*self.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
             provider.spawn_sidebar(
                 &session_name,
                 &window_id,
@@ -1585,50 +1214,46 @@ impl ReadOnlyMuxStateSource {
                 SidebarPosition::Left,
                 SIDEBAR_SCRIPTS_DIR,
             );
-            spawned = true;
         }
-        spawned
     }
 
-    fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
-        let provider = self.providers.first()?;
-        let target_index = index.checked_sub(1).map(|index| index as usize)?;
-        let name = self
-            .sidebar_display_session_names()
-            .and_then(|names| names.get(target_index).cloned())?;
+    fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) {
+        let Some(provider) = self.providers.first() else {
+            return;
+        };
+        let Some(target_index) = index.checked_sub(1).map(|index| index as usize) else {
+            return;
+        };
+        let Some(name) = self
+            .visible_session_names()
+            .and_then(|names| names.get(target_index).cloned())
+        else {
+            return;
+        };
         provider.switch_session(&name, client_tty);
-        None
     }
 
-    fn session_before(&self, name: &str) -> Option<String> {
-        let names = self.sidebar_display_session_names()?;
-        let index = names.iter().position(|candidate| candidate == name)?;
-        index
-            .checked_sub(1)
-            .and_then(|previous| names.get(previous).cloned())
-    }
+    fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
+        let mut names = self.visible_session_names()?;
+        if names.is_empty() {
+            *self.focused_session.lock().unwrap() = None;
+            return None;
+        }
 
-    fn session_after(&self, name: &str) -> Option<String> {
-        let names = self.sidebar_display_session_names()?;
-        let index = names.iter().position(|candidate| candidate == name)?;
-        names.get(index + 1).cloned()
-    }
-
-    fn sidebar_display_session_names(&self) -> Option<Vec<String>> {
-        app_from_state_json(&self.snapshot_json()).map(|app| {
-            app.display_sessions()
-                .into_iter()
-                .map(|session| session.name.clone())
-                .collect()
-        })
-    }
-
-    fn sidebar_reordered_session_names(&self, name: &str, delta: i8) -> Option<Vec<String>> {
-        app_from_state_json(&self.snapshot_json())?.reordered_session_names(name, delta)
-    }
-
-    fn sidebar_reordered_worktree_group_names(&self, key: &str, delta: i8) -> Option<Vec<String>> {
-        app_from_state_json(&self.snapshot_json())?.reordered_worktree_group_names(key, delta)
+        let focused = self
+            .focused_session
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| current_session.map(ToString::to_string));
+        let current_idx = focused
+            .and_then(|focused| names.iter().position(|name| name == &focused))
+            .unwrap_or(0);
+        let max_idx = names.len() - 1;
+        let next_idx = (current_idx as i64 + delta).clamp(0, max_idx as i64) as usize;
+        let next = names.swap_remove(next_idx);
+        *self.focused_session.lock().unwrap() = Some(next.clone());
+        Some(next)
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
@@ -1660,11 +1285,14 @@ impl ReadOnlyMuxStateSource {
     }
 }
 
-/// Background ticker that advances sidebar lifecycle timers. This keeps
-/// user-visible lifecycle states like `warming up…` stable long enough to be
-/// perceived, then broadcasts the transition back to ready without relying on
-/// unrelated tmux or websocket traffic.
-async fn run_sidebar_lifecycle_loop(
+/// Background ticker that polls the sidebar coordinator's UserDrag settle
+/// state and broadcasts a fresh snapshot the moment the settle window
+/// expires. Without this loop the websocket only sends an "adjusting…"
+/// state when the width report is processed and never sends the cleared
+/// "ready" state once the user stops resizing. Mirrors the
+/// `setTimeout(USER_DRAG_SETTLE_MS)` callback in
+/// `packages/runtime/src/server/index.ts::startTransientSidebarResize`.
+async fn run_drag_settle_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     state_updates: broadcast::Sender<String>,
     shutdown: broadcast::Sender<()>,
@@ -1678,12 +1306,17 @@ async fn run_sidebar_lifecycle_loop(
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
                 let now = (source.now_ms)();
-                let changed = {
+                let cleared = {
                     let mut coordinator = source.sidebar_coordinator.lock().unwrap();
-                    coordinator.tick_timers(now)
+                    let was_drag = coordinator.state().resize_authority
+                        == opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::UserDrag;
+                    coordinator.tick_user_drag_settle(now, USER_DRAG_SETTLE_MS);
+                    let is_drag = coordinator.state().resize_authority
+                        == opensessions_runtime::sidebar_coordinator::SidebarResizeAuthority::UserDrag;
+                    was_drag && !is_drag
                 };
-                if changed {
-                    debug_log("sidebar_lifecycle_loop: lifecycle changed, broadcasting fresh state");
+                if cleared {
+                    debug_log("drag_settle_loop: UserDrag cleared, broadcasting fresh state");
                     let _ = state_updates.send(source.snapshot_json());
                 }
             }
@@ -1692,9 +1325,10 @@ async fn run_sidebar_lifecycle_loop(
 }
 
 /// Poll tmux state on a fixed cadence and broadcast a fresh snapshot whenever
-/// the JSON differs from the last broadcast, so the sidebar picks up new
-/// sessions, agent panes, focus changes, and other mux state without requiring
-/// an explicit hook.
+/// the JSON differs from the last broadcast. Mirrors the periodic
+/// session/window/pane refresh in `packages/runtime/src/server/index.ts`'s
+/// `setInterval` so the sidebar picks up new sessions, agent panes, focus
+/// changes, and width updates without requiring an explicit hook.
 async fn run_tmux_state_poll_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     state_updates: broadcast::Sender<String>,
@@ -1703,7 +1337,7 @@ async fn run_tmux_state_poll_loop(
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut shutdown_rx = shutdown.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_millis(TMUX_STATE_POLL_MS));
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Seed `last_hash` from the current state so the first tick does not
     // broadcast an unprovoked snapshot. Subsequent broadcasts only happen
@@ -1713,12 +1347,40 @@ async fn run_tmux_state_poll_loop(
         strip_ts_field(&source.snapshot_json()).hash(&mut hasher);
         hasher.finish()
     };
+    // Track the last observed current session so we can clear unseen-agent
+    // flags whenever the user moves into a different tmux session externally
+    // (e.g. via `tmux switch-client`). This complements the inline
+    // `handle_focus` calls in switch-session / focus-session / `/focus`
+    // command handlers.
+    let mut last_current_session: Option<String> = source
+        .providers
+        .first()
+        .and_then(|provider| provider.get_current_session());
+
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
-                // Hooks correct tmux layout churn immediately; this slower poll
-                // is only a backstop for missed external tmux changes.
+                // Re-enforce the configured sidebar width on every tick so
+                // tmux pane resizes by other clients are corrected. Mirrors
+                // `enforceSidebarWidth` in the TS server's tick.
+                let width = (*source.sidebar_width.lock().unwrap()).min(u16::MAX as u32) as u16;
+                source.enforce_sidebar_width(width, None);
+
+                // Visiting (= becoming the current tmux session) clears the
+                // unseen-agents notification dot for that session, so `●`
+                // turns back into `✓`. Mirrors `tracker.handleFocus` in TS
+                // (`packages/runtime/src/server/index.ts`).
+                let current_session = source
+                    .providers
+                    .first()
+                    .and_then(|provider| provider.get_current_session());
+                if current_session != last_current_session {
+                    if let Some(name) = current_session.as_deref() {
+                        source.agent_tracker.lock().unwrap().handle_focus(name);
+                    }
+                    last_current_session = current_session;
+                }
 
                 let snapshot = source.snapshot_json();
                 // Hash the snapshot ignoring the per-tick `ts` field so that
@@ -1836,7 +1498,6 @@ async fn run_agent_watcher_loop(
 struct AgentWatcherFingerprint {
     status: AgentStatus,
     thread_name: Option<String>,
-    last_user_prompt: Option<String>,
     project_dir: Option<String>,
 }
 
@@ -1845,7 +1506,6 @@ impl From<&AgentWatcherSnapshot> for AgentWatcherFingerprint {
         Self {
             status: snapshot.status,
             thread_name: snapshot.thread_name.clone(),
-            last_user_prompt: snapshot.last_user_prompt.clone(),
             project_dir: snapshot.project_dir.clone(),
         }
     }
@@ -1873,8 +1533,6 @@ fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {
     scan_claude_code_projects(&home, now_ms, &mut snapshots);
     scan_codex_sessions(&home, now_ms, &mut snapshots);
     scan_opencode_sessions(&home, now_ms, &mut snapshots);
-    scan_pi_sessions(&home, now_ms, &mut snapshots);
-    scan_droid_sessions(&home, now_ms, &mut snapshots);
     snapshots
 }
 
@@ -1988,7 +1646,6 @@ fn scan_codex_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatche
 
 fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
     let db_path = std::env::var_os("OPENCODE_DB_PATH")
-        .or_else(|| std::env::var_os("OPENCODE_DB"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
     if !db_path.exists() {
@@ -1997,38 +1654,22 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
 
     let stale_threshold = now_ms.saturating_sub(AGENT_WATCHER_RECENT_MS);
     let query = format!(
-        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),''), ifnull((SELECT sm.data FROM session_message sm WHERE sm.session_id = r.id AND sm.type = 'user' ORDER BY sm.seq DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
+        "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
     );
-    let run_query = |query: String| {
-        let mut command = process::Command::new("sqlite3");
-        command
-            .arg("-readonly")
-            .arg("-separator")
-            .arg(OPENCODE_SQL_SEP.to_string())
-            .arg(&db_path)
-            .arg(query);
+    let mut command = process::Command::new("sqlite3");
+    command
+        .arg("-readonly")
+        .arg("-separator")
+        .arg(OPENCODE_SQL_SEP.to_string())
+        .arg(&db_path)
+        .arg(query);
+    let Some(output) =
         run_process_with_timeout(command, Duration::from_millis(OPENCODE_SQL_TIMEOUT_MS))
-    };
-    let output = run_query(query).or_else(|| {
-        let legacy_query = format!(
-            "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
-        );
-        run_query(legacy_query)
-    });
-    let Some(mut output) = output else {
+    else {
         return;
     };
     if !output.status.success() {
-        let legacy_query = format!(
-            "WITH recent AS MATERIALIZED (SELECT id, title, directory, time_updated FROM session WHERE time_updated > {stale_threshold} ORDER BY time_updated DESC LIMIT 50) SELECT r.id, ifnull(r.title,''), r.directory, r.time_updated, ifnull((SELECT m.data FROM message m WHERE m.session_id = r.id ORDER BY m.time_created DESC LIMIT 1),'') FROM recent r ORDER BY r.time_updated DESC;"
-        );
-        let Some(legacy_output) = run_query(legacy_query) else {
-            return;
-        };
-        if !legacy_output.status.success() {
-            return;
-        }
-        output = legacy_output;
+        return;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2044,62 +1685,8 @@ fn scan_opencode_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWat
             parts[2],
             time_updated,
             parts[4],
-            parts.get(5).copied().filter(|value| !value.is_empty()),
             now_ms,
         ) {
-            snapshots.push(snapshot);
-        }
-    }
-}
-
-fn scan_pi_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
-    let sessions_dir = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("PI_CODING_AGENT_DIR")
-                .map(PathBuf::from)
-                .map(|dir| dir.join("sessions"))
-        })
-        .unwrap_or_else(|| home.join(".pi/agent/sessions"));
-
-    for path in collect_jsonl_files(&sessions_dir) {
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
-            continue;
-        };
-        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-            continue;
-        }
-        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(snapshot) = pi_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms) {
-            snapshots.push(snapshot);
-        }
-    }
-}
-
-fn scan_droid_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
-    let projects_dir = std::env::var_os("FACTORY_PROJECTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".factory/projects"));
-
-    for path in collect_jsonl_files(&projects_dir) {
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
-            continue;
-        };
-        if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-            continue;
-        }
-        let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(snapshot) = droid_snapshot_from_jsonl(thread_id, &raw, mtime_ms, now_ms) {
             snapshots.push(snapshot);
         }
     }
@@ -2171,18 +1758,18 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn format_focus_json(focused_session: Option<&str>, current_session: Option<&str>) -> String {
+    format!(
+        r#"{{"type":"focus","focusedSession":{},"currentSession":{}}}"#,
+        json_string_or_null(focused_session),
+        json_string_or_null(current_session),
+    )
+}
+
 fn json_string_or_null(value: Option<&str>) -> String {
     value
         .map(|value| serde_json::to_string(value).expect("string must serialize"))
         .unwrap_or_else(|| "null".to_string())
-}
-
-fn activate_session_json(name: String, source_pane_id: Option<&str>) -> String {
-    serde_json::to_string(&SidebarServerMessage::ActivateSession {
-        name,
-        source_pane_id: source_pane_id.map(str::to_string),
-    })
-    .expect("activate-session must serialize")
 }
 
 fn parse_metadata_tone(value: &str) -> Option<MetadataTone> {
@@ -2210,14 +1797,6 @@ fn parse_agent_status(value: &str) -> Option<AgentStatus> {
     }
 }
 
-fn parse_agent_panel_scope(value: &str) -> Option<AgentPanelScope> {
-    match value {
-        "current" => Some(AgentPanelScope::Current),
-        "all" => Some(AgentPanelScope::All),
-        _ => None,
-    }
-}
-
 fn parse_process_row(line: &str) -> Option<(u32, u32)> {
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse::<u32>().ok()?;
@@ -2229,38 +1808,16 @@ struct HttpContext {
     client_tty: Option<String>,
     session: String,
     window_id: String,
-    pane_id: Option<String>,
-    pane_active: Option<bool>,
 }
 
 fn parse_context(body: &str) -> Option<HttpContext> {
     let trimmed = trim_context_quotes(body);
     let pipe_parts = trimmed.split('|').collect::<Vec<_>>();
-    if pipe_parts.len() == 5 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
-        return Some(HttpContext {
-            client_tty: (!pipe_parts[0].is_empty()).then(|| pipe_parts[0].to_string()),
-            session: pipe_parts[1].to_string(),
-            window_id: pipe_parts[2].to_string(),
-            pane_id: Some(pipe_parts[3].to_string()),
-            pane_active: Some(pipe_parts[4] == "1"),
-        });
-    }
-    if pipe_parts.len() == 4 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
-        return Some(HttpContext {
-            client_tty: (!pipe_parts[0].is_empty()).then(|| pipe_parts[0].to_string()),
-            session: pipe_parts[1].to_string(),
-            window_id: pipe_parts[2].to_string(),
-            pane_id: Some(pipe_parts[3].to_string()),
-            pane_active: None,
-        });
-    }
     if pipe_parts.len() == 3 && !pipe_parts[1].is_empty() && !pipe_parts[2].is_empty() {
         return Some(HttpContext {
             client_tty: (!pipe_parts[0].is_empty()).then(|| pipe_parts[0].to_string()),
             session: pipe_parts[1].to_string(),
             window_id: pipe_parts[2].to_string(),
-            pane_id: None,
-            pane_active: None,
         });
     }
 
@@ -2274,13 +1831,16 @@ fn parse_context(body: &str) -> Option<HttpContext> {
         client_tty: None,
         session: session.to_string(),
         window_id: window_id.to_string(),
-        pane_id: None,
-        pane_active: None,
     })
 }
 
 fn parse_context_session(body: &str) -> Option<String> {
     parse_context(body).map(|context| context.session)
+}
+
+fn parse_legacy_focus_session(body: &str) -> Option<String> {
+    let name = trim_double_quotes(body.trim());
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn trim_context_quotes(value: &str) -> &str {
@@ -2300,6 +1860,7 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub pid_file: PathBuf,
+    shim_socket_path: Option<PathBuf>,
     state_source: Option<Arc<dyn StateSource>>,
 }
 
@@ -2309,8 +1870,14 @@ impl ServerConfig {
             host: host.into(),
             port,
             pid_file: pid_file.into(),
+            shim_socket_path: None,
             state_source: None,
         }
+    }
+
+    pub fn with_shim_socket_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.shim_socket_path = Some(path.into());
+        self
     }
 
     pub fn with_state_source(mut self, source: impl StateSource) -> Self {
@@ -2322,6 +1889,7 @@ impl ServerConfig {
 #[derive(Debug)]
 pub struct ServerHandle {
     addr: SocketAddr,
+    shim_socket_path: Option<PathBuf>,
     shutdown: broadcast::Sender<()>,
     task: JoinHandle<Result<(), ServerError>>,
 }
@@ -2329,6 +1897,10 @@ pub struct ServerHandle {
 impl ServerHandle {
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    pub fn shim_socket_path(&self) -> Option<&std::path::Path> {
+        self.shim_socket_path.as_deref()
     }
 
     pub async fn shutdown(self) -> Result<(), ServerError> {
@@ -2387,21 +1959,26 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
         .ok_or_else(|| ServerError::new("server bind address did not resolve"))?;
     let listener = TcpListener::bind(bind_addr).await?;
     let addr = listener.local_addr()?;
+    let shim_socket_path = config
+        .shim_socket_path
+        .clone()
+        .unwrap_or_else(|| default_shim_socket_path(&config.pid_file));
+    if shim_socket_path.exists() {
+        fs::remove_file(&shim_socket_path)?;
+    }
+    let shim_listener = UnixListener::bind(&shim_socket_path)?;
+
     fs::write(&config.pid_file, process::id().to_string())?;
 
     let (shutdown, shutdown_rx) = broadcast::channel(1);
     let (state_updates, _) = broadcast::channel(16);
-    let shutdown_announcement = Arc::new(ShutdownAnnouncement::default());
     if let Some(source) = config.state_source.clone() {
-        let _background_tasks = source
-            .clone()
-            .start_background_tasks(state_updates.clone(), shutdown.clone());
-        source.setup_mux_hooks(&config.host, addr.port());
+        let _background_tasks =
+            source.start_background_tasks(state_updates.clone(), shutdown.clone());
     }
     let task_shutdown = shutdown.clone();
     let state_source = config.state_source.clone();
-    let cleanup_state_source = state_source.clone();
-    let loop_shutdown_announcement = Arc::clone(&shutdown_announcement);
+    let cleanup_shim_socket_path = shim_socket_path.clone();
     let task = tokio::spawn(async move {
         let result = run_accept_loop(
             listener,
@@ -2409,25 +1986,38 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
             shutdown_rx,
             state_source,
             state_updates,
-            loop_shutdown_announcement,
+            shim_listener,
         )
         .await;
-        if let Some(source) = cleanup_state_source.as_ref() {
-            source.cleanup_mux_hooks();
-        }
         let cleanup_result = fs::remove_file(&config.pid_file);
-        match (result, cleanup_result) {
-            (Err(err), _) => Err(err),
-            (Ok(()), Err(err)) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+        let socket_cleanup_result = fs::remove_file(&cleanup_shim_socket_path);
+        match (result, cleanup_result, socket_cleanup_result) {
+            (Err(err), _, _) => Err(err),
+            (Ok(()), Err(err), _) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+            (Ok(()), _, Err(err)) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
             _ => Ok(()),
         }
     });
 
     Ok(ServerHandle {
         addr,
+        shim_socket_path: Some(shim_socket_path),
         shutdown,
         task,
     })
+}
+
+fn default_shim_socket_path(pid_file: &std::path::Path) -> PathBuf {
+    let candidate = pid_file.with_extension("sock");
+    if candidate.as_os_str().len() < 90 {
+        return candidate;
+    }
+
+    let mut hash = 0_u32;
+    for (idx, byte) in pid_file.to_string_lossy().bytes().enumerate() {
+        hash = (hash + u32::from(byte) * (idx as u32 + 1)) % 100_000;
+    }
+    std::env::temp_dir().join(format!("opensessions-{hash}.sock"))
 }
 
 async fn run_accept_loop(
@@ -2436,58 +2026,318 @@ async fn run_accept_loop(
     mut shutdown_rx: broadcast::Receiver<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
-    shutdown_announcement: Arc<ShutdownAnnouncement>,
+    shim_listener: UnixListener,
 ) -> Result<(), ServerError> {
     loop {
         tokio::select! {
-            _ = shutdown_rx.recv() => {
-                shutdown_announcement.announce_once(&state_source, &state_updates);
-                tokio::time::sleep(Duration::from_millis(SERVER_SHUTDOWN_DRAIN_MS)).await;
-                return Ok(());
-            }
+            _ = shutdown_rx.recv() => return Ok(()),
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let connection_shutdown = shutdown.clone();
                 let connection_state_source = state_source.clone();
                 let connection_state_updates = state_updates.clone();
-                let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 tokio::spawn(async move {
                     let _ = handle_connection(
                         stream,
                         connection_shutdown,
                         connection_state_source,
                         connection_state_updates,
-                        connection_shutdown_announcement,
                     )
                     .await;
                 });
             }
-
+            accepted = shim_listener.accept() => {
+                let (stream, _) = accepted?;
+                let connection_shutdown = shutdown.clone();
+                let connection_state_source = state_source.clone();
+                let connection_state_updates = state_updates.clone();
+                tokio::spawn(async move {
+                    let _ = handle_shim_connection(
+                        stream,
+                        connection_shutdown,
+                        connection_state_source,
+                        connection_state_updates,
+                    )
+                    .await;
+                });
+            }
         }
     }
 }
 
-fn announce_shutdown(
-    state_source: &Option<Arc<dyn StateSource>>,
-    state_updates: &broadcast::Sender<String>,
-) {
-    if let Some(payload) = state_source
-        .as_ref()
-        .and_then(|source| source.begin_shutdown())
-    {
-        let _ = state_updates.send(payload);
+async fn handle_shim_connection(
+    stream: UnixStream,
+    shutdown: broadcast::Sender<()>,
+    state_source: Option<Arc<dyn StateSource>>,
+    state_updates: broadcast::Sender<String>,
+) -> Result<(), ServerError> {
+    let (mut reader, mut writer) = stream.into_split();
+    let first = read_protocol_frame(&mut reader).await?;
+    let ShimToServer::Hello(hello) = decode_shim_message(&first)
+        .map_err(|err| ServerError::new(format!("invalid shim hello: {err}")))?
+    else {
+        return Err(ServerError::new("shim must send hello first"));
+    };
+
+    writer
+        .write_all(&encode_server_message(&ServerToShim::Hello {
+            protocol: PROTOCOL_VERSION,
+        }))
+        .await?;
+    let (frames_tx, frames_rx) = watch::channel(Arc::new(Vec::<u8>::new()));
+    let _writer_task = tokio::spawn(write_shim_frames(writer, frames_rx));
+
+    let mut context = ClientConnectionContext {
+        client_tty: hello.client_tty.clone(),
+        pane_id: Some(hello.pane_id.clone()),
+        session_name: Some(hello.session_name.clone()),
+        window_id: hello.window_id.clone(),
+    };
+    let identify = serde_json::json!({
+        "type": "identify-pane",
+        "paneId": hello.pane_id,
+        "sessionName": hello.session_name,
+        "windowId": hello.window_id,
+    });
+
+    let mut app = state_source.as_ref().and_then(|state_source| {
+        let _ = state_source.handle_sender_command_with_context(&identify, &mut context);
+        app_from_state_json(&state_source.snapshot_json())
+    });
+    if let Some(state_source) = &state_source {
+        let _ = state_updates.send(state_source.snapshot_json());
     }
-    let _ = state_updates.send(QUIT_JSON.to_string());
+    if let Some(app) = &mut app {
+        app.my_session = context.session_name.clone();
+    }
+
+    let mut width = hello.width;
+    let mut height = hello.height;
+    let mut previous_rows = None::<RenderedRows>;
+    let mut seq = 0_u32;
+    if let Some(app) = &mut app {
+        seq = seq.wrapping_add(1);
+        let rows = render_rows(app, width, height);
+        frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::FullFrame {
+            seq,
+            width,
+            height,
+            rows: rows.rows.clone(),
+        })));
+        previous_rows = Some(rows);
+    }
+
+    let mut connection_shutdown = shutdown.subscribe();
+    let mut state_rx = state_updates.subscribe();
+    let mut render_tick = tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
+    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut dirty = false;
+
+    loop {
+        tokio::select! {
+            _ = connection_shutdown.recv() => {
+                frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
+                return Ok(());
+            }
+            _ = render_tick.tick(), if dirty => {
+                if let Some(app) = &mut app {
+                    seq = seq.wrapping_add(1);
+                    let rows = render_rows(app, width, height);
+                    let message = match previous_rows.as_ref() {
+                        Some(previous) => match diff_rows(previous, &rows) {
+                            FrameDiff::Full(rows) => ServerToShim::FullFrame {
+                                seq,
+                                width: rows.width,
+                                height: rows.height,
+                                rows: rows.rows.clone(),
+                            },
+                            FrameDiff::Patch { width, height, changed_rows, clear_from_row } => {
+                                ServerToShim::PatchFrame { seq, width, height, changed_rows, clear_from_row }
+                            }
+                        },
+                        None => ServerToShim::FullFrame {
+                            seq,
+                            width: rows.width,
+                            height: rows.height,
+                            rows: rows.rows.clone(),
+                        },
+                    };
+                    previous_rows = Some(rows);
+                    frames_tx.send_replace(Arc::new(encode_server_message(&message)));
+                }
+                dirty = false;
+            }
+            state = state_rx.recv() => {
+                match state {
+                    Ok(state) => {
+                        if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&state) {
+                            if matches!(message, SidebarServerMessage::Quit) {
+                                frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
+                                return Ok(());
+                            }
+                            apply_sidebar_server_message(&mut app, message);
+                            dirty = true;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+            frame = read_protocol_frame(&mut reader) => {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(err) if err.message == "client closed" => return Ok(()),
+                    Err(err) => return Err(err),
+                };
+                match decode_shim_message(&frame)
+                    .map_err(|err| ServerError::new(format!("invalid shim frame: {err}")))? {
+                    ShimToServer::Hello(_) => {}
+                    ShimToServer::Close => return Ok(()),
+                    ShimToServer::Resize { width: next_width, height: next_height } => {
+                        if next_width != width && state_source.as_ref().is_some_and(|state_source| {
+                            state_source.should_report_sidebar_resize(&context)
+                        }) {
+                            let command = serde_json::json!({
+                                "type": "report-width",
+                                "width": next_width,
+                            });
+                            if let Some(payload) = state_source
+                                .as_ref()
+                                .and_then(|state_source| {
+                                    state_source.handle_client_command_with_context(
+                                        &command,
+                                        Some(&context),
+                                    )
+                                })
+                            {
+                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
+                                    apply_sidebar_server_message(&mut app, message);
+                                }
+                                let _ = state_updates.send(payload);
+                            }
+                        }
+                        width = next_width;
+                        height = next_height;
+                        previous_rows = None;
+                        dirty = true;
+                    }
+                    ShimToServer::Mouse(_) => {
+                        // Mouse hit-testing is intentionally server-owned; the protocol carries
+                        // coordinates now so clickable rows and drag resizing can be layered on
+                        // the render model without adding Ratatui to the shim.
+                    }
+                    ShimToServer::Key(key) => {
+                        if let Some(app) = &mut app {
+                            if let Some(ui_key) = ui_key_from_shim(key.code, key.modifiers) {
+                                apply_ui_key(app, ui_key);
+                                if drain_sidebar_commands(
+                                    app,
+                                    &state_source,
+                                    &state_updates,
+                                    &mut context,
+                                    &shutdown,
+                                )? {
+                                    frames_tx.send_replace(Arc::new(encode_server_message(&ServerToShim::Quit)));
+                                    return Ok(());
+                                }
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn request_shutdown(
+async fn write_shim_frames(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut frames_rx: watch::Receiver<Arc<Vec<u8>>>,
+) -> Result<(), ServerError> {
+    loop {
+        if frames_rx.changed().await.is_err() {
+            return Ok(());
+        }
+        let frame = frames_rx.borrow_and_update().clone();
+        if frame.is_empty() {
+            continue;
+        }
+        writer.write_all(&frame).await?;
+    }
+}
+
+async fn read_protocol_frame<R>(reader: &mut R) -> Result<Vec<u8>, ServerError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut len = [0_u8; 4];
+    if let Err(err) = reader.read_exact(&mut len).await {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(ServerError::new("client closed"));
+        }
+        return Err(err.into());
+    }
+    let len = u32::from_le_bytes(len) as usize;
+    let mut frame = Vec::with_capacity(4 + len);
+    frame.extend_from_slice(&(len as u32).to_le_bytes());
+    frame.resize(4 + len, 0);
+    reader.read_exact(&mut frame[4..]).await?;
+    Ok(frame)
+}
+
+fn ui_key_from_shim(code: ShimKeyCode, modifiers: ShimKeyModifiers) -> Option<UiKey> {
+    if modifiers.contains(ShimKeyModifiers::ALT) {
+        return match code {
+            ShimKeyCode::Up => Some(UiKey::AltUp),
+            ShimKeyCode::Down => Some(UiKey::AltDown),
+            _ => None,
+        };
+    }
+    if modifiers.contains(ShimKeyModifiers::CONTROL) {
+        return match code {
+            ShimKeyCode::Char('j') => Some(UiKey::CtrlJ),
+            ShimKeyCode::Char('k') => Some(UiKey::CtrlK),
+            _ => None,
+        };
+    }
+
+    match code {
+        ShimKeyCode::Char('j') | ShimKeyCode::Down => Some(UiKey::Down),
+        ShimKeyCode::Char('k') | ShimKeyCode::Up => Some(UiKey::Up),
+        ShimKeyCode::Char(ch) => Some(UiKey::Char(ch)),
+        ShimKeyCode::Tab => Some(UiKey::Tab {
+            shift: modifiers.contains(ShimKeyModifiers::SHIFT),
+        }),
+        ShimKeyCode::Enter => Some(UiKey::Enter),
+        ShimKeyCode::Esc => Some(UiKey::Esc),
+    }
+}
+
+fn drain_sidebar_commands(
+    app: &mut SidebarApp,
     state_source: &Option<Arc<dyn StateSource>>,
     state_updates: &broadcast::Sender<String>,
+    context: &mut ClientConnectionContext,
     shutdown: &broadcast::Sender<()>,
-    shutdown_announcement: &ShutdownAnnouncement,
-) {
-    shutdown_announcement.announce_once(state_source, state_updates);
-    let _ = shutdown.send(());
+) -> Result<bool, ServerError> {
+    for command in app.drain_commands() {
+        if matches!(command, SidebarClientCommand::Quit) {
+            let _ = state_updates.send(QUIT_JSON.to_string());
+            let _ = shutdown.send(());
+            return Ok(true);
+        }
+        let command = serde_json::to_value(command)
+            .map_err(|err| ServerError::new(format!("serialize sidebar command: {err}")))?;
+        if let Some(payload) = state_source.as_ref().and_then(|state_source| {
+            state_source.handle_client_command_with_context(&command, Some(context))
+        }) {
+            if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
+                app.apply_server_message(message);
+            }
+            let _ = state_updates.send(payload);
+        }
+    }
+    Ok(false)
 }
 
 async fn handle_connection(
@@ -2495,7 +2345,6 @@ async fn handle_connection(
     shutdown: broadcast::Sender<()>,
     state_source: Option<Arc<dyn StateSource>>,
     state_updates: broadcast::Sender<String>,
-    shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
     let mut request = read_http_header(&mut stream).await?;
     let parsed = parse_http_request(&request)?;
@@ -2540,7 +2389,7 @@ async fn handle_connection(
         };
         let body = String::from_utf8_lossy(http_body(&request));
         if let Some(state_source) = &state_source {
-            let _ = state_source.handle_switch_index(index, &body);
+            state_source.handle_switch_index(index, &body);
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -2552,9 +2401,8 @@ async fn handle_connection(
     if parsed.method == "POST" && is_ok_hook_path(&parsed.path) {
         let body = String::from_utf8_lossy(http_body(&request));
         if let Some(state_source) = &state_source {
-            if let Some(payload) = state_source.handle_http_hook(&parsed.path, &body) {
-                let _ = state_updates.send(payload);
-            }
+            state_source.handle_http_hook(&parsed.path, &body);
+            let _ = state_updates.send(state_source.snapshot_json());
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -2607,21 +2455,21 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source
-            && let Err(err) = state_source.handle_pi_runtime_upsert(&body)
-        {
-            let body = err.body();
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
+        if let Some(state_source) = &state_source {
+            if let Err(err) = state_source.handle_pi_runtime_upsert(&body) {
+                let body = err.body();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await?;
-            let _ = stream.shutdown().await;
-            return Ok(());
+                    .await?;
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
         }
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -2638,21 +2486,21 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source
-            && let Err(err) = state_source.handle_pi_runtime_delete(&body)
-        {
-            let body = err.body();
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
+        if let Some(state_source) = &state_source {
+            if let Err(err) = state_source.handle_pi_runtime_delete(&body) {
+                let body = err.body();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                )
-                .await?;
-            let _ = stream.shutdown().await;
-            return Ok(());
+                    .await?;
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
         }
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -2692,13 +2540,19 @@ async fn handle_connection(
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             .await?;
         let _ = stream.shutdown().await;
-        request_shutdown(
-            &state_source,
-            &state_updates,
-            &shutdown,
-            &shutdown_announcement,
-        );
+        let _ = shutdown.send(());
         return Ok(());
+    }
+
+    if parsed.is_websocket_upgrade() && parsed.path == "/rendered-sidebar" {
+        return handle_rendered_sidebar_connection(
+            stream,
+            parsed,
+            shutdown,
+            state_source,
+            state_updates,
+        )
+        .await;
     }
 
     if parsed.is_websocket_upgrade() {
@@ -2730,35 +2584,40 @@ async fn handle_connection(
         let mut connection_shutdown = shutdown.subscribe();
         let mut state_rx = state_updates.subscribe();
         let mut client_context = ClientConnectionContext::default();
-        let mut pending_state: Option<String> = None;
-        let mut state_flush =
-            tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
-        state_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                biased;
-
                 _ = connection_shutdown.recv() => {
                     let _ = websocket.send(Message::text(QUIT_JSON)).await;
                     return Ok(());
+                }
+                state = state_rx.recv() => {
+                    match state {
+                        Ok(state) => {
+                            debug_log(format!(
+                                "ws: forwarding broadcast state ({} bytes) to client",
+                                state.len()
+                            ));
+                            websocket.send(Message::text(state)).await?
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            debug_log(format!("ws: state_rx lagged by {n} messages"));
+                        }
+                    }
                 }
                 message = websocket.next() => {
                     match message {
                         Some(Ok(message)) if message.is_close() => return Ok(()),
                         Some(Ok(message)) => {
                             if is_quit_command(&message) {
-                                request_shutdown(
-                                    &state_source,
-                                    &state_updates,
-                                    &shutdown,
-                                    &shutdown_announcement,
-                                );
+                                let _ = state_updates.send(QUIT_JSON.to_string());
+                                let _ = shutdown.send(());
                                 return Ok(());
                             }
-                            if is_command_type(&message, "refresh")
-                                && let Some(state_source) = &state_source
-                            {
-                                let _ = state_updates.send(state_source.snapshot_json());
+                            if is_command_type(&message, "refresh") {
+                                if let Some(state_source) = &state_source {
+                                    let _ = state_updates.send(state_source.snapshot_json());
+                                }
                             }
                             if let Some(command) = parse_command(&message) {
                                 if let Some(reply) = state_source
@@ -2767,54 +2626,16 @@ async fn handle_connection(
                                 {
                                     websocket.send(Message::text(reply)).await?;
                                 }
-                                if let Some(name) = switch_session_target(&command) {
-                                    let _ = state_updates.send(activate_session_json(
-                                        name,
-                                        client_context.pane_id.as_deref(),
-                                    ));
-                                    tokio::task::yield_now().await;
-                                }
                                 if let Some(payload) = state_source
                                     .as_ref()
                                     .and_then(|state_source| state_source.handle_client_command_with_context(&command, Some(&client_context)))
                                 {
-                                    if is_client_view_command(&command) {
-                                        websocket.send(Message::text(payload)).await?;
-                                    } else {
-                                        let _ = state_updates.send(payload);
-                                    }
+                                    let _ = state_updates.send(payload);
                                 }
                             }
                         }
                         Some(Err(err)) => return Err(err.into()),
                         None => return Ok(()),
-                    }
-                }
-                _ = state_flush.tick(), if pending_state.is_some() => {
-                    let state = pending_state.take().expect("pending state checked above");
-                    debug_log(format!(
-                        "ws: flushing latest broadcast state ({} bytes) to client",
-                        state.len()
-                    ));
-                    websocket.send(Message::text(state)).await?;
-                }
-                state = state_rx.recv() => {
-                    match state {
-                        Ok(state) => {
-                            if state == QUIT_JSON {
-                                let _ = websocket.send(Message::text(QUIT_JSON)).await;
-                                return Ok(());
-                            }
-                            if is_immediate_server_message(&state) {
-                                websocket.send(Message::text(state)).await?;
-                                continue;
-                            }
-                            pending_state = Some(state);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            debug_log(format!("ws: state_rx lagged by {n} messages"));
-                        }
                     }
                 }
             }
@@ -2827,6 +2648,153 @@ async fn handle_connection(
     Ok(())
 }
 
+async fn handle_rendered_sidebar_connection(
+    mut stream: TcpStream,
+    parsed: HttpRequest,
+    shutdown: broadcast::Sender<()>,
+    state_source: Option<Arc<dyn StateSource>>,
+    state_updates: broadcast::Sender<String>,
+) -> Result<(), ServerError> {
+    let Some(key) = parsed.header("sec-websocket-key") else {
+        stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            .await?;
+        return Ok(());
+    };
+    let accept = websocket_accept(key);
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    let mut websocket = ServerBuilder::new().serve(stream);
+    let mut width = parsed
+        .query_param("width")
+        .and_then(|width| width.parse::<u16>().ok())
+        .unwrap_or(35);
+    let mut height = parsed
+        .query_param("height")
+        .and_then(|height| height.parse::<u16>().ok())
+        .unwrap_or(56);
+
+    let mut app = state_source
+        .as_ref()
+        .and_then(|state_source| app_from_state_json(&state_source.snapshot_json()));
+    if let Some(app) = &mut app {
+        websocket
+            .send(Message::text(render_sidebar_frame(app, width, height)))
+            .await?;
+    }
+
+    let mut connection_shutdown = shutdown.subscribe();
+    let mut state_rx = state_updates.subscribe();
+    let mut render_tick = tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
+    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut dirty = false;
+    loop {
+        tokio::select! {
+            _ = connection_shutdown.recv() => {
+                let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                return Ok(());
+            }
+            _ = render_tick.tick(), if dirty => {
+                if let Some(app) = &mut app {
+                    websocket.send(Message::text(render_sidebar_frame(app, width, height))).await?;
+                }
+                dirty = false;
+            }
+            state = state_rx.recv() => {
+                match state {
+                    Ok(state) => {
+                        if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&state) {
+                            if matches!(message, SidebarServerMessage::Quit) {
+                                let _ = websocket.send(Message::text(QUIT_JSON)).await;
+                                return Ok(());
+                            }
+                            apply_sidebar_server_message(&mut app, message);
+                            dirty = true;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+            message = websocket.next() => {
+                match message {
+                    Some(Ok(message)) if message.is_close() => return Ok(()),
+                    Some(Ok(message)) => {
+                        if is_quit_command(&message) {
+                            let _ = state_updates.send(QUIT_JSON.to_string());
+                            let _ = shutdown.send(());
+                            return Ok(());
+                        }
+
+                        if let Some(command) = parse_command(&message) {
+                            if command.get("type").and_then(Value::as_str) == Some("render-resize") {
+                                width = command
+                                    .get("width")
+                                    .and_then(Value::as_u64)
+                                    .map(|width| width.min(u16::MAX as u64) as u16)
+                                    .unwrap_or(width);
+                                height = command
+                                    .get("height")
+                                    .and_then(Value::as_u64)
+                                    .map(|height| height.min(u16::MAX as u64) as u16)
+                                    .unwrap_or(height);
+                                dirty = true;
+                                continue;
+                            }
+
+                            if command.get("type").and_then(Value::as_str) == Some("render-key") {
+                                if let Some(app) = &mut app {
+                                    apply_render_key(app, &command);
+                                    for command in app.drain_commands() {
+                                        if matches!(command, SidebarClientCommand::Quit) {
+                                            let _ = state_updates.send(QUIT_JSON.to_string());
+                                            let _ = shutdown.send(());
+                                            return Ok(());
+                                        }
+                                        if let Ok(command) = serde_json::to_value(command) {
+                                            if let Some(payload) = state_source
+                                                .as_ref()
+                                                .and_then(|state_source| state_source.handle_client_command(&command))
+                                            {
+                                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
+                                                    app.apply_server_message(message);
+                                                }
+                                                let _ = state_updates.send(payload);
+                                            }
+                                        }
+                                    }
+                                    dirty = true;
+                                }
+                                continue;
+                            }
+
+                            if let Some(payload) = state_source
+                                .as_ref()
+                                .and_then(|state_source| state_source.handle_client_command(&command))
+                            {
+                                if let Ok(message) = serde_json::from_str::<SidebarServerMessage>(&payload) {
+                                    apply_sidebar_server_message(&mut app, message);
+                                }
+                                let _ = state_updates.send(payload);
+                            }
+                            dirty = true;
+                        }
+                    }
+                    Some(Err(err)) => return Err(err.into()),
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
 fn app_from_state_json(state_json: &str) -> Option<SidebarApp> {
     let SidebarServerMessage::State(state) =
         serde_json::from_str::<SidebarServerMessage>(state_json).ok()?
@@ -2834,6 +2802,67 @@ fn app_from_state_json(state_json: &str) -> Option<SidebarApp> {
         return None;
     };
     Some(SidebarApp::from_state(state))
+}
+
+fn apply_sidebar_server_message(app: &mut Option<SidebarApp>, message: SidebarServerMessage) {
+    match (app, message) {
+        (slot @ None, SidebarServerMessage::State(state)) => {
+            *slot = Some(SidebarApp::from_state(state))
+        }
+        (Some(app), message) => app.apply_server_message(message),
+        (None, _) => {}
+    }
+}
+
+fn render_sidebar_frame(app: &mut SidebarApp, width: u16, height: u16) -> String {
+    let rows = render_rows(app, width, height);
+    let mut frame = String::new();
+    for row in rows.rows {
+        frame.push_str(&String::from_utf8_lossy(&row));
+        frame.push('\n');
+    }
+    frame
+}
+
+fn apply_render_key(app: &mut SidebarApp, command: &Value) {
+    let key = command
+        .get("key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let alt = command.get("alt").and_then(Value::as_bool).unwrap_or(false);
+    let ctrl = command
+        .get("ctrl")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let shift = command
+        .get("shift")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let code = match key {
+        "up" => ShimKeyCode::Up,
+        "down" => ShimKeyCode::Down,
+        "tab" => ShimKeyCode::Tab,
+        "enter" => ShimKeyCode::Enter,
+        "esc" => ShimKeyCode::Esc,
+        key if key.chars().count() == 1 => {
+            ShimKeyCode::Char(key.chars().next().expect("single char key must exist"))
+        }
+        _ => return,
+    };
+    let mut modifiers = ShimKeyModifiers::empty();
+    if alt {
+        modifiers = modifiers | ShimKeyModifiers::ALT;
+    }
+    if ctrl {
+        modifiers = modifiers | ShimKeyModifiers::CONTROL;
+    }
+    if shift {
+        modifiers = modifiers | ShimKeyModifiers::SHIFT;
+    }
+    if let Some(key) = ui_key_from_shim(code, modifiers) {
+        apply_ui_key(app, key);
+    }
 }
 
 async fn read_http_header(stream: &mut TcpStream) -> Result<Vec<u8>, ServerError> {
@@ -2946,7 +2975,11 @@ fn is_metadata_path(path: &str) -> bool {
 fn is_ok_hook_path(path: &str) -> bool {
     matches!(
         path,
-        "/pane-exited" | "/pane-layout-changed" | "/client-resized" | "/ensure-sidebar" | "/toggle"
+        "/suppress-width-reports"
+            | "/client-resized"
+            | "/pane-exited"
+            | "/ensure-sidebar"
+            | "/toggle"
     )
 }
 
@@ -2994,26 +3027,6 @@ fn is_command_type(message: &Message, command_type: &str) -> bool {
         })
         .as_deref()
         == Some(command_type)
-}
-
-fn is_client_view_command(command: &Value) -> bool {
-    matches!(
-        command.get("type").and_then(Value::as_str),
-        Some("switch-session" | "switch-index")
-    )
-}
-
-fn switch_session_target(command: &Value) -> Option<String> {
-    (command.get("type").and_then(Value::as_str) == Some("switch-session"))
-        .then(|| command.get("name")?.as_str().map(str::to_string))?
-}
-
-fn is_immediate_server_message(payload: &str) -> bool {
-    payload.contains(r#""type":"activate-session""#)
-}
-
-fn clamp_detail_panel_height(height: u16) -> u16 {
-    height.clamp(MIN_DETAIL_PANEL_HEIGHT, MAX_DETAIL_PANEL_HEIGHT)
 }
 
 fn parse_command(message: &Message) -> Option<Value> {

@@ -18,15 +18,14 @@ pub struct ProtocolHello {
 pub enum ServerMessage {
     Hello(ProtocolHello),
     State(ServerState),
+    Focus(FocusUpdate),
+    Resize {
+        width: u32,
+    },
     Quit,
     YourSession {
         name: String,
         client_tty: Option<String>,
-    },
-    ActivateSession {
-        name: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        source_pane_id: Option<String>,
     },
     ReIdentify,
 }
@@ -41,18 +40,19 @@ pub struct ServerState {
     pub theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
-    #[serde(default)]
-    pub agent_panel_scope: AgentPanelScope,
     pub sidebar_width: u32,
-    pub detail_panel_height: u32,
     pub initializing: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_label: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub collapsed_worktree_groups: Vec<String>,
     pub ts: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusUpdate {
+    pub focused_session: Option<String>,
+    pub current_session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -63,12 +63,6 @@ pub struct SessionData {
     pub dir: String,
     pub branch: String,
     pub dirty: bool,
-    #[serde(default)]
-    pub changed_files: u32,
-    #[serde(default)]
-    pub insertions: u32,
-    #[serde(default)]
-    pub deletions: u32,
     pub is_worktree: bool,
     pub unseen: bool,
     pub panes: u32,
@@ -127,14 +121,6 @@ impl fmt::Display for AgentStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentPanelScope {
-    #[default]
-    Current,
-    All,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentLiveness {
@@ -156,9 +142,6 @@ pub struct AgentEvent {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_name: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_user_prompt: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unseen: Option<bool>,
@@ -249,6 +232,9 @@ pub enum ClientCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         client_tty: Option<String>,
     },
+    SwitchIndex {
+        index: u32,
+    },
     NewSession,
     HideSession {
         name: String,
@@ -261,11 +247,13 @@ pub enum ClientCommand {
         name: String,
         delta: i8,
     },
-    ReorderWorktreeGroup {
-        key: String,
+    Refresh,
+    MoveFocus {
         delta: i8,
     },
-    Refresh,
+    FocusSession {
+        name: String,
+    },
     MarkSeen {
         name: String,
     },
@@ -278,21 +266,11 @@ pub enum ClientCommand {
     SetTheme {
         theme: String,
     },
-    SetSidebarWidth {
-        width: u32,
-    },
-    SetDetailPanelHeight {
-        height: u32,
-    },
-    SetAgentPanelScope {
-        scope: AgentPanelScope,
-    },
-    RepairWidth,
     SetFilter {
         filter: SessionFilterMode,
     },
-    ToggleWorktreeGroup {
-        key: String,
+    Identify {
+        client_tty: String,
     },
     Quit,
     IdentifyPane {
@@ -308,8 +286,6 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pane_id: Option<String>,
     },
     KillAgentPane {
         session: String,
@@ -318,7 +294,8 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pane_id: Option<String>,
+    },
+    ReportWidth {
+        width: u32,
     },
 }

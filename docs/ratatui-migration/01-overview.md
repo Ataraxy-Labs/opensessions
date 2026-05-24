@@ -78,7 +78,7 @@ state) matches `reference-snapshots/pane-attached-session-list.ansi` byte-for-by
 ### Phase 3 — Keyboard + filter + focus
 
 - Implement the keyboard FSM (`07-input-keyboard.md`).
-- Wire local focus movement, `cycle-filter`, `switch-session`, `quit`.
+- Wire `move-focus`, `cycle-filter`, `switch-session`, `quit`.
 - Optimistic updates per the TS implementation.
 
 **Acceptance:** all keybinds verified by recorded interaction tests.

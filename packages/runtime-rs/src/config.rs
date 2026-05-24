@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,8 +32,8 @@ pub struct OpensessionsConfig {
     pub sidebar_position: Option<SidebarPosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keybinding: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail_panel_height: Option<u16>,
+    #[serde(default)]
+    pub detail_panel_heights: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
 }
@@ -97,7 +98,12 @@ fn update_map(updates: OpensessionsConfig) -> Map<String, Value> {
     insert_option(&mut map, "sidebarWidth", updates.sidebar_width);
     insert_option(&mut map, "sidebarPosition", updates.sidebar_position);
     insert_option(&mut map, "keybinding", updates.keybinding);
-    insert_option(&mut map, "detailPanelHeight", updates.detail_panel_height);
+    if !updates.detail_panel_heights.is_empty() {
+        map.insert(
+            "detailPanelHeights".to_string(),
+            serde_json::to_value(updates.detail_panel_heights).expect("detail heights serialize"),
+        );
+    }
     insert_option(&mut map, "sessionFilter", updates.session_filter);
 
     map

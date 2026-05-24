@@ -32,8 +32,8 @@ pub fn encode_client_command(command: &ClientCommand) -> serde_json::Result<Stri
 }
 
 /// Build the raw HTTP/1.1 request the sidebar fires at `http://host:port/quit`
-/// when the user presses 'q'. This keeps quit reliable even if the websocket
-/// is closing:
+/// when the user presses 'q'. Mirrors the TypeScript fallback in
+/// `apps/tui/src/index.tsx`:
 ///   `fetch(`http://${SERVER_HOST}:${SERVER_PORT}/quit`, { method: "POST" })`
 /// This is fire-and-forget — the server replies, then closes the WS, which
 /// tears down the renderer.

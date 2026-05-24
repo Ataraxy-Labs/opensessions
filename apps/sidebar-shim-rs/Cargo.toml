@@ -1,0 +1,14 @@
+[package]
+name = "opensessions-sidebar-shim"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "opensessions-sidebar-shim"
+path = "src/main.rs"
+
+[dependencies]
+opensessions-sidebar-protocol = { path = "../../packages/sidebar-protocol-rs" }
+crossterm = { version = "0.29", default-features = false, features = ["event-stream", "events"] }
+futures-util = { version = "0.3", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "macros", "time"] }

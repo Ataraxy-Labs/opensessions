@@ -102,15 +102,21 @@ if spinner_interval {
 
 Saves CPU when nothing's running.
 
-## 6. Detail panel height is shared, not per-session
+## 6. Detail panel height stash on session switch
 
-When one sidebar resizes the agent/detail panel, send `SetDetailPanelHeight` to
-the server. The next `ServerState` carries the shared height to every sidebar;
-focus changes must not swap in per-session heights.
+When focus moves to a different session, load that session's persisted
+height (TS line 694). Use the `detail_panel_heights` HashMap.
 
 ```rust
-fn apply_server_state(&mut self, state: ServerState) {
-    self.detail_panel_height = state.detail_panel_height.max(MIN_DETAIL_PANEL_HEIGHT);
+// In handle of focus change:
+fn on_focus_change(&mut self) {
+    if let Some(name) = self.detail_panel_session_name() {
+        if let Some(&h) = self.detail_panel_heights.get(name) {
+            self.detail_panel_height = h.max(MIN_DETAIL_PANEL_HEIGHT);
+        } else {
+            self.detail_panel_height = DEFAULT_DETAIL_PANEL_HEIGHT;
+        }
+    }
 }
 ```
 

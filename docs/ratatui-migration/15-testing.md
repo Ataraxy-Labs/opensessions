@@ -118,7 +118,7 @@ async fn handles_state_then_focus_messages() {
     // Simulate Tab key
     app.handle_key(key('\t'));
     let cmd = server.recv_command().await;
-    assert!(matches!(cmd, ClientCommand::SwitchSession { name, .. } if name == "beta"));
+    assert!(matches!(cmd, ClientCommand::FocusSession { name } if name == "beta"));
 }
 ```
 

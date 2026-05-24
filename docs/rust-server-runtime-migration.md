@@ -45,8 +45,8 @@ The TypeScript server/runtime remains the behavioral oracle while the Rust imple
 ## Remaining Work
 
 - Expand the Ratatui renderer beyond the current read-only parity surface into remaining interactive components and widgets.
-- Finish advanced HTTP/sidebar parity around fixed-width repair hooks, warmup completion, and full agent pane focus/kill resolution/highlighting.
-- Port the full sidebar lifecycle and Fixed Sidebar Width model while preserving `docs/explanation/sidebar-behavior.md`.
+- Finish advanced HTTP/sidebar parity around server-wired resize authority, warmup completion/adjusting flows, fan-out timing, and full agent pane focus/kill resolution/highlighting.
+- Port the full sidebar lifecycle and width-authority state machine while preserving `docs/explanation/sidebar-behavior.md`.
 - Fill server state parity for remaining unseen edge cases and filter edge cases.
 - Port live watchers/providers for Amp, Claude Code, Codex, OpenCode, and full Pi pane-presence resolution.
 - Complete zellij/cross-mux behavior, startup/distribution integration, and final TypeScript-to-Rust launch replacement.

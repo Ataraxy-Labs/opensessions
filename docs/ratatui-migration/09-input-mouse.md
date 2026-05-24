@@ -68,6 +68,7 @@ fn on_left_down(&mut self, col: u16, row: u16) {
     match zone {
         ClickZone::SessionRow { name, .. } => {
             self.focused_session = Some(name.clone());
+            self.send(ClientCommand::FocusSession { name });
         }
         ClickZone::OpenDir { dir, only_when_focused, .. } => {
             // Match TS behavior: only open dir when row is focused
@@ -133,10 +134,14 @@ fn on_drag(&mut self, _col: u16, row: u16) {
 
 fn on_left_up(&mut self, _col: u16, _row: u16) {
     if let Some(st) = self.detail_resize.take() {
-        // Server owns one shared height and broadcasts it to all sidebars.
-        self.send(ClientCommand::SetDetailPanelHeight {
-            height: self.detail_panel_height,
-        });
+        // Persist to server (which writes config)
+        if let Some(name) = self.detail_panel_session_name() {
+            self.send(ClientCommand::SetDetailPanelHeight {
+                session: name.to_string(),
+                height: self.detail_panel_height,
+            });
+            self.detail_panel_heights.insert(name.to_string(), self.detail_panel_height);
+        }
         self.log_resize("endDetailResize", &[("h", self.detail_panel_height.to_string())]);
         let _ = st;
     }
@@ -144,7 +149,8 @@ fn on_left_up(&mut self, _col: u16, _row: u16) {
 ```
 
 > **Note:** `SetDetailPanelHeight` is a *new* `ClientCommand` variant we add
-> in Phase 0 to keep detail-panel height as server-owned shared UI state.
+> in Phase 0 to move config writes to server. Until then, write directly to
+> `~/.config/opensessions/config.json` from the client.
 
 ## Hover state (visual only)
 

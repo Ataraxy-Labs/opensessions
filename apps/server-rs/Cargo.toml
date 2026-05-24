@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 opensessions-runtime = { path = "../../packages/runtime-rs" }
 opensessions-sidebar-core = { path = "../../packages/sidebar-core-rs" }
+opensessions-sidebar-protocol = { path = "../../packages/sidebar-protocol-rs" }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 tokio-websockets = { version = "0.13.2", default-features = false, features = ["server", "sha1_smol", "fastrand"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

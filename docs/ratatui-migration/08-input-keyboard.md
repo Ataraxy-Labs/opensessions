@@ -134,6 +134,10 @@ fn handle_normal_key(&mut self, key: KeyEvent) {
         KeyCode::Char('t')      => self.open_theme_picker(),
         KeyCode::Char('n')      => self.send(ClientCommand::NewSession),
         KeyCode::Char('D')      => self.dismiss_focused_agent(),
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let idx = (c as u8 - b'1') as u32;
+            self.send(ClientCommand::SwitchIndex { index: idx });
+        }
         _ => {}
     }
 }

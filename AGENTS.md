@@ -37,9 +37,7 @@ opensessions/
 │   │   │   │       ├── amp.ts
 │   │   │   │       ├── claude-code.ts
 │   │   │   │       ├── codex.ts
-│   │   │   │       ├── opencode.ts
-│   │   │   │       ├── kilo.ts
-│   │   │   │       └── pi.ts
+│   │   │   │       └── opencode.ts
 │   │   │   ├── mux/         # Mux registry and detection helpers
 │   │   │   ├── server/      # WebSocket server internals and launcher
 │   │   │   ├── shared.ts    # Shared types, constants, palette
@@ -51,7 +49,7 @@ opensessions/
 │       │   ├── tmux/        # @opensessions/mux-tmux — tmux provider
 │       │   └── zellij/      # @opensessions/mux-zellij — experimental zellij provider
 │       └── tmux-sdk/        # @opensessions/tmux-sdk — lower-level tmux command wrapper
-├── CONTRACTS.md       # Agent integration guide (Amp, Claude Code, OpenCode, Kilo, Aider, Pi)
+├── CONTRACTS.md       # Agent integration guide (Amp, Claude Code, OpenCode, Aider)
 ├── turbo.json         # Turborepo config
 ├── opensessions.tmux  # Root TPM entrypoint
 └── package.json       # Bun workspace root
@@ -60,7 +58,7 @@ opensessions/
 ## Key Architecture Decisions
 
 1. **Monorepo**: Turborepo + Bun workspaces, with `apps/` for runnable entrypoints and `packages/` for reusable libraries.
-2. **Built-in agent watchers**: Core ships with `AmpAgentWatcher`, `ClaudeCodeAgentWatcher`, `CodexAgentWatcher`, `OpenCodeAgentWatcher`, `KiloAgentWatcher` and `PiAgentWatcher` that watch agent data directories directly. External agents integrate via the `AgentWatcher` plugin interface.
+2. **Built-in agent watchers**: Core ships with `AmpAgentWatcher`, `ClaudeCodeAgentWatcher`, `CodexAgentWatcher`, and `OpenCodeAgentWatcher` that watch agent data directories directly. External agents integrate via the `AgentWatcher` plugin interface.
 3. **Mux-agnostic**: `MuxProvider` interface abstracts all mux operations. `TmuxProvider` is the reference implementation.
 4. **MuxProvider is SYNC**: All methods use `Bun.spawnSync` — matches the existing pattern and keeps the server simple.
 5. **Auto-detect mux**: `detectMux()` checks `$TMUX`, `$ZELLIJ_SESSION_NAME` env vars. Config file override planned.
@@ -113,7 +111,7 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 - **Sync mux calls**: MuxProvider methods are synchronous. Don't make them async.
 - **Preserve optimizations**: Batched tmux calls, 5s git cache with HEAD watchers, lightweight focus-only broadcasts.
 - **Sidebar resize work**: Before changing sidebar spawning, width sync, tmux resize handling, or `sidebar-coordinator`, read `docs/explanation/sidebar-behavior.md` and preserve those invariants unless you update the doc in the same change.
-- **Built-in watchers in runtime**: Amp, Claude Code, Codex, OpenCode, Kilo and Pi have built-in watchers in `packages/runtime/src/agents/watchers/`. Community agents use the `AgentWatcher` plugin interface.
+- **Built-in watchers in runtime**: Amp, Claude Code, Codex, and OpenCode have built-in watchers in `packages/runtime/src/agents/watchers/`. Community agents use the `AgentWatcher` plugin interface.
 - **OpenTUI Solid**: JSX needs `bunfig.toml` preload and `jsxImportSource: "@opentui/solid"` in tsconfig. Build needs `solidPlugin`.
 - **Never call `process.exit()` directly in TUI**: Use `renderer.destroy()`.
 

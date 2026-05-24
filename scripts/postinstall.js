@@ -11,6 +11,7 @@ function targetTriple(platform = os.platform(), arch = os.arch()) {
   if (platform === "darwin" && arch === "x64") return "x86_64-apple-darwin";
   if (platform === "linux" && arch === "x64") return "x86_64-unknown-linux-gnu";
   if (platform === "linux" && arch === "arm64") return "aarch64-unknown-linux-gnu";
+  if (platform === "win32" && arch === "x64") return "x86_64-pc-windows-msvc";
   throw new Error(`Unsupported platform: ${platform}-${arch}`);
 }
 
@@ -51,23 +52,14 @@ async function main() {
   const { version } = require("../package.json");
   const triple = targetTriple();
   const binDir = path.join(__dirname, "..", "bin");
-  const executableNames = [
-    "opensessions-sidebar",
-    "opensessions-server",
-    "lazydiff",
-  ];
+  const dest = path.join(binDir, process.platform === "win32" ? "opensessions-sidebar.exe" : "opensessions-sidebar");
   const tarball = path.join(binDir, "opensessions-sidebar.tmp.tar.gz");
 
   fs.mkdirSync(binDir, { recursive: true });
   await download(releaseUrl(version, triple), tarball);
   execFileSync("tar", ["-xzf", tarball, "-C", binDir]);
   fs.unlinkSync(tarball);
-  for (const name of executableNames) {
-    const executable = path.join(binDir, name);
-    if (fs.existsSync(executable)) {
-      fs.chmodSync(executable, 0o755);
-    }
-  }
+  fs.chmodSync(dest, 0o755);
 }
 
 if (require.main === module) {

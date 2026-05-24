@@ -42,16 +42,15 @@ impl SessionOrder {
         }
     }
 
-    pub fn set_visible_order(&mut self, visible_names: Vec<String>) {
-        let visible_set = visible_names.iter().cloned().collect::<BTreeSet<_>>();
-        let mut order = visible_names;
-        order.extend(
-            self.order
-                .iter()
-                .filter(|name| !visible_set.contains(*name))
-                .cloned(),
-        );
-        self.order = order;
+    pub fn reorder(&mut self, name: &str, delta: i8) {
+        let Some(index) = self.order.iter().position(|candidate| candidate == name) else {
+            return;
+        };
+        let new_index = index as isize + delta as isize;
+        if new_index < 0 || new_index >= self.order.len() as isize {
+            return;
+        }
+        self.order.swap(index, new_index as usize);
         let _ = self.save();
     }
 

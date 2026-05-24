@@ -56,6 +56,7 @@ pub struct App {
     pub flash: Option<Flash>,                  // text + expiry Instant
     pub spin_idx: usize,
     pub detail_panel_height: u16,
+    pub detail_panel_heights: HashMap<String, u16>,  // persisted per-session
     pub detail_resize: Option<DetailResizeState>,    // active drag
     pub theme_before_preview: Option<Theme>,
     pub client_tty: Option<String>,
@@ -173,6 +174,11 @@ impl App {
                 self.init_label = s.init_label.unwrap_or_default();
                 self.connected = true;
             }
+            ServerMessage::Focus(f) => {
+                self.focused_session = f.focused_session;
+                self.current_session = f.current_session;
+            }
+            ServerMessage::Resize { width } => self.sidebar_width = width,
             ServerMessage::Quit => self.should_quit = true,
             ServerMessage::YourSession { name, client_tty } => {
                 self.my_session = Some(name);

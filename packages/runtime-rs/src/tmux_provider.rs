@@ -1,13 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
 
 use crate::mux::{
-    ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
-};
-use crate::tmux_scripting::{
-    delayed_http_hook_command, hook_context_format, http_hook_command, pane_died_hook_command,
-    pane_exited_hook_command, sidebar_width_repair_pipeline,
+    ActiveWindow, AgentPane, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
 };
 
 const SEP: &str = "\t";
@@ -180,26 +176,6 @@ impl TmuxClient {
         self.run(&args);
     }
 
-    pub fn select_sidebar_pane_for_session(&self, session_name: &str) {
-        let Some(window_id) = self
-            .list_windows()
-            .into_iter()
-            .find(|window| window.session_name == session_name && window.active)
-            .map(|window| window.id)
-        else {
-            return;
-        };
-        let Some(sidebar_pane) = self
-            .list_panes(PaneScope::Window(&window_id))
-            .into_iter()
-            .find(|pane| pane.title == "opensessions-sidebar")
-            .map(|pane| pane.id)
-        else {
-            return;
-        };
-        self.select_pane(&sidebar_pane);
-    }
-
     pub fn new_session(&self, name: Option<&str>, cwd: Option<&str>) -> String {
         let mut args = vec!["new-session", "-d"];
         if let Some(name) = name {
@@ -230,41 +206,12 @@ impl TmuxClient {
         self.run(&["select-pane", "-t", target]);
     }
 
-    pub fn flash_pane(&self, target: &str) {
-        self.run(&["select-pane", "-t", target, "-P", "bg=colour238"]);
-        let quoted = shell_quote(target);
-        self.run(&[
-            "run-shell",
-            "-b",
-            &format!("sleep 0.18; tmux select-pane -t {quoted} -P default"),
-        ]);
-    }
-
     pub fn set_pane_title(&self, target: &str, title: &str) {
         self.run(&["select-pane", "-t", target, "-T", title]);
     }
 
     pub fn resize_pane_width(&self, target: &str, width: u16) {
         self.run(&["resize-pane", "-t", target, "-x", &width.to_string()]);
-    }
-
-    pub fn set_window_remain_on_exit(&self, target: &str, enabled: bool) {
-        self.run(&[
-            "set-window-option",
-            "-t",
-            target,
-            "remain-on-exit",
-            if enabled { "on" } else { "off" },
-        ]);
-    }
-
-    pub fn set_remain_on_exit_for_sidebar_windows(&self, enabled: bool) {
-        let mut seen_windows = HashSet::new();
-        for pane in self.list_panes(PaneScope::All) {
-            if pane.title == "opensessions-sidebar" && seen_windows.insert(pane.window_id.clone()) {
-                self.set_window_remain_on_exit(&pane.window_id, enabled);
-            }
-        }
     }
 
     pub fn split_sidebar_pane(
@@ -306,22 +253,7 @@ impl TmuxClient {
         self.run(&args).stdout
     }
 
-    pub fn display_for_client(&self, format: &str, client_tty: Option<&str>) -> String {
-        let mut args = vec!["display-message"];
-        if let Some(client_tty) = client_tty.filter(|client_tty| !client_tty.is_empty()) {
-            args.push("-c");
-            args.push(client_tty);
-        }
-        args.push("-p");
-        args.push(format);
-        self.run(&args).stdout
-    }
-
     pub fn get_current_session(&self) -> Option<String> {
-        let session_name = self.display("#{session_name}", None);
-        if !session_name.is_empty() && !session_name.contains('/') {
-            return Some(session_name);
-        }
         self.list_clients()
             .into_iter()
             .find(|client| !client.tty.is_empty())
@@ -335,28 +267,6 @@ impl TmuxClient {
     pub fn get_current_window_id(&self) -> Option<String> {
         let window_id = self.display("#{window_id}", None);
         (!window_id.is_empty()).then_some(window_id)
-    }
-
-    pub fn get_current_pane_id(&self) -> Option<String> {
-        let pane_id = self.display("#{pane_id}", None);
-        (!pane_id.is_empty()).then_some(pane_id)
-    }
-
-    pub fn get_client_focus(&self, client_tty: Option<&str>) -> Option<ClientFocus> {
-        let raw = self.display_for_client(
-            "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}",
-            client_tty,
-        );
-        let parts = raw.split(SEP).collect::<Vec<_>>();
-        if parts.len() < 4 || parts[1].is_empty() || parts[2].is_empty() || parts[3].is_empty() {
-            return None;
-        }
-        Some(ClientFocus {
-            client_tty: (!parts[0].is_empty()).then(|| parts[0].to_string()),
-            session_name: parts[1].to_string(),
-            window_id: parts[2].to_string(),
-            pane_id: parts[3].to_string(),
-        })
     }
 
     pub fn get_session_dir(&self, target: &str) -> String {
@@ -396,25 +306,11 @@ impl TmuxClient {
     }
 
     pub fn set_global_hook(&self, name: &str, command: &str) {
-        let output = self.run(&["set-hook", "-g", name, command]);
-        if !output.ok() {
-            eprintln!(
-                "opensessions: failed to install tmux hook {name}: status={} stderr={} command={command}",
-                output.exit_code, output.stderr,
-            );
-        }
+        self.run(&["set-hook", "-g", name, command]);
     }
 
     pub fn unset_global_hook(&self, name: &str) {
         self.run(&["set-hook", "-gu", name]);
-    }
-
-    pub fn set_global_option(&self, name: &str, value: &str) {
-        self.run(&["set-option", "-gq", name, value]);
-    }
-
-    pub fn unset_global_option(&self, name: &str) {
-        self.run(&["set-option", "-gu", name]);
     }
 }
 
@@ -505,28 +401,26 @@ impl MuxProvider for TmuxProvider {
 
     fn setup_hooks(&self, server_host: &str, server_port: u16) {
         let base = format!("http://{server_host}:{server_port}");
-        let hook_context = hook_context_format();
-        let focus_cmd = http_hook_command(&base, "/focus", Some(hook_context), true);
-        let refresh_cmd = http_hook_command(&base, "/refresh", None, true);
-        let ensure_cmd = http_hook_command(&base, "/ensure-sidebar", Some(hook_context), true);
-        let pane_exited_cmd = pane_exited_hook_command(&base);
-        let pane_died_cmd = pane_died_hook_command(&base);
-        let repair_sidebar_width_cmd =
-            format!("run-shell -b \"{}\"", sidebar_width_repair_pipeline());
-        let client_resized_cmd = format!(
-            "{repair_sidebar_width_cmd} ; {}",
-            delayed_http_hook_command(&base, "/client-resized"),
+        let hook = |path: &str, data: Option<&str>| {
+            let body = data.map(|data| format!(" -d '{data}'")).unwrap_or_default();
+            format!(
+                "run-shell -b \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path}{body} >/dev/null 2>&1 || true\""
+            )
+        };
+
+        let focus_cmd = hook("/focus", Some("#{client_tty}|#{session_name}|#{window_id}"));
+        let refresh_cmd = hook("/refresh", None);
+        let ensure_cmd = hook(
+            "/ensure-sidebar",
+            Some("#{client_tty}|#{session_name}|#{window_id}"),
         );
-        let pane_layout_changed_cmd = format!(
-            "{repair_sidebar_width_cmd} ; {}",
-            delayed_http_hook_command(&base, "/pane-layout-changed"),
-        );
+        let client_resized_cmd = hook("/client-resized", None);
+        let pane_exited_cmd = hook("/pane-exited", None);
 
         self.client.set_global_hook(
             "client-session-changed",
             &format!("{focus_cmd} ; {ensure_cmd}"),
         );
-        self.client.set_global_hook("after-select-pane", &focus_cmd);
         self.client.set_global_hook("session-created", &refresh_cmd);
         self.client.set_global_hook("session-closed", &refresh_cmd);
         self.client
@@ -534,41 +428,21 @@ impl MuxProvider for TmuxProvider {
         self.client.set_global_hook("after-new-window", &ensure_cmd);
         self.client
             .set_global_hook("client-resized", &client_resized_cmd);
-        self.client
-            .set_global_hook("after-kill-pane", &pane_exited_cmd);
         self.client.set_global_hook("pane-exited", &pane_exited_cmd);
-        self.client.set_global_hook("pane-died", &pane_died_cmd);
-        self.client
-            .set_global_hook("after-resize-pane", &repair_sidebar_width_cmd);
-        self.client
-            .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
-        self.client.set_remain_on_exit_for_sidebar_windows(true);
     }
 
     fn cleanup_hooks(&self) {
-        self.client.set_remain_on_exit_for_sidebar_windows(false);
         for hook in [
             "client-session-changed",
-            "after-select-pane",
             "session-created",
             "session-closed",
             "after-select-window",
             "after-new-window",
             "client-resized",
-            "after-kill-pane",
             "pane-exited",
-            "pane-died",
-            "after-resize-pane",
-            "after-resize-window",
         ] {
             self.client.unset_global_hook(hook);
         }
-        self.client.unset_global_option("@opensessions_width");
-    }
-
-    fn set_sidebar_width_hint(&self, width: u16) {
-        self.client
-            .set_global_option("@opensessions_width", &width.to_string());
     }
 
     fn is_window_capable(&self) -> bool {
@@ -584,40 +458,20 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn list_active_windows(&self) -> Vec<ActiveWindow> {
-        let mut windows = Vec::<ActiveWindow>::new();
-        for window in self
-            .client
+        self.client
             .list_windows()
             .into_iter()
             .filter(|window| window.session_name != STASH_SESSION)
-        {
-            let next = ActiveWindow {
+            .map(|window| ActiveWindow {
                 id: window.id,
                 session_name: window.session_name,
                 active: window.active,
-            };
-            if let Some(current) = windows.iter_mut().find(|current| current.id == next.id) {
-                if !current.active && next.active {
-                    *current = next;
-                }
-            } else {
-                windows.push(next);
-            }
-        }
-
-        windows
+            })
+            .collect()
     }
 
     fn get_current_window_id(&self) -> Option<String> {
         self.client.get_current_window_id()
-    }
-
-    fn get_current_pane_id(&self) -> Option<String> {
-        self.client.get_current_pane_id()
-    }
-
-    fn get_client_focus(&self, client_tty: Option<&str>) -> Option<ClientFocus> {
-        self.client.get_client_focus(client_tty)
     }
 
     fn list_sidebar_panes(&self, session_name: Option<&str>) -> Vec<SidebarPane> {
@@ -634,13 +488,11 @@ impl MuxProvider for TmuxProvider {
                 .or_insert(width);
         }
 
-        let mut seen_pane_ids = HashSet::new();
         panes
             .into_iter()
             .filter(|pane| {
                 pane.title == "opensessions-sidebar" && pane.session_name != STASH_SESSION
             })
-            .filter(|pane| seen_pane_ids.insert(pane.id.clone()))
             .map(|pane| SidebarPane {
                 pane_id: pane.id,
                 session_name: pane.session_name,
@@ -661,7 +513,6 @@ impl MuxProvider for TmuxProvider {
                 thread_name: thread_name_from_pane(&pane, &agent),
                 agent,
                 pane_id: pane.id,
-                active: pane.active,
                 thread_id: None,
             })
             .collect()
@@ -675,17 +526,12 @@ impl MuxProvider for TmuxProvider {
         self.client.kill_pane(pane_id);
     }
 
-    fn prepare_sidebar_window(&self, window_id: &str) {
-        self.client.set_window_remain_on_exit(window_id, true);
-    }
-
     fn focus_pane(&self, pane_id: &str) {
         let window_id = self.client.display("#{window_id}", Some(pane_id));
         if !window_id.is_empty() {
             self.client.select_window(&window_id);
         }
         self.client.select_pane(pane_id);
-        self.client.flash_pane(pane_id);
     }
 
     fn kill_pane(&self, pane_id: &str) {
@@ -706,18 +552,18 @@ impl MuxProvider for TmuxProvider {
             .filter(|pane| pane.title != "opensessions-sidebar")
             .collect::<Vec<_>>();
 
-        if agent == "amp"
-            && let Some(thread_name) = thread_name
-        {
-            let matches = panes
-                .iter()
-                .filter(|pane| {
-                    pane.title.to_lowercase().starts_with("amp - ")
-                        && pane.title.contains(thread_name)
-                })
-                .collect::<Vec<_>>();
-            if matches.len() == 1 {
-                return Some(matches[0].id.clone());
+        if agent == "amp" {
+            if let Some(thread_name) = thread_name {
+                let matches = panes
+                    .iter()
+                    .filter(|pane| {
+                        pane.title.to_lowercase().starts_with("amp - ")
+                            && pane.title.contains(thread_name)
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() == 1 {
+                    return Some(matches[0].id.clone());
+                }
             }
         }
 
@@ -742,32 +588,14 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn kill_orphaned_sidebar_panes(&self) {
-        self.kill_orphaned_sidebar_panes_with_fallbacks(&HashMap::new());
-    }
-
-    fn kill_orphaned_sidebar_panes_with_fallbacks(
-        &self,
-        fallback_sessions: &HashMap<String, String>,
-    ) {
         let panes = self.client.list_panes(PaneScope::All);
-        let windows_by_session = self
-            .client
-            .list_sessions()
-            .into_iter()
-            .map(|session| (session.name, session.window_count))
-            .collect::<HashMap<_, _>>();
         let mut window_pane_counts: HashMap<String, u32> = HashMap::new();
         let mut sidebars_by_window: HashMap<String, Vec<String>> = HashMap::new();
-        let mut session_by_window: HashMap<String, String> = HashMap::new();
-        let mut seen_pane_ids = HashSet::new();
 
         for pane in panes {
-            if pane.session_name == STASH_SESSION || !seen_pane_ids.insert(pane.id.clone()) {
+            if pane.session_name == STASH_SESSION {
                 continue;
             }
-            session_by_window
-                .entry(pane.window_id.clone())
-                .or_insert_with(|| pane.session_name.clone());
             *window_pane_counts
                 .entry(pane.window_id.clone())
                 .or_insert(0) += 1;
@@ -781,17 +609,6 @@ impl MuxProvider for TmuxProvider {
 
         for (window_id, sidebars) in sidebars_by_window {
             if window_pane_counts.get(&window_id) == Some(&1) {
-                if let Some(session_name) = session_by_window.get(&window_id)
-                    && windows_by_session.get(session_name).copied().unwrap_or(1) <= 1
-                    && let Some(fallback_session) = fallback_sessions.get(session_name)
-                {
-                    for client in self.client.list_clients() {
-                        if client.session_name == *session_name {
-                            self.client
-                                .switch_client(fallback_session, Some(&client.tty));
-                        }
-                    }
-                }
                 for pane_id in sidebars {
                     self.client.kill_pane(&pane_id);
                 }
@@ -832,7 +649,6 @@ impl MuxProvider for TmuxProvider {
         )?;
         self.client
             .set_pane_title(&new_pane.id, "opensessions-sidebar");
-        self.client.set_window_remain_on_exit(window_id, true);
         Some(new_pane.id)
     }
 
@@ -860,44 +676,25 @@ fn pane_format() -> &'static str {
 fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
     let title = pane.title.to_lowercase();
     let command = pane.command.to_lowercase();
-    if title == "pi" || title.starts_with("pi ") || title.starts_with('π') || command == "pi" {
-        return Some("pi".to_string());
+    if title.starts_with("amp") || command.contains("amp") {
+        return Some("amp".to_string());
     }
-    let haystack = format!("{title} {command}");
-    for (agent, aliases) in AGENT_ALIASES {
-        if aliases.iter().any(|alias| haystack.contains(alias)) {
-            return Some((*agent).to_string());
-        }
+    if title.contains("claude") || command.contains("claude") {
+        return Some("claude-code".to_string());
+    }
+    if title.contains("codex") || command.contains("codex") {
+        return Some("codex".to_string());
+    }
+    if title.contains("opencode") || command.contains("opencode") {
+        return Some("opencode".to_string());
     }
     None
 }
 
-// Keep this broad and process/title based for zero-config agent
-// awareness. Transcript/file watchers still provide richer status where we
-// have native integrations; this path makes panes from other popular CLIs show
-// up immediately instead of disappearing from the sidebar.
-const AGENT_ALIASES: &[(&str, &[&str])] = &[
-    ("amp", &["amp", "amp-local"]),
-    ("claude-code", &["claude", "claude-code"]),
-    ("codex", &["codex"]),
-    ("gemini", &["gemini"]),
-    ("cursor", &["cursor", "cursor-agent"]),
-    ("antigravity", &["agy", "antigravity", "antigravity-cli"]),
-    ("cline", &["cline"]),
-    ("opencode", &["opencode", "open-code"]),
-    ("github-copilot", &["copilot", "github-copilot", "ghcs"]),
-    ("kimi", &["kimi", "kimi-code"]),
-    ("kiro", &["kiro", "kiro-cli"]),
-    ("droid", &["droid"]),
-    ("grok", &["grok", "grok-build"]),
-    ("hermes", &["hermes", "hermes-agent"]),
-    ("qodercli", &["qodercli", "qoderclicn", "qoder", "qodercn"]),
-];
-
 fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
     let title = pane.title.trim();
     if agent == "amp"
-        && let Some((thread_name, _)) = title.split_once(" - amp - ")
+        && let Some((_, thread_name)) = title.split_once(" - ")
     {
         let thread_name = thread_name.trim();
         if !thread_name.is_empty() {
@@ -905,10 +702,6 @@ fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn parse_sessions(raw: &str) -> Vec<SessionInfo> {
@@ -1019,51 +812,4 @@ fn parse_u64(parts: &[&str], index: usize) -> u64 {
         .get(index)
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct RecordingRunner {
-        calls: Mutex<Vec<Vec<String>>>,
-    }
-
-    impl CommandRunner for RecordingRunner {
-        fn run(&self, args: &[String]) -> CommandOutput {
-            self.calls.lock().unwrap().push(args.to_vec());
-            CommandOutput {
-                exit_code: 0,
-                stdout: "/dev/ttys001\topensessions\t@0\t%186".to_string(),
-                stderr: String::new(),
-            }
-        }
-    }
-
-    #[test]
-    fn client_focus_uses_tmux_target_client_not_window_active_state() {
-        let runner = Arc::new(RecordingRunner::default());
-        let provider = TmuxProvider::new(runner.clone());
-
-        let focus = provider
-            .get_client_focus(Some("/dev/ttys001"))
-            .expect("client focus");
-
-        assert_eq!(focus.client_tty.as_deref(), Some("/dev/ttys001"));
-        assert_eq!(focus.session_name, "opensessions");
-        assert_eq!(focus.window_id, "@0");
-        assert_eq!(focus.pane_id, "%186");
-        assert_eq!(
-            runner.calls.lock().unwrap()[0],
-            vec![
-                "display-message".to_string(),
-                "-c".to_string(),
-                "/dev/ttys001".to_string(),
-                "-p".to_string(),
-                "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
-            ],
-        );
-    }
 }

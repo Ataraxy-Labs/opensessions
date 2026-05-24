@@ -1,3 +1,5 @@
+use crate::generated::protocol::ClientCommand;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneIdentity {
     pub pane_id: String,
@@ -13,12 +15,12 @@ where
 }
 
 /// Resolve the running pane's identity, mirroring
-/// tmux display-message fallback used by the live sidebar.
+/// `apps/tui/src/index.tsx` (`getLocalSessionName` / `getLocalWindowId`).
 ///
 /// `env` reads process environment variables. `tmux_query` invokes
 /// `tmux display-message -p -t <target> <format>` and returns the trimmed
 /// stdout. Tmux is only consulted when the corresponding `OPENSESSIONS_*`
-/// env vars are absent.
+/// env vars are absent, matching the OpenTUI client priority.
 pub fn pane_identity_resolve<F, T>(env: F, tmux_query: T) -> Option<PaneIdentity>
 where
     F: Fn(&str) -> Option<String>,
@@ -53,6 +55,19 @@ where
     })
 }
 
+pub fn should_report_width(local_session: Option<&str>, current_session: Option<&str>) -> bool {
+    let Some(local) = local_session else {
+        return false;
+    };
+    if local == "_os_stash" {
+        return false;
+    }
+    match current_session {
+        Some(current) => current == local,
+        None => true,
+    }
+}
+
 /// Plan describing which tmux pane should receive focus after the sidebar
 /// finishes capability detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +75,7 @@ pub struct RefocusPlan {
     pub select_pane: String,
 }
 
-/// Refocus-main-pane planning as a pure function.
+/// Mirror of `apps/tui/src/index.tsx::refocusMainPane` as a pure function.
 ///
 /// `tmux_query` is invoked with the argv slice that should be passed to
 /// `tmux <args>`. It must return the trimmed stdout when the command succeeds
@@ -97,4 +112,15 @@ where
     Some(RefocusPlan {
         select_pane: main_pane.to_string(),
     })
+}
+
+pub fn report_width_command(
+    width: u32,
+    local_session: Option<&str>,
+    current_session: Option<&str>,
+) -> Option<ClientCommand> {
+    if !should_report_width(local_session, current_session) {
+        return None;
+    }
+    Some(ClientCommand::ReportWidth { width })
 }

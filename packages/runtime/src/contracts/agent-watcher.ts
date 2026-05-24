@@ -28,7 +28,6 @@ export interface AgentWatcherContext {
  *   - claude-code: watches ~/.claude/projects/ JSONL files
  *   - codex: watches ~/.codex/sessions/ JSONL transcripts
  *   - opencode: polls OpenCode SQLite database
- *   - kilo: polls Kilo SQLite database
  *   - pi: watches ~/.pi/agent/sessions/ JSONL transcripts
  *
  * To add a new watcher:

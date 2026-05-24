@@ -8,7 +8,7 @@ describe("opensessions-sidebar postinstall", () => {
     expect(targetTriple("darwin", "x64")).toBe("x86_64-apple-darwin");
     expect(targetTriple("linux", "x64")).toBe("x86_64-unknown-linux-gnu");
     expect(targetTriple("linux", "arm64")).toBe("aarch64-unknown-linux-gnu");
-    expect(() => targetTriple("win32", "x64")).toThrow("Unsupported platform: win32-x64");
+    expect(targetTriple("win32", "x64")).toBe("x86_64-pc-windows-msvc");
   });
 
   test("builds release artifact URL from package version", () => {

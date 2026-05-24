@@ -53,6 +53,25 @@ pub struct ServerState {
 }
 ```
 
+### `focus`
+
+```ts
+{ type: "focus"; focusedSession: string | null; currentSession: string | null }
+```
+
+```rust
+pub struct FocusUpdate {
+    pub focused_session: Option<String>,
+    pub current_session: Option<String>,
+}
+```
+
+### `resize`
+
+```ts
+{ type: "resize"; width: number }
+```
+
 ### `quit`
 
 ```ts
@@ -83,6 +102,8 @@ Client should re-send an `identify-pane` command.
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ServerMessage {
     State(ServerState),
+    Focus(FocusUpdate),
+    Resize { width: u32 },
     Quit,
     YourSession { name: String, client_tty: Option<String> },
     ReIdentify,
@@ -91,7 +112,7 @@ pub enum ServerMessage {
 
 > ⚠ Note: TS uses `"your-session"` and `"re-identify"` (kebab-case). Confirm
 > that `#[serde(rename_all = "kebab-case")]` on the **enum tag** matches.
-> `State` → `state`, `Focus` → `focus`, `Quit` → `quit`,
+> `State` → `state`, `Focus` → `focus`, `Resize` → `resize`, `Quit` → `quit`,
 > `YourSession` → `your-session`, `ReIdentify` → `re-identify`. ✅
 
 ## Nested types
@@ -286,23 +307,25 @@ All 18 variants:
 ```ts
 type ClientCommand =
   | { type: "switch-session"; name: string; clientTty?: string }
+  | { type: "switch-index"; index: number }
   | { type: "new-session" }
   | { type: "hide-session"; name: string }
   | { type: "show-all-sessions" }
   | { type: "kill-session"; name: string }
   | { type: "reorder-session"; name: string; delta: -1 | 1 }
   | { type: "refresh" }
+  | { type: "move-focus"; delta: -1 | 1 }
+  | { type: "focus-session"; name: string }
   | { type: "mark-seen"; name: string }
   | { type: "dismiss-agent"; session: string; agent: string; threadId?: string }
   | { type: "set-theme"; theme: string }
-  | { type: "set-sidebar-width"; width: number }
-  | { type: "repair-width" }
   | { type: "set-filter"; filter: SessionFilterMode }
-  | { type: "toggle-worktree-group"; key: string }
+  | { type: "identify"; clientTty: string }
   | { type: "quit" }
   | { type: "identify-pane"; paneId: string; sessionName: string; windowId?: string }
-  | { type: "focus-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string; paneId?: string }
-  | { type: "kill-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string; paneId?: string };
+  | { type: "focus-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string }
+  | { type: "kill-agent-pane"; session: string; agent: string; threadId?: string; threadName?: string }
+  | { type: "report-width"; width: number };
 ```
 
 ```rust
@@ -314,12 +337,15 @@ pub enum ClientCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         client_tty: Option<String>,
     },
+    SwitchIndex { index: u32 },
     NewSession,
     HideSession { name: String },
     ShowAllSessions,
     KillSession { name: String },
     ReorderSession { name: String, delta: i8 }, // -1 | 1
     Refresh,
+    MoveFocus { delta: i8 },
+    FocusSession { name: String },
     MarkSeen { name: String },
     DismissAgent {
         session: String,
@@ -328,10 +354,8 @@ pub enum ClientCommand {
         thread_id: Option<String>,
     },
     SetTheme { theme: String },
-    SetSidebarWidth { width: u32 },
-    RepairWidth,
     SetFilter { filter: SessionFilterMode },
-    ToggleWorktreeGroup { key: String },
+    Identify { client_tty: String },
     Quit,
     IdentifyPane {
         pane_id: String,
@@ -346,8 +370,6 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pane_id: Option<String>,
     },
     KillAgentPane {
         session: String,
@@ -356,27 +378,21 @@ pub enum ClientCommand {
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pane_id: Option<String>,
     },
+    ReportWidth { width: u32 },
 }
 ```
 
-## Protocol type ownership (current)
+## Codegen path (Phase 0)
 
-Rust protocol types are owned in `packages/runtime-rs/src/protocol.rs`. The
-sidebar re-exports those types from `packages/sidebar-core-rs/src/generated/protocol.rs`
-so server, sidebar core, and TUI code compile against one Rust source of truth.
-
-## Codegen path (future TS sync)
-
-To prevent type drift between TS and Rust, the recommended follow-up work:
+To prevent type drift between TS and Rust, the recommended Phase 0 work:
 
 1. Annotate every TS interface in `packages/runtime/src/shared.ts` and
    `contracts/agent.ts` with `ts-rs` (or `specta`).
-2. Add a `pnpm run gen-types` script that emits TypeScript declarations from the
-   Rust protocol or verifies the TypeScript mirror against it.
-3. Wire it into CI so a stale TS schema fails immediately.
+2. Add a `pnpm run gen-types` script that emits Rust code into
+   `apps/tui-rs/src/generated/protocol.rs`.
+3. Wire it into the Cargo build via `build.rs` so a stale TS schema fails the
+   Rust build immediately.
 
 If we don't want runtime TS deps, alternatively use `typeshare` or hand-maintain
 this file with a snapshot test in TS that asserts the wire format hasn't changed.

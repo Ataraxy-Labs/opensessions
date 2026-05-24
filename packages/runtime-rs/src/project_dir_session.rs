@@ -43,7 +43,9 @@ pub fn resolve_session_for_project_dir(
         return unique_match(related_matches);
     }
 
-    let encoded = project_dir.strip_prefix("__encoded__:")?;
+    let Some(encoded) = project_dir.strip_prefix("__encoded__:") else {
+        return None;
+    };
 
     let mut encoded_matches = BTreeSet::new();
     for (dir, sessions) in dir_session_map {
