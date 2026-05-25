@@ -1,0 +1,28 @@
+[package]
+name = "opensessions-sidebar"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "opensessions_sidebar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "opensessions-sidebar"
+path = "src/main.rs"
+
+[dependencies]
+opensessions-sidebar-core = { path = "../../packages/sidebar-core-rs" }
+opensessions-sidebar-protocol = { path = "../../packages/sidebar-protocol-rs" }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29", default-features = false, features = ["event-stream", "events"] }
+unicode-width = "0.2"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "macros", "time", "sync"] }
+tokio-util = { version = "0.7", default-features = false, features = [] }
+tokio-websockets = { version = "0.13.2", default-features = false, features = ["client", "sha1_smol", "fastrand"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+http = "1"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+anyhow = "1"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help"] }

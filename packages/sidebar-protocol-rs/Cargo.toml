@@ -1,0 +1,8 @@
+[package]
+name = "opensessions-sidebar-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "opensessions_sidebar_protocol"
+path = "src/lib.rs"

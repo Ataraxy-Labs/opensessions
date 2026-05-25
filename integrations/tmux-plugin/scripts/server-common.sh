@@ -27,10 +27,11 @@ server_key() {
 }
 
 SERVER_KEY="$(server_key)"
+PORT_BASE=22000
 if [ -n "$OPENSESSIONS_PORT" ]; then
   PORT="$OPENSESSIONS_PORT"
 elif [ -n "$SERVER_KEY" ]; then
-  PORT=$((17000 + SERVER_KEY))
+  PORT=$((PORT_BASE + SERVER_KEY))
 else
   PORT="7391"
 fi
@@ -45,9 +46,15 @@ fi
 
 PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
-BUN_PATH="${BUN_PATH:-$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")}"
-SERVER_ENTRY="$PLUGIN_DIR/apps/server/src/main.ts"
+SERVER_WIDTH="${OPENSESSIONS_WIDTH:-$(tmux show-environment -g OPENSESSIONS_WIDTH 2>/dev/null | cut -d= -f2)}"
 SERVER_LOG="/tmp/opensessions-server.log"
+
+RUST_SERVER_BIN=""
+if [ -x "$PLUGIN_DIR/target/release/opensessions-server" ]; then
+  RUST_SERVER_BIN="$PLUGIN_DIR/target/release/opensessions-server"
+elif [ -x "$PLUGIN_DIR/target/debug/opensessions-server" ]; then
+  RUST_SERVER_BIN="$PLUGIN_DIR/target/debug/opensessions-server"
+fi
 
 show_startup_error() {
   message="$1"
@@ -64,12 +71,12 @@ ensure_server() {
     return 0
   fi
 
-  if [ ! -x "$BUN_PATH" ]; then
-    show_startup_error "opensessions: bun not found. Install bun and retry."
+  if [ -z "$RUST_SERVER_BIN" ]; then
+    show_startup_error "opensessions: server binary not found. Run: cd $PLUGIN_DIR && cargo build --release -p opensessions-server"
     return 1
   fi
 
-  "$BUN_PATH" run "$SERVER_ENTRY" >"$SERVER_LOG" 2>&1 &
+  "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
 
   attempt=0
   while [ "$attempt" -lt 30 ]; do
@@ -80,12 +87,6 @@ ensure_server() {
     attempt=$((attempt + 1))
   done
 
-  if grep -Eq "Cannot find module '@opensessions/|Cannot find package '@opensessions/|Cannot find module 'xstate'|Cannot find package 'xstate'" "$SERVER_LOG" 2>/dev/null; then
-    show_startup_error "opensessions: server dependencies are missing. Run: cd $PLUGIN_DIR && $BUN_PATH install --frozen-lockfile"
-    return 1
-  fi
-
   show_startup_error "opensessions: server failed to start. See $SERVER_LOG"
-
   return 1
 }

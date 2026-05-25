@@ -1,0 +1,55 @@
+
+   Sessions 6 ⚡1 ● 1
+
+   1 plane-feat-edit-pages-from-pi
+     feat-edit-pages-from-pi
+     feat/edit-pages-from-pi
+
+   2 plane-feat-background-exports
+     feat-background-exports
+     feat-background-exports
+
+   3 learning
+     main
+
+ ▌ 4 opensessions                ⚙
+     devpulse
+
+ ▌ 5 plane-pdf-word-formatting   ●
+     pdf-word-formatting
+     chore-relation-pqls
+
+   6 dotfiles_public
+     dotfiles.public
+     main
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────
+ …ments/work/opensessions
+
+  ⚙ amp                    tools ✕
+  Query tmux for open sessions
+
+  ○ amp                          ✕
+
+
+
+
+
+
+ ──────────────────────────────────
+ ⇥ cycle  ⏎ go  → agents  f filter
+  d hide  x kill
+

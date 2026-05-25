@@ -1,0 +1,13 @@
+[package]
+name = "opensessions-sidebar-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "opensessions_sidebar_core"
+path = "src/lib.rs"
+
+[dependencies]
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+unicode-width = "0.2"

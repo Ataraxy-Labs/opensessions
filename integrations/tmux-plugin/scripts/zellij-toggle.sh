@@ -17,8 +17,13 @@ PORT="${OPENSESSIONS_PORT:-7391}"
 HOST="${OPENSESSIONS_HOST:-127.0.0.1}"
 
 OPENSESSIONS_DIR="${OPENSESSIONS_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
-BUN_PATH="${BUN_PATH:-$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")}"
-SERVER_ENTRY="$OPENSESSIONS_DIR/apps/server/src/main.ts"
+
+RUST_SERVER_BIN=""
+if [ -x "$OPENSESSIONS_DIR/target/release/opensessions-server" ]; then
+    RUST_SERVER_BIN="$OPENSESSIONS_DIR/target/release/opensessions-server"
+elif [ -x "$OPENSESSIONS_DIR/target/debug/opensessions-server" ]; then
+    RUST_SERVER_BIN="$OPENSESSIONS_DIR/target/debug/opensessions-server"
+fi
 
 # --- Ensure server is running ---
 server_alive() {
@@ -26,7 +31,11 @@ server_alive() {
 }
 
 if ! server_alive; then
-    "$BUN_PATH" run "$SERVER_ENTRY" &>/dev/null &
+    if [ -z "$RUST_SERVER_BIN" ]; then
+        echo "opensessions: server binary not found. Run: cd $OPENSESSIONS_DIR && cargo build --release -p opensessions-server" >&2
+        exit 1
+    fi
+    "$RUST_SERVER_BIN" &>/dev/null &
     disown
     for i in $(seq 1 30); do
         sleep 0.1

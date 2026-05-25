@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "apps/sidebar-shim-rs",
+    "apps/tui-rs",
+    "apps/server-rs",
+    "packages/runtime-rs",
+    "packages/sidebar-core-rs",
+    "packages/sidebar-protocol-rs",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+
+[profile.release-dev]
+inherits = "release"
+opt-level = 3
+strip = false
+debug = "line-tables-only"

@@ -1,5 +1,7 @@
 node_modules
 dist
+target
 .turbo
 *.log
+.DS_Store
 .agents/skills/grill-me/

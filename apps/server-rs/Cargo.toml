@@ -1,0 +1,29 @@
+[package]
+name = "opensessions-server"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "opensessions_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "opensessions-server"
+path = "src/main.rs"
+
+[dependencies]
+opensessions-runtime = { path = "../../packages/runtime-rs" }
+opensessions-sidebar-core = { path = "../../packages/sidebar-core-rs" }
+opensessions-sidebar-protocol = { path = "../../packages/sidebar-protocol-rs" }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+tokio-websockets = { version = "0.13.2", default-features = false, features = ["server", "sha1_smol", "fastrand"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+sha1_smol = { version = "1", default-features = false }
+
+[dev-dependencies]
+http = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+tokio-websockets = { version = "0.13.2", default-features = false, features = ["client", "server", "sha1_smol", "fastrand"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }

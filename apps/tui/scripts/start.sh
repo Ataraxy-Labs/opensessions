@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
-# Start the opensessions TUI.
-# Works in both tmux and zellij — detects the mux from environment.
+# Start the opensessions TUI sidebar (Rust/Ratatui).
 
 if [ -n "${TMUX:-}" ]; then
     OPENSESSIONS_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f2)"
 fi
 OPENSESSIONS_DIR="${OPENSESSIONS_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
-TUI_DIR="$OPENSESSIONS_DIR/apps/tui"
 
-BUN_PATH="${BUN_PATH:-$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")}"
+RUST_BIN=""
+if [ -x "$OPENSESSIONS_DIR/target/release/opensessions-sidebar" ]; then
+    RUST_BIN="$OPENSESSIONS_DIR/target/release/opensessions-sidebar"
+elif [ -x "$OPENSESSIONS_DIR/target/debug/opensessions-sidebar" ]; then
+    RUST_BIN="$OPENSESSIONS_DIR/target/debug/opensessions-sidebar"
+fi
 
-cd "$TUI_DIR"
+if [ -z "$RUST_BIN" ]; then
+    echo "opensessions: sidebar binary not found. Run: cd $OPENSESSIONS_DIR && cargo build --release -p opensessions-sidebar" >&2
+    exit 1
+fi
+
 export REFOCUS_WINDOW
 export OPENSESSIONS_DIR
-exec "$BUN_PATH" run src/index.tsx 2>/tmp/opensessions-err.log
+
+printf '\n--- launch %s pid=%s ---\n' "$(date +%s)" "$$" >>/tmp/opensessions-err.log
+export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+exec "$RUST_BIN" 2>>/tmp/opensessions-err.log
