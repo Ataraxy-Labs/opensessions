@@ -90,8 +90,10 @@ describe("TUI: q keystroke wiring", () => {
     expect(block).not.toMatch(/key\.name === "y"/);
   });
 
-  test("destructive shortcuts are gated on paneHasTerminalFocus", () => {
-    expect(tuiSrc).toMatch(/if \(!paneHasTerminalFocus\(\)\) return/);
+  test("destructive shortcuts are gated on active pane or focus state", () => {
+    expect(tuiSrc).toMatch(/const localPaneActive = getLocalPaneActive\(\)/);
+    expect(tuiSrc).toMatch(/if \(localPaneActive === false\) return/);
+    expect(tuiSrc).toMatch(/if \(localPaneActive === null && !paneHasTerminalFocus\(\)\) return/);
   });
 
   test("focus-event tracking is wired up via DECSET 1004", () => {
@@ -118,6 +120,16 @@ describe("TUI: q keystroke wiring", () => {
     expect(tuiSrc).toMatch(/clearPendingPrintableShortcut\(\)/);
     expect(tuiSrc).toMatch(/isBurstGuardedShortcut\(key\)/);
     expect(tuiSrc).toMatch(/handleNormalKey\(pending\)/);
+  });
+
+  test("keyboard input trusts tmux pane_active before focus-event state", () => {
+    expect(tuiSrc).toMatch(/function getLocalPaneActive\(\): boolean \| null/);
+    expect(tuiSrc).toMatch(/"#\{pane_active\}"/);
+    const keyboardMatch = tuiSrc.match(/const localPaneActive = getLocalPaneActive\(\);[\s\S]*?handleNormalKey\(key\);/);
+    expect(keyboardMatch).not.toBeNull();
+    const block = keyboardMatch![0];
+    expect(block).toMatch(/if \(localPaneActive === false\) return/);
+    expect(block).toMatch(/if \(localPaneActive === null && !paneHasTerminalFocus\(\)\) return/);
   });
 });
 
