@@ -131,6 +131,19 @@ describe("TUI: q keystroke wiring", () => {
     expect(block).toMatch(/if \(localPaneActive === false\) return/);
     expect(block).toMatch(/if \(localPaneActive === null && !paneHasTerminalFocus\(\)\) return/);
   });
+
+  test("active sidebar keeps n/c wired to new-session creation", () => {
+    const normalKeyMatch = tuiSrc.match(/function handleNormalKey\(key: BufferedShortcutKey\) \{[\s\S]*?\n  \}/);
+    expect(normalKeyMatch).not.toBeNull();
+    const normalKeyHandler = normalKeyMatch![0];
+    expect(normalKeyHandler).toMatch(/case "n":\s*\n\s*case "c":\s*\n\s*createNewSession\(\)/);
+
+    const keyboardMatch = tuiSrc.match(/const localPaneActive = getLocalPaneActive\(\);[\s\S]*?handleNormalKey\(key\);/);
+    expect(keyboardMatch).not.toBeNull();
+    const keyboardGate = keyboardMatch![0];
+    expect(keyboardGate).toMatch(/if \(localPaneActive === false\) return/);
+    expect(keyboardGate).toMatch(/if \(handlePrintableBurstGuard\(key\)\) return;\s*\n\s*handleNormalKey\(key\)/);
+  });
 });
 
 describe("TUI: sessionizer sidebar restore", () => {

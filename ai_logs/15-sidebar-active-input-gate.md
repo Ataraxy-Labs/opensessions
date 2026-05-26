@@ -12,12 +12,14 @@ The previous guard marked a sidebar pane unfocused immediately after it programm
 
 The fix adds a direct `#{pane_active}` query for the TUI's own tmux pane. If tmux says the sidebar pane is active, shortcuts are accepted even if focus-event state is stale. If tmux says the pane is inactive, shortcuts are ignored. The old focus-event signal remains as a fallback when tmux active-state cannot be queried.
 
+Regression coverage also explicitly verifies that the normal key handler still routes `n`/`c` to `createNewSession()` after the active-pane gate, so the guard cannot silently break new-session creation again.
+
 ---
 
 ## Files Changed
 
 - `apps/tui/src/index.tsx` - Added `getLocalPaneActive()` and changed the keyboard gate to prefer tmux pane-active state.
-- `packages/runtime/test/close-sidebar.test.ts` - Added regression coverage for the pane-active keyboard gate.
+- `packages/runtime/test/close-sidebar.test.ts` - Added regression coverage for the pane-active keyboard gate and the reachable `n`/`c` new-session shortcut path.
 
 ---
 
