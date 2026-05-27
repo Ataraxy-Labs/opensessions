@@ -1542,6 +1542,27 @@ const GRUVBOX_DARK: Palette = Palette {
     surface2: Rgb::new(102, 92, 84),
 };
 
+const GRUVBOX_LIGHT: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(7, 102, 120),
+    lavender: Rgb::new(143, 63, 113),
+    pink: Rgb::new(177, 98, 134),
+    yellow: Rgb::new(181, 118, 20),
+    green: Rgb::new(121, 116, 14),
+    red: Rgb::new(157, 0, 6),
+    peach: Rgb::new(175, 58, 3),
+    teal: Rgb::new(66, 123, 88),
+    sky: Rgb::new(69, 133, 136),
+    text: Rgb::new(60, 56, 54),
+    subtext0: Rgb::new(80, 73, 69),
+    subtext1: Rgb::new(102, 92, 84),
+    overlay0: Rgb::new(168, 153, 132),
+    overlay1: Rgb::new(124, 111, 100),
+    surface1: Rgb::new(213, 196, 161),
+    surface2: Rgb::new(189, 174, 147),
+};
+
 const NORD: Palette = Palette {
     white: Rgb::new(255, 255, 255),
     black: Rgb::new(0, 0, 0),
@@ -1846,6 +1867,7 @@ pub const THEME_NAMES: &[&str] = &[
     "catppuccin-macchiato",
     "tokyo-night",
     "gruvbox-dark",
+    "gruvbox-light",
     "nord",
     "dracula",
     "github-dark",
@@ -1872,6 +1894,7 @@ pub fn palette_for_theme(name: Option<&str>) -> Palette {
         Some("catppuccin-macchiato") => CATPPUCCIN_MACCHIATO,
         Some("tokyo-night") => TOKYO_NIGHT,
         Some("gruvbox-dark") => GRUVBOX_DARK,
+        Some("gruvbox-light") => GRUVBOX_LIGHT,
         Some("nord") => NORD,
         Some("dracula") => DRACULA,
         Some("github-dark") => GITHUB_DARK,
