@@ -147,6 +147,19 @@ function localLinkText(link: SessionData["localLinks"][number]): string {
   }
 }
 
+function sessionDirLabel(dir: string, sessionName: string): string {
+  if (!dir) return "";
+
+  const parts = dir.replace(/\/+$/, "").split("/").filter(Boolean);
+  const name = parts[parts.length - 1] || "";
+  if (!name) return "";
+
+  if (name !== sessionName) return name;
+
+  const parent = parts[parts.length - 2];
+  return parent ? `${parent}/${name}` : name;
+}
+
 function wrapLocalLinks(links: SessionData["localLinks"], maxWidth: number): SessionData["localLinks"][] {
   if (links.length === 0) return [];
 
@@ -1840,12 +1853,7 @@ function SessionCard(props: SessionCardProps) {
   const truncBranch = () => props.session.branch ?? "";
 
   const dirName = () => {
-    const d = props.session.dir;
-    if (!d) return "";
-    const parts = d.replace(/\/+$/, "").split("/");
-    const name = parts[parts.length - 1] || "";
-    if (name === props.session.name) return "";
-    return name;
+    return sessionDirLabel(props.session.dir, props.session.name);
   };
 
   const portHint = () => {

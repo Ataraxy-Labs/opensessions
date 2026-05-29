@@ -146,6 +146,18 @@ describe("TUI: q keystroke wiring", () => {
   });
 });
 
+describe("TUI: session card directory label", () => {
+  const tuiPath = resolve(__dirname, "../../../apps/tui/src/index.tsx");
+  const tuiSrc = readFileSync(tuiPath, "utf-8");
+
+  test("keeps showing a directory label when the session name matches the directory basename", () => {
+    expect(tuiSrc).toMatch(/function sessionDirLabel\(dir: string, sessionName: string\): string/);
+    expect(tuiSrc).toMatch(/if \(name !== sessionName\) return name/);
+    expect(tuiSrc).toMatch(/return parent \? `\$\{parent\}\/\$\{name\}` : name/);
+    expect(tuiSrc).not.toMatch(/if \(name === props\.session\.name\) return ""/);
+  });
+});
+
 describe("TUI: sessionizer sidebar restore", () => {
   const tuiPath = resolve(__dirname, "../../../apps/tui/src/index.tsx");
   const tuiSrc = readFileSync(tuiPath, "utf-8");
