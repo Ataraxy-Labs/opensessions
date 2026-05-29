@@ -1838,6 +1838,48 @@ const SHADES_OF_PURPLE: Palette = Palette {
     surface2: Rgb::new(45, 43, 85),
 };
 
+const TOKYO_NIGHT_STORM: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(122, 162, 247),
+    lavender: Rgb::new(187, 154, 247),
+    pink: Rgb::new(187, 154, 247),
+    yellow: Rgb::new(224, 175, 104),
+    green: Rgb::new(158, 206, 106),
+    red: Rgb::new(247, 118, 142),
+    peach: Rgb::new(255, 158, 100),
+    teal: Rgb::new(115, 218, 202),
+    sky: Rgb::new(125, 207, 255),
+    text: Rgb::new(192, 202, 245),
+    subtext0: Rgb::new(169, 177, 214),
+    subtext1: Rgb::new(154, 165, 206),
+    overlay0: Rgb::new(78, 85, 117),
+    overlay1: Rgb::new(59, 66, 97),
+    surface1: Rgb::new(52, 58, 82),
+    surface2: Rgb::new(65, 72, 104),
+};
+
+const TANGO_ADAPTED: Palette = Palette {
+    white: Rgb::new(255, 255, 255),
+    black: Rgb::new(0, 0, 0),
+    blue: Rgb::new(0, 162, 255),
+    lavender: Rgb::new(193, 126, 204),
+    pink: Rgb::new(233, 167, 225),
+    yellow: Rgb::new(227, 190, 0),
+    green: Rgb::new(89, 214, 0),
+    red: Rgb::new(255, 0, 0),
+    peach: Rgb::new(206, 92, 0),
+    teal: Rgb::new(0, 208, 214),
+    sky: Rgb::new(136, 201, 255),
+    text: Rgb::new(0, 0, 0),
+    subtext0: Rgb::new(60, 60, 60),
+    subtext1: Rgb::new(85, 85, 85),
+    overlay0: Rgb::new(143, 146, 139),
+    overlay1: Rgb::new(192, 197, 187),
+    surface1: Rgb::new(220, 220, 220),
+    surface2: Rgb::new(200, 200, 200),
+};
+
 /// All built-in theme names, in display order. Used by the theme picker.
 pub const THEME_NAMES: &[&str] = &[
     "catppuccin-mocha",
@@ -1860,6 +1902,8 @@ pub const THEME_NAMES: &[&str] = &[
     "matrix",
     "transparent",
     "shades-of-purple",
+    "tokyo-night-storm",
+    "tango-adapted",
 ];
 
 /// Resolve a theme name to a built-in [`Palette`]. Unknown or missing names
@@ -1886,6 +1930,8 @@ pub fn palette_for_theme(name: Option<&str>) -> Palette {
         Some("matrix") => MATRIX,
         Some("transparent") => TRANSPARENT,
         Some("shades-of-purple") => SHADES_OF_PURPLE,
+        Some("tokyo-night-storm") => TOKYO_NIGHT_STORM,
+        Some("tango-adapted") => TANGO_ADAPTED,
         _ => CATPPUCCIN_MOCHA,
     }
 }
