@@ -659,7 +659,7 @@ impl MuxProvider for TmuxProvider {
         // Forcing `sh` keeps the launcher portable regardless of the user's
         // interactive shell. Single quotes in the session name are escaped.
         let inner = format!(
-            "OPENSESSIONS_SESSION_NAME={} OPENSESSIONS_WINDOW_ID={window_id} REFOCUS_WINDOW={window_id} exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
+            "OPENSESSIONS_SESSION_NAME=\"{}\" OPENSESSIONS_WINDOW_ID=\"{window_id}\" REFOCUS_WINDOW=\"{window_id}\" exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
             target.session_name,
         );
         let command = format!("sh -c '{}'", inner.replace('\'', r"'\''"));
