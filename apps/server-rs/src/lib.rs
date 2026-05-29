@@ -1669,6 +1669,12 @@ async fn run_agent_watcher_loop(
                     snapshots.len()
                 ));
                 for snapshot in &snapshots {
+                    // Track liveness only for keys the dedup cache (`last_seen`)
+                    // can hold — non-Idle — so the two maps stay consistent and
+                    // Idle keys do not linger in `last_seen_at`.
+                    if snapshot.status == AgentStatus::Idle {
+                        continue;
+                    }
                     last_seen_at.insert(agent_watcher_key(snapshot), now);
                 }
                 for snapshot in snapshots {
