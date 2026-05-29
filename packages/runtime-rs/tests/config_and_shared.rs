@@ -161,6 +161,30 @@ fn save_config_merges_with_existing_file_and_preserves_detail_heights() {
     fs::remove_dir_all(home).unwrap();
 }
 
+#[test]
+fn config_roundtrips_auto_theme_fields() {
+    let home = temp_home("auto-theme");
+    fs::create_dir_all(home.join(".config/opensessions")).unwrap();
+
+    save_config_to_home(
+        &home,
+        OpensessionsConfig {
+            auto_theme_follows_system: Some(true),
+            dark_theme: Some("tokyo-night-storm".into()),
+            light_theme: Some("tango-adapted".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let config = load_config_from_home(&home);
+    assert_eq!(config.auto_theme_follows_system, Some(true));
+    assert_eq!(config.dark_theme.as_deref(), Some("tokyo-night-storm"));
+    assert_eq!(config.light_theme.as_deref(), Some("tango-adapted"));
+
+    fs::remove_dir_all(home).unwrap();
+}
+
 fn temp_home(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "opensessions-runtime-rs-{name}-{}",
