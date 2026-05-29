@@ -316,7 +316,7 @@ fn tmux_provider_spawns_sidebar_against_edge_pane_and_titles_it() {
     assert_eq!(
         split_call.last().map(String::as_str),
         Some(
-            "OPENSESSIONS_SESSION_NAME=alpha OPENSESSIONS_WINDOW_ID=@1 REFOCUS_WINDOW=@1 exec \"${OPENSESSIONS_DIR:-.}\"//scripts/start.sh"
+            "sh -c 'OPENSESSIONS_SESSION_NAME=alpha OPENSESSIONS_WINDOW_ID=@1 REFOCUS_WINDOW=@1 exec \"${OPENSESSIONS_DIR:-.}\"//scripts/start.sh'"
         )
     );
     assert!(
