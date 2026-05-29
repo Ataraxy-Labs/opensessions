@@ -4,6 +4,10 @@ use crate::protocol::{AgentEvent, AgentLiveness, AgentStatus};
 
 const MAX_EVENT_TIMESTAMPS: usize = 30;
 const TERMINAL_PRUNE_MS: u64 = 5 * 60 * 1000;
+/// Hard cap for unseen terminal instances. They are normally kept (so the user
+/// can notice them) but must not accumulate forever, so they are pruned after
+/// this longer interval even while still unseen.
+const TERMINAL_HARD_PRUNE_MS: u64 = 15 * 60 * 1000;
 const SYNTHETIC_PANE_MARKER: &str = ":pane:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,21 +218,35 @@ impl AgentTracker {
         for session in sessions {
             let unseen_instances = self.unseen_instances.clone();
             let mut empty = false;
+            let mut cleared_unseen: Vec<String> = Vec::new();
             if let Some(session_instances) = self.instances.get_mut(&session) {
                 let keys = session_instances
                     .iter()
                     .filter(|(key, event)| {
-                        is_terminal_status(event.status)
-                            && !unseen_instances.contains(&format!("{session}\0{key}"))
-                            && event.liveness != Some(AgentLiveness::Alive)
-                            && now.saturating_sub(event.ts) > TERMINAL_PRUNE_MS
+                        if !is_terminal_status(event.status)
+                            || event.liveness == Some(AgentLiveness::Alive)
+                        {
+                            return false;
+                        }
+                        let age = now.saturating_sub(event.ts);
+                        if unseen_instances.contains(&format!("{session}\0{key}")) {
+                            // Unseen: keep until the longer hard cap.
+                            age > TERMINAL_HARD_PRUNE_MS
+                        } else {
+                            // Seen: prune at the normal interval.
+                            age > TERMINAL_PRUNE_MS
+                        }
                     })
                     .map(|(key, _)| key.clone())
                     .collect::<Vec<_>>();
                 for key in keys {
                     session_instances.remove(&key);
+                    cleared_unseen.push(format!("{session}\0{key}"));
                 }
                 empty = session_instances.is_empty();
+            }
+            for ukey in cleared_unseen {
+                self.unseen_instances.remove(&ukey);
             }
             if empty {
                 self.instances.remove(&session);
