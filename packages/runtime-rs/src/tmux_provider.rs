@@ -605,6 +605,8 @@ impl MuxProvider for TmuxProvider {
         let panes = self.client.list_panes(PaneScope::All);
         let mut window_pane_counts: HashMap<String, u32> = HashMap::new();
         let mut sidebars_by_window: HashMap<String, Vec<String>> = HashMap::new();
+        let mut window_session: HashMap<String, String> = HashMap::new();
+        let mut windows_by_session: HashMap<String, HashSet<String>> = HashMap::new();
         let mut seen_pane_ids = HashSet::new();
 
         for pane in panes {
@@ -614,6 +616,13 @@ impl MuxProvider for TmuxProvider {
             *window_pane_counts
                 .entry(pane.window_id.clone())
                 .or_insert(0) += 1;
+            window_session
+                .entry(pane.window_id.clone())
+                .or_insert_with(|| pane.session_name.clone());
+            windows_by_session
+                .entry(pane.session_name.clone())
+                .or_default()
+                .insert(pane.window_id.clone());
             if pane.title == "opensessions-sidebar" {
                 sidebars_by_window
                     .entry(pane.window_id)
@@ -624,8 +633,19 @@ impl MuxProvider for TmuxProvider {
 
         for (window_id, sidebars) in sidebars_by_window {
             if window_pane_counts.get(&window_id) == Some(&1) {
-                for pane_id in sidebars {
-                    self.client.kill_pane(&pane_id);
+                // The window holds only the sidebar. Killing it leaves the
+                // window with zero panes, destroying the window — and the
+                // session too if this is its last window. Only reclaim it when
+                // the session has other windows; otherwise keep the sidebar so
+                // closing the last work pane doesn't close the whole session.
+                let session_has_other_windows = window_session
+                    .get(&window_id)
+                    .and_then(|session| windows_by_session.get(session))
+                    .is_some_and(|windows| windows.len() > 1);
+                if session_has_other_windows {
+                    for pane_id in sidebars {
+                        self.client.kill_pane(&pane_id);
+                    }
                 }
                 continue;
             }
