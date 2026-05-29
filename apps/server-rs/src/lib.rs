@@ -488,6 +488,67 @@ fn server_home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
+/// Parse a PID from pid-file contents.
+pub fn parse_pid(contents: &str) -> Option<u32> {
+    contents.trim().parse().ok()
+}
+
+/// True if a process with `pid` is currently running, via a signal-0 probe
+/// (`kill(pid, 0)`): 0 means it exists and is signalable; `EPERM` means it
+/// exists but is owned by another user.
+pub fn pid_is_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// If `pid_file` names a live process, return its PID — another opensessions
+/// server already owns the port. A missing file or a stale (dead) PID yields
+/// `None`, so a crashed server's leftover pid file does not block startup.
+pub fn running_server_pid(pid_file: &Path) -> Option<u32> {
+    let contents = fs::read_to_string(pid_file).ok()?;
+    let pid = parse_pid(&contents)?;
+    pid_is_alive(pid).then_some(pid)
+}
+
+#[cfg(test)]
+mod singleton_tests {
+    use super::{parse_pid, pid_is_alive, running_server_pid};
+
+    #[test]
+    fn parse_pid_trims_and_rejects_garbage() {
+        assert_eq!(parse_pid(" 1234\n"), Some(1234));
+        assert_eq!(parse_pid("not-a-pid"), None);
+        assert_eq!(parse_pid(""), None);
+    }
+
+    #[test]
+    fn pid_is_alive_for_current_process_but_not_for_unused_pid() {
+        assert!(pid_is_alive(std::process::id()));
+        assert!(!pid_is_alive(999_999_999));
+    }
+
+    #[test]
+    fn running_server_pid_detects_live_and_ignores_stale() {
+        let dir = std::env::temp_dir().join(format!("os-singleton-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("server.pid");
+
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        assert_eq!(running_server_pid(&pid_file), Some(std::process::id()));
+
+        std::fs::write(&pid_file, "999999999").unwrap();
+        assert_eq!(running_server_pid(&pid_file), None);
+
+        std::fs::remove_file(&pid_file).unwrap();
+        assert_eq!(running_server_pid(&pid_file), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 impl StateSource for ReadOnlyMuxStateSource {
     fn start_background_tasks(
         self: Arc<Self>,
