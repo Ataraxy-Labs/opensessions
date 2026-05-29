@@ -248,7 +248,7 @@ fn tmux_provider_resolves_focuses_and_kills_agent_panes() {
 fn tmux_provider_kills_orphaned_and_duplicate_sidebar_panes() {
     let runner = Arc::new(RecordingRunner::new(HashMap::from([(
         "list-panes".to_string(),
-        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%1\talpha-2\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%2\tbeta\t@2\t0\t0\t1\t/dev/ttys2\t124\t/repo\tbash\tmain\t94\t24\t26\t119\n%3\tbeta\t@2\t0\t1\t0\t/dev/ttys3\t125\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%4\tbeta\t@2\t0\t2\t0\t/dev/ttys4\t126\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%5\t_os_stash\t@3\t0\t0\t1\t/dev/ttys5\t127\t/tmp\tzsh\topensessions-sidebar\t26\t24\t0\t25"
+        "%1\talpha\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%1\talpha-2\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%2\tbeta\t@2\t0\t0\t1\t/dev/ttys2\t124\t/repo\tbash\tmain\t94\t24\t26\t119\n%3\tbeta\t@2\t0\t1\t0\t/dev/ttys3\t125\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%4\tbeta\t@2\t0\t2\t0\t/dev/ttys4\t126\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%5\t_os_stash\t@3\t0\t0\t1\t/dev/ttys5\t127\t/tmp\tzsh\topensessions-sidebar\t26\t24\t0\t25\n%6\talpha\t@4\t0\t0\t1\t/dev/ttys6\t128\t/repo\tbash\tmain\t94\t24\t26\t119"
             .to_string(),
     )])));
     let provider = TmuxProvider::new(runner.clone());
@@ -277,6 +277,30 @@ fn tmux_provider_kills_orphaned_and_duplicate_sidebar_panes() {
             .iter()
             .any(|call| call == &vec!["kill-pane", "-t", "%5"]),
         "stash sidebars should be ignored"
+    );
+}
+
+#[test]
+fn tmux_provider_keeps_lone_sidebar_when_it_is_the_sessions_only_window() {
+    // A window containing only the sidebar, in a session that has no other
+    // window, must NOT be killed: doing so would leave the window with zero
+    // panes, destroying the session (closing the last work pane should not
+    // close the whole session).
+    let runner = Arc::new(RecordingRunner::new(HashMap::from([(
+        "list-panes".to_string(),
+        "%9\tsolo\t@9\t0\t0\t1\t/dev/ttys9\t130\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25"
+            .to_string(),
+    )])));
+    let provider = TmuxProvider::new(runner.clone());
+
+    provider.kill_orphaned_sidebar_panes();
+
+    let calls = runner.calls.lock().unwrap().clone();
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call == &vec!["kill-pane", "-t", "%9"]),
+        "a lone sidebar that is the session's only window must be kept (killing it would destroy the session)"
     );
 }
 
