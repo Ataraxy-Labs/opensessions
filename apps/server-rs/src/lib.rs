@@ -63,6 +63,9 @@ const GIT_CACHE_TTL_MS: u64 = 5_000;
 const PORT_POLL_INTERVAL_MS: u64 = 10_000;
 const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
+/// Drop an agent-watcher dedup entry after this long without its key appearing
+/// in a scan, keeping `last_seen` bounded on a long-running server.
+const AGENT_WATCHER_EVICT_MS: u64 = 15 * 60 * 1000;
 // Mirrors `USER_DRAG_SETTLE_MS` in `packages/runtime/src/server/index.ts`:
 // once a width-report is accepted the coordinator stays in UserDrag for this
 // many milliseconds, then the next snapshot tick clears it so the sidebar
@@ -1464,6 +1467,7 @@ async fn run_agent_watcher_loop(
     let mut interval = tokio::time::interval(Duration::from_millis(AGENT_WATCHER_POLL_MS));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
+    let mut last_seen_at = HashMap::<String, u64>::new();
 
     loop {
         tokio::select! {
@@ -1477,6 +1481,9 @@ async fn run_agent_watcher_loop(
                     "agent_watcher_loop: tick scanned {} snapshots",
                     snapshots.len()
                 ));
+                for snapshot in &snapshots {
+                    last_seen_at.insert(agent_watcher_key(snapshot), now);
+                }
                 for snapshot in snapshots {
                     if snapshot.status == AgentStatus::Idle {
                         continue;
@@ -1501,6 +1508,12 @@ async fn run_agent_watcher_loop(
                         ));
                     }
                 }
+                evict_stale_watcher_keys(
+                    &mut last_seen,
+                    &mut last_seen_at,
+                    now,
+                    AGENT_WATCHER_EVICT_MS,
+                );
             }
         }
     }
@@ -1533,6 +1546,52 @@ fn agent_watcher_key(snapshot: &AgentWatcherSnapshot) -> String {
             .or(snapshot.project_dir.as_deref())
             .unwrap_or_default(),
     )
+}
+
+/// Drop `last_seen` fingerprints whose key has not appeared in a scan within
+/// `evict_ms`. `last_seen_at` records the last scan time per key; both maps are
+/// pruned together so the agent-watcher dedup cache stays bounded.
+fn evict_stale_watcher_keys(
+    last_seen: &mut std::collections::HashMap<String, AgentWatcherFingerprint>,
+    last_seen_at: &mut std::collections::HashMap<String, u64>,
+    now: u64,
+    evict_ms: u64,
+) {
+    last_seen_at.retain(|_, seen_at| now.saturating_sub(*seen_at) < evict_ms);
+    last_seen.retain(|key, _| last_seen_at.contains_key(key));
+}
+
+#[cfg(test)]
+mod agent_watcher_eviction_tests {
+    use super::{evict_stale_watcher_keys, AgentStatus, AgentWatcherFingerprint};
+    use std::collections::HashMap;
+
+    fn fingerprint() -> AgentWatcherFingerprint {
+        AgentWatcherFingerprint {
+            status: AgentStatus::Running,
+            thread_name: None,
+            project_dir: None,
+        }
+    }
+
+    #[test]
+    fn evicts_keys_not_seen_within_window() {
+        let now = 100 * 60 * 1000;
+        let evict_ms = 15 * 60 * 1000;
+        let mut last_seen = HashMap::new();
+        last_seen.insert("stale".to_string(), fingerprint());
+        last_seen.insert("fresh".to_string(), fingerprint());
+        let mut last_seen_at = HashMap::new();
+        last_seen_at.insert("stale".to_string(), now - 16 * 60 * 1000);
+        last_seen_at.insert("fresh".to_string(), now - 5 * 60 * 1000);
+
+        evict_stale_watcher_keys(&mut last_seen, &mut last_seen_at, now, evict_ms);
+
+        assert!(!last_seen.contains_key("stale"), "stale key dropped from last_seen");
+        assert!(!last_seen_at.contains_key("stale"), "stale key dropped from last_seen_at");
+        assert!(last_seen.contains_key("fresh"), "fresh key retained in last_seen");
+        assert!(last_seen_at.contains_key("fresh"), "fresh timestamp retained");
+    }
 }
 
 fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {
