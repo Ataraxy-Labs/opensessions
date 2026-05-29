@@ -16,7 +16,9 @@ use opensessions_runtime::agent_watchers::{
     codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
     opencode_snapshot_from_row, parse_codex_session_index,
 };
-use opensessions_runtime::config::load_config_from_home;
+use opensessions_runtime::config::{
+    OpensessionsConfig, load_config_from_home, save_config_to_home,
+};
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
 use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
@@ -34,7 +36,8 @@ use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarWidth
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::system_theme::{
-    SystemAppearance, resolve_auto_theme, watch_mac_system_appearance,
+    SystemAppearance, ThemePersistSlot, manual_persist_slot, resolve_auto_theme,
+    watch_mac_system_appearance,
 };
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
@@ -315,6 +318,7 @@ pub struct ReadOnlyMuxStateSource {
     theme: Mutex<Option<String>>,
     current_appearance: Mutex<Option<SystemAppearance>>,
     auto_theme_following: AtomicBool,
+    config_home: Option<PathBuf>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
@@ -333,7 +337,9 @@ pub fn default_state_source_from_env(
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
         }
         let config = load_config_from_home(&server_home_dir());
-        source = source.with_auto_theme_follow(config.auto_theme_follows_system.unwrap_or(false));
+        source = source
+            .with_config_home(server_home_dir())
+            .with_auto_theme_follow(config.auto_theme_follows_system.unwrap_or(false));
         return Some(source);
     }
 
@@ -354,6 +360,7 @@ impl ReadOnlyMuxStateSource {
             theme: Mutex::new(None),
             current_appearance: Mutex::new(None),
             auto_theme_following: AtomicBool::new(false),
+            config_home: None,
             session_filter: Mutex::new(None),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
@@ -388,6 +395,14 @@ impl ReadOnlyMuxStateSource {
     /// tests stay hermetic). The real bootstrap sets this from config.
     pub fn with_auto_theme_follow(self, enabled: bool) -> Self {
         self.auto_theme_following.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    /// Directory whose `.config/opensessions/config.json` theme changes persist
+    /// to. Unset (the default) disables persistence so tests do not touch the
+    /// real config; the real bootstrap sets it to `$HOME`.
+    pub fn with_config_home(mut self, home: PathBuf) -> Self {
+        self.config_home = Some(home);
         self
     }
 
@@ -427,7 +442,10 @@ impl ReadOnlyMuxStateSource {
         state_updates: &broadcast::Sender<String>,
     ) {
         *self.current_appearance.lock().unwrap() = Some(mode);
-        let config = load_config_from_home(&server_home_dir());
+        let Some(home) = self.config_home.clone() else {
+            return;
+        };
+        let config = load_config_from_home(&home);
         let desired = resolve_auto_theme(mode, &config);
         let mut theme = self.theme.lock().unwrap();
         if theme.as_deref() == Some(desired.as_str()) {
@@ -436,6 +454,31 @@ impl ReadOnlyMuxStateSource {
         *theme = Some(desired);
         drop(theme);
         let _ = state_updates.send(self.snapshot_json());
+    }
+
+    /// Persist a manual theme choice to the appropriate config slot (per current
+    /// appearance when following). No-op when no config home is configured.
+    fn persist_theme_choice(&self, theme: &str) {
+        let Some(home) = self.config_home.clone() else {
+            return;
+        };
+        let following = self.auto_theme_following.load(Ordering::SeqCst);
+        let mode = *self.current_appearance.lock().unwrap();
+        let updates = match manual_persist_slot(following, mode) {
+            ThemePersistSlot::DarkTheme => OpensessionsConfig {
+                dark_theme: Some(theme.to_string()),
+                ..Default::default()
+            },
+            ThemePersistSlot::LightTheme => OpensessionsConfig {
+                light_theme: Some(theme.to_string()),
+                ..Default::default()
+            },
+            ThemePersistSlot::Theme => OpensessionsConfig {
+                theme: Some(serde_json::json!(theme)),
+                ..Default::default()
+            },
+        };
+        let _ = save_config_to_home(&home, updates);
     }
 }
 
@@ -638,7 +681,8 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "set-theme" => {
                 let theme = command.get("theme")?.as_str()?.to_string();
-                *self.theme.lock().unwrap() = Some(theme);
+                *self.theme.lock().unwrap() = Some(theme.clone());
+                self.persist_theme_choice(&theme);
                 Some(self.snapshot_json())
             }
             "set-filter" => {

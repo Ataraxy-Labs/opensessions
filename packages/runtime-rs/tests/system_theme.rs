@@ -80,3 +80,27 @@ fn resolve_auto_theme_uses_config_with_defaults() {
         "tango-adapted"
     );
 }
+
+#[test]
+fn manual_persist_slot_picks_per_appearance_when_following() {
+    use opensessions_runtime::system_theme::{manual_persist_slot, ThemePersistSlot};
+
+    // Not following → always the plain `theme` slot.
+    assert_eq!(
+        manual_persist_slot(false, Some(SystemAppearance::Dark)),
+        ThemePersistSlot::Theme
+    );
+    assert_eq!(manual_persist_slot(false, None), ThemePersistSlot::Theme);
+
+    // Following → per-appearance slot, so dark/light remember independently.
+    assert_eq!(
+        manual_persist_slot(true, Some(SystemAppearance::Dark)),
+        ThemePersistSlot::DarkTheme
+    );
+    assert_eq!(
+        manual_persist_slot(true, Some(SystemAppearance::Light)),
+        ThemePersistSlot::LightTheme
+    );
+    // Following but appearance not observed yet → fall back to `theme`.
+    assert_eq!(manual_persist_slot(true, None), ThemePersistSlot::Theme);
+}

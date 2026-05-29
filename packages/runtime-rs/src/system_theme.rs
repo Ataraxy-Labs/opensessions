@@ -34,6 +34,32 @@ pub fn resolve_auto_theme(mode: SystemAppearance, config: &OpensessionsConfig) -
     theme_for_system_mode(mode, dark, light)
 }
 
+/// Which config field a manual theme choice should persist to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePersistSlot {
+    Theme,
+    DarkTheme,
+    LightTheme,
+}
+
+/// When auto-follow is active, a manual theme choice persists to the
+/// appearance-specific slot (so the next poll does not overwrite it and dark /
+/// light remember independently); otherwise it persists to the plain `theme`
+/// slot. Falls back to `theme` if the appearance has not been observed yet.
+pub fn manual_persist_slot(
+    auto_following: bool,
+    current_mode: Option<SystemAppearance>,
+) -> ThemePersistSlot {
+    if !auto_following {
+        return ThemePersistSlot::Theme;
+    }
+    match current_mode {
+        Some(SystemAppearance::Dark) => ThemePersistSlot::DarkTheme,
+        Some(SystemAppearance::Light) => ThemePersistSlot::LightTheme,
+        None => ThemePersistSlot::Theme,
+    }
+}
+
 /// Read the current macOS Appearance. `defaults read -g AppleInterfaceStyle`
 /// prints "Dark" in dark mode and exits non-zero / empty in light mode (the key
 /// is absent), so both absent and unreadable map to Light. Never panics.
