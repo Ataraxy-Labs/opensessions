@@ -882,7 +882,7 @@ function App() {
   const isFocused = createSelector(focusedSession);
 
   return (
-    <box flexDirection="column" flexGrow={1} backgroundColor={P().crust}>
+    <box flexDirection="column" flexGrow={1} backgroundColor={P().base}>
       {/* Header */}
       <box flexDirection="column" paddingLeft={1} paddingTop={1} paddingBottom={0} flexShrink={0}>
         <text>

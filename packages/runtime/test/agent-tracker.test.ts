@@ -266,6 +266,27 @@ describe("AgentTracker", () => {
     expect(tracker.getState("sess-1")).not.toBeNull();
   });
 
+  test("pruneTerminal hard-prunes unseen terminal instances older than 15 min", () => {
+    const veryOldTs = Date.now() - 16 * 60 * 1000; // past TERMINAL_HARD_PRUNE_MS
+    tracker.applyEvent(event({ session: "sess-1", status: "done", ts: veryOldTs }));
+    // NOT marked seen — but old enough that hard cutoff should kick in
+
+    tracker.pruneTerminal();
+
+    expect(tracker.getState("sess-1")).toBeNull();
+  });
+
+  test("pruneTerminal clears unseen marker when hard-pruning", () => {
+    const veryOldTs = Date.now() - 16 * 60 * 1000;
+    tracker.applyEvent(event({ session: "sess-1", status: "done", ts: veryOldTs }));
+    expect(tracker.isUnseen("sess-1")).toBe(true);
+
+    tracker.pruneTerminal();
+
+    expect(tracker.isUnseen("sess-1")).toBe(false);
+    expect(tracker.getUnseen()).not.toContain("sess-1");
+  });
+
   // --- applyPanePresence ---
 
   describe("applyPanePresence", () => {

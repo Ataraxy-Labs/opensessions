@@ -352,6 +352,40 @@ const SHADES_OF_PURPLE: Theme = {
   icons: CATPPUCCIN_MOCHA.icons,
 };
 
+const TOKYO_NIGHT_STORM: Theme = {
+  palette: {
+    blue: "#7aa2f7", lavender: "#bb9af7", pink: "#bb9af7", mauve: "#bb9af7",
+    yellow: "#e0af68", green: "#9ece6a", red: "#f7768e", peach: "#ff9e64",
+    teal: "#73daca", sky: "#7dcfff",
+    text: "#c0caf5", subtext0: "#a9b1d6", subtext1: "#9aa5ce",
+    overlay0: "#4e5575", overlay1: "#3b4261",
+    surface0: "#292e42", surface1: "#343a52", surface2: "#414868",
+    base: "#24283b", mantle: "#1f2335", crust: "#1d202f",
+  },
+  status: {
+    idle: "#4e5575", running: "#e0af68", "tool-running": "#7dcfff", done: "#9ece6a",
+    error: "#f7768e", waiting: "#7aa2f7", interrupted: "#ff9e64", stale: "#e0af68",
+  },
+  icons: CATPPUCCIN_MOCHA.icons,
+};
+
+const TANGO_ADAPTED: Theme = {
+  palette: {
+    blue: "#00a2ff", lavender: "#c17ecc", pink: "#e9a7e1", mauve: "#c17ecc",
+    yellow: "#e3be00", green: "#59d600", red: "#ff0000", peach: "#ce5c00",
+    teal: "#00d0d6", sky: "#88c9ff",
+    text: "#000000", subtext0: "#3c3c3c", subtext1: "#555555",
+    overlay0: "#8f928b", overlay1: "#c0c5bb",
+    surface0: "#eaeaea", surface1: "#dcdcdc", surface2: "#c8c8c8",
+    base: "#ffffff", mantle: "#f6f6f4", crust: "#eaeaea",
+  },
+  status: {
+    idle: "#8f928b", running: "#b88800", "tool-running": "#0066cc", done: "#3d9400",
+    error: "#cc0000", waiting: "#0066cc", interrupted: "#cc5500", stale: "#b88800",
+  },
+  icons: CATPPUCCIN_MOCHA.icons,
+};
+
 export const BUILTIN_THEMES: Record<string, Theme> = {
   "catppuccin-mocha": CATPPUCCIN_MOCHA,
   "catppuccin-latte": CATPPUCCIN_LATTE,
@@ -373,6 +407,8 @@ export const BUILTIN_THEMES: Record<string, Theme> = {
   "matrix": MATRIX,
   "transparent": TRANSPARENT,
   "shades-of-purple": SHADES_OF_PURPLE,
+  "tango-adapted": TANGO_ADAPTED,
+  "tokyo-night-storm": TOKYO_NIGHT_STORM,
 };
 
 export const DEFAULT_THEME = "catppuccin-mocha";

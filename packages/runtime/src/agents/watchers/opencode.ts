@@ -136,6 +136,11 @@ const POLL_MS = 3000;
 const STALE_MS = 5 * 60 * 1000;
 /** How long a "running" session can go without DB updates before we assume the process died */
 const STUCK_MS = 15_000;
+/** Drop a session from the local snapshot Map after this long without a DB hit.
+ *  Independent of the tracker's own prune logic — this just keeps memory bounded
+ *  and ensures a reappearing session re-seeds cleanly rather than diffing against
+ *  a stale snapshot. */
+const LOCAL_EVICT_MS = 15 * 60 * 1000;
 
 // --- Status detection ---
 
@@ -310,7 +315,9 @@ export class OpenCodeAgentWatcher implements AgentWatcher {
       }
 
       // --- Incremental: detect changes via time_updated ---
+      const seenThisCycle = new Set<string>();
       for (const row of rows) {
+        seenThisCycle.add(row.id);
         const prev = this.sessions.get(row.id);
 
         if (prev && prev.lastTimestamp === row.time_updated) {
@@ -339,6 +346,16 @@ export class OpenCodeAgentWatcher implements AgentWatcher {
         // (new sessions appearing for the first time after seed don't emit)
         if (prev && (status !== prevStatus || prev.title !== row.title)) {
           this.emitStatus(row.id, snapshot);
+        }
+      }
+
+      // Evict locally-cached sessions whose DB row hasn't been touched in a long
+      // time. The tracker handles UI pruning separately; this just bounds memory
+      // and ensures reappearances re-seed cleanly.
+      for (const [sessionId, snapshot] of this.sessions) {
+        if (seenThisCycle.has(sessionId)) continue;
+        if (now - snapshot.lastGrowthAt >= LOCAL_EVICT_MS) {
+          this.sessions.delete(sessionId);
         }
       }
     } finally {

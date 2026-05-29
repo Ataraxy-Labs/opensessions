@@ -3,6 +3,7 @@ import { TERMINAL_STATUSES } from "../contracts/agent";
 
 const MAX_EVENT_TIMESTAMPS = 30;
 const TERMINAL_PRUNE_MS = 5 * 60 * 1000;
+const TERMINAL_HARD_PRUNE_MS = 15 * 60 * 1000;
 const SYNTHETIC_PANE_MARKER = ":pane:";
 
 const STATUS_PRIORITY: Record<string, number> = {
@@ -231,18 +232,23 @@ export class AgentTracker {
     }
   }
 
-  /** Auto-prune terminal instances older than timeout, but only if instance is not unseen or alive */
+  /** Auto-prune terminal instances. Two-tier:
+   *   - Seen + non-alive: prune after TERMINAL_PRUNE_MS (5 min).
+   *   - Unseen + non-alive: prune after TERMINAL_HARD_PRUNE_MS (15 min) regardless of unseen.
+   *   - Alive (pane-backed) instances are never pruned here — they're cleared via pane events. */
   pruneTerminal(): void {
     const now = Date.now();
     for (const [session, sessionInstances] of this.instances) {
       for (const [key, event] of sessionInstances) {
         if (!TERMINAL_STATUSES.has(event.status)) continue;
+        if (event.liveness === "alive") continue;
         const ukey = this.unseenKey(session, key);
-        if (this.unseenInstances.has(ukey)) continue; // Don't prune unseen — user hasn't looked yet
-        if (event.liveness === "alive") continue; // Don't prune agents backed by live panes
-        if (now - event.ts > TERMINAL_PRUNE_MS) {
-          sessionInstances.delete(key);
-        }
+        const age = now - event.ts;
+        const isUnseen = this.unseenInstances.has(ukey);
+        if (age <= TERMINAL_PRUNE_MS) continue;
+        if (isUnseen && age <= TERMINAL_HARD_PRUNE_MS) continue;
+        sessionInstances.delete(key);
+        this.unseenInstances.delete(ukey);
       }
       if (sessionInstances.size === 0) {
         this.instances.delete(session);
