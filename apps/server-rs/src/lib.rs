@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -15,6 +16,7 @@ use opensessions_runtime::agent_watchers::{
     codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
     opencode_snapshot_from_row, parse_codex_session_index,
 };
+use opensessions_runtime::config::load_config_from_home;
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
 use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
@@ -31,6 +33,9 @@ use opensessions_runtime::session_order::SessionOrder;
 use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarWidthReportInput};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
+use opensessions_runtime::system_theme::{
+    SystemAppearance, resolve_auto_theme, watch_mac_system_appearance,
+};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::frame::{FrameDiff, RenderedRows, diff_rows, render_rows};
@@ -308,6 +313,8 @@ pub struct ReadOnlyMuxStateSource {
     sidebar_width: Mutex<u32>,
     focused_session: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
+    current_appearance: Mutex<Option<SystemAppearance>>,
+    auto_theme_following: AtomicBool,
     session_filter: Mutex<Option<SessionFilterMode>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
@@ -325,6 +332,8 @@ pub fn default_state_source_from_env(
         if let Some(width) = env("OPENSESSIONS_WIDTH").and_then(|width| width.parse::<u16>().ok()) {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
         }
+        let config = load_config_from_home(&server_home_dir());
+        source = source.with_auto_theme_follow(config.auto_theme_follows_system.unwrap_or(false));
         return Some(source);
     }
 
@@ -343,6 +352,8 @@ impl ReadOnlyMuxStateSource {
             sidebar_width: Mutex::new(26),
             focused_session: Mutex::new(None),
             theme: Mutex::new(None),
+            current_appearance: Mutex::new(None),
+            auto_theme_following: AtomicBool::new(false),
             session_filter: Mutex::new(None),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
@@ -372,6 +383,66 @@ impl ReadOnlyMuxStateSource {
         self.git_command_runner = runner;
         self
     }
+
+    /// Enable the macOS system-appearance theme follower (off by default so
+    /// tests stay hermetic). The real bootstrap sets this from config.
+    pub fn with_auto_theme_follow(self, enabled: bool) -> Self {
+        self.auto_theme_following.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    /// Start the macOS appearance follower when enabled via
+    /// [`with_auto_theme_follow`](Self::with_auto_theme_follow). Returns a task
+    /// that stops the watcher on shutdown, or `None` when disabled. macOS-gated
+    /// via the watcher itself.
+    fn start_system_theme_follower(
+        self: Arc<Self>,
+        state_updates: broadcast::Sender<String>,
+        shutdown: broadcast::Sender<()>,
+    ) -> Option<JoinHandle<()>> {
+        if !self.auto_theme_following.load(Ordering::SeqCst) {
+            return None;
+        }
+
+        let source = self.clone();
+        let updates = state_updates.clone();
+        let watcher = watch_mac_system_appearance(
+            move |mode| source.on_system_appearance_change(mode, &updates),
+            Some(60_000),
+        );
+
+        let mut shutdown_rx = shutdown.subscribe();
+        Some(tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+            watcher.stop();
+        }))
+    }
+
+    /// Apply the configured dark/light theme for a new system appearance,
+    /// re-reading config each time so a manual override is honored, and
+    /// broadcast only when the active theme actually changes.
+    fn on_system_appearance_change(
+        &self,
+        mode: SystemAppearance,
+        state_updates: &broadcast::Sender<String>,
+    ) {
+        *self.current_appearance.lock().unwrap() = Some(mode);
+        let config = load_config_from_home(&server_home_dir());
+        let desired = resolve_auto_theme(mode, &config);
+        let mut theme = self.theme.lock().unwrap();
+        if theme.as_deref() == Some(desired.as_str()) {
+            return;
+        }
+        *theme = Some(desired);
+        drop(theme);
+        let _ = state_updates.send(self.snapshot_json());
+    }
+}
+
+fn server_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 impl StateSource for ReadOnlyMuxStateSource {
@@ -380,7 +451,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         state_updates: broadcast::Sender<String>,
         shutdown: broadcast::Sender<()>,
     ) -> Vec<JoinHandle<()>> {
-        vec![
+        let mut tasks = vec![
             tokio::spawn(run_agent_watcher_loop(
                 self.clone(),
                 state_updates.clone(),
@@ -391,8 +462,19 @@ impl StateSource for ReadOnlyMuxStateSource {
                 state_updates.clone(),
                 shutdown.clone(),
             )),
-            tokio::spawn(run_tmux_state_poll_loop(self, state_updates, shutdown)),
-        ]
+        ];
+        if let Some(task) = self
+            .clone()
+            .start_system_theme_follower(state_updates.clone(), shutdown.clone())
+        {
+            tasks.push(task);
+        }
+        tasks.push(tokio::spawn(run_tmux_state_poll_loop(
+            self,
+            state_updates,
+            shutdown,
+        )));
+        tasks
     }
 
     fn snapshot_json(&self) -> String {

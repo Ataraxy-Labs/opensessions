@@ -53,3 +53,30 @@ fn watcher_handle_stop_is_idempotent() {
     // On macOS the initial synchronous check fires once; on non-macOS, never.
     assert!(calls.load(Ordering::SeqCst) <= 1);
 }
+
+#[test]
+fn resolve_auto_theme_uses_config_with_defaults() {
+    use opensessions_runtime::config::OpensessionsConfig;
+    use opensessions_runtime::system_theme::resolve_auto_theme;
+
+    let mut config = OpensessionsConfig::default();
+    assert_eq!(
+        resolve_auto_theme(SystemAppearance::Dark, &config),
+        "catppuccin-mocha"
+    );
+    assert_eq!(
+        resolve_auto_theme(SystemAppearance::Light, &config),
+        "catppuccin-latte"
+    );
+
+    config.dark_theme = Some("tokyo-night-storm".into());
+    config.light_theme = Some("tango-adapted".into());
+    assert_eq!(
+        resolve_auto_theme(SystemAppearance::Dark, &config),
+        "tokyo-night-storm"
+    );
+    assert_eq!(
+        resolve_auto_theme(SystemAppearance::Light, &config),
+        "tango-adapted"
+    );
+}

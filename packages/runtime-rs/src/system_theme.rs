@@ -5,6 +5,8 @@
 //! push changes to the consumer. All functions are total and macOS-gated; on
 //! non-macOS platforms appearance is always [`SystemAppearance::Light`].
 
+use crate::config::OpensessionsConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemAppearance {
     Dark,
@@ -22,6 +24,14 @@ pub fn theme_for_system_mode(
         SystemAppearance::Dark => dark_theme.to_string(),
         SystemAppearance::Light => light_theme.to_string(),
     }
+}
+
+/// Resolve the theme to apply for the current appearance from config, using the
+/// TS defaults: dark -> catppuccin-mocha, light -> catppuccin-latte.
+pub fn resolve_auto_theme(mode: SystemAppearance, config: &OpensessionsConfig) -> String {
+    let dark = config.dark_theme.as_deref().unwrap_or("catppuccin-mocha");
+    let light = config.light_theme.as_deref().unwrap_or("catppuccin-latte");
+    theme_for_system_mode(mode, dark, light)
 }
 
 /// Read the current macOS Appearance. `defaults read -g AppleInterfaceStyle`
