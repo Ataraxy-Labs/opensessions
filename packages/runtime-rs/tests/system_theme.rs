@@ -32,3 +32,24 @@ fn read_appearance_is_total_and_returns_a_variant() {
     let mode = read_mac_system_appearance();
     assert!(matches!(mode, SystemAppearance::Dark | SystemAppearance::Light));
 }
+
+#[test]
+fn watcher_handle_stop_is_idempotent() {
+    use opensessions_runtime::system_theme::watch_mac_system_appearance;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let watcher = watch_mac_system_appearance(
+        move |_mode| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        },
+        Some(60_000),
+    );
+    watcher.stop();
+    watcher.stop(); // must not panic
+
+    // On macOS the initial synchronous check fires once; on non-macOS, never.
+    assert!(calls.load(Ordering::SeqCst) <= 1);
+}
