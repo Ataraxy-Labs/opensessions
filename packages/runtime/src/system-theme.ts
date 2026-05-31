@@ -85,10 +85,18 @@ export function watchMacSystemAppearance(
 
   async function check() {
     if (stopped) return;
-    const mode = await readMacSystemAppearance();
-    if (mode !== lastMode) {
-      lastMode = mode;
-      await onChange(mode);
+    // All three call sites invoke this as `void check()`, so any rejection
+    // (most plausibly from the consumer's onChange callback) would surface as
+    // an unhandled promise rejection. The appearance watch is best-effort —
+    // swallow so a failing callback can't take down the process.
+    try {
+      const mode = await readMacSystemAppearance();
+      if (mode !== lastMode) {
+        lastMode = mode;
+        await onChange(mode);
+      }
+    } catch {
+      // ignore — next file-watch event or safety poll will retry
     }
   }
 

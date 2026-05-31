@@ -2271,6 +2271,8 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   function cleanup() {
     for (const w of allWatchers) w.stop();
     if (debounceTimer) clearTimeout(debounceTimer);
+    if (broadcastDebounceTimer) clearTimeout(broadcastDebounceTimer);
+    if (refreshPaneAgentsTimer) clearTimeout(refreshPaneAgentsTimer);
     if (sidebarEnforceTimer) clearTimeout(sidebarEnforceTimer);
     clearClientResizeSyncTimer();
     clearProgrammaticAdjustmentTimer();
