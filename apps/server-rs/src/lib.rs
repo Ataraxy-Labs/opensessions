@@ -1243,6 +1243,10 @@ impl ReadOnlyMuxStateSource {
             return;
         };
         provider.switch_session(&name, client_tty);
+        // Move the sidebar highlight to the switched-to session, mirroring the
+        // move_focus path. Without this, Alt+digit switches the tmux session but
+        // the highlighted selection stays on the previously focused session.
+        *self.focused_session.lock().unwrap() = Some(name);
     }
 
     fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {

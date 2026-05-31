@@ -551,11 +551,16 @@ async fn websocket_switch_index_switches_to_visible_session() {
         .await
         .expect("refresh command should send");
 
-    let _ = timeout(Duration::from_secs(1), receiver.next())
+    let state = timeout(Duration::from_secs(1), receiver.next())
         .await
         .expect("refresh state should arrive before timeout")
         .expect("refresh state should arrive")
         .expect("refresh state should be valid");
+    let state_text = state.as_text().expect("state should be text");
+    assert!(
+        state_text.contains(r#""focusedSession":"worker""#),
+        "switch-index should move the sidebar highlight (focusedSession) to the switched-to session; got: {state_text}"
+    );
     assert_eq!(
         *mux.switch_calls.lock().unwrap(),
         vec![("worker".to_string(), None)]

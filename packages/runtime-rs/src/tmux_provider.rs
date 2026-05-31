@@ -605,6 +605,8 @@ impl MuxProvider for TmuxProvider {
         let panes = self.client.list_panes(PaneScope::All);
         let mut window_pane_counts: HashMap<String, u32> = HashMap::new();
         let mut sidebars_by_window: HashMap<String, Vec<String>> = HashMap::new();
+        let mut window_session: HashMap<String, String> = HashMap::new();
+        let mut windows_by_session: HashMap<String, HashSet<String>> = HashMap::new();
         let mut seen_pane_ids = HashSet::new();
 
         for pane in panes {
@@ -614,6 +616,13 @@ impl MuxProvider for TmuxProvider {
             *window_pane_counts
                 .entry(pane.window_id.clone())
                 .or_insert(0) += 1;
+            window_session
+                .entry(pane.window_id.clone())
+                .or_insert_with(|| pane.session_name.clone());
+            windows_by_session
+                .entry(pane.session_name.clone())
+                .or_default()
+                .insert(pane.window_id.clone());
             if pane.title == "opensessions-sidebar" {
                 sidebars_by_window
                     .entry(pane.window_id)
@@ -624,8 +633,19 @@ impl MuxProvider for TmuxProvider {
 
         for (window_id, sidebars) in sidebars_by_window {
             if window_pane_counts.get(&window_id) == Some(&1) {
-                for pane_id in sidebars {
-                    self.client.kill_pane(&pane_id);
+                // The window holds only the sidebar. Killing it leaves the
+                // window with zero panes, destroying the window — and the
+                // session too if this is its last window. Only reclaim it when
+                // the session has other windows; otherwise keep the sidebar so
+                // closing the last work pane doesn't close the whole session.
+                let session_has_other_windows = window_session
+                    .get(&window_id)
+                    .and_then(|session| windows_by_session.get(session))
+                    .is_some_and(|windows| windows.len() > 1);
+                if session_has_other_windows {
+                    for pane_id in sidebars {
+                        self.client.kill_pane(&pane_id);
+                    }
                 }
                 continue;
             }
@@ -652,10 +672,27 @@ impl MuxProvider for TmuxProvider {
         // pane works even when the parent pane's cwd is unrelated to the
         // workspace (e.g. tmux sessions whose default cwd is `$HOME`). Falls
         // back to the literal path if the env is unset.
-        let command = format!(
-            "OPENSESSIONS_SESSION_NAME={} OPENSESSIONS_WINDOW_ID={window_id} REFOCUS_WINDOW={window_id} exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
-            target.session_name,
+        //
+        // Wrap in `sh -c '...'`: tmux runs pane commands via the user's
+        // `default-command`/`default-shell`, which may be a non-POSIX shell
+        // (e.g. fish) that cannot parse `FOO=bar exec` or `${VAR:-default}`.
+        // Forcing `sh` keeps the launcher portable regardless of the user's
+        // interactive shell.
+        //
+        // Quoting is two-layered: the session name / window id sit inside
+        // double quotes (so `$`, backtick, `"` and `\` are still live to the
+        // inner `sh`), so escape those metacharacters first; then the whole
+        // `inner` is wrapped in single quotes for `sh -c`, with embedded single
+        // quotes escaped via the standard `'\''` dance. Without the inner
+        // escape a session name like `x"; rm -rf ~ #` would break out of the
+        // double quotes and inject commands.
+        let inner = format!(
+            "OPENSESSIONS_SESSION_NAME=\"{}\" OPENSESSIONS_WINDOW_ID=\"{}\" REFOCUS_WINDOW=\"{}\" exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
+            sh_double_quote_escape(&target.session_name),
+            sh_double_quote_escape(window_id),
+            sh_double_quote_escape(window_id),
         );
+        let command = format!("sh -c '{}'", inner.replace('\'', r"'\''"));
         let new_pane = self.client.split_sidebar_pane(
             &target.id,
             position == SidebarPosition::Left,
@@ -670,6 +707,18 @@ impl MuxProvider for TmuxProvider {
     fn get_all_pane_counts(&self) -> HashMap<String, u32> {
         self.client.get_all_pane_counts()
     }
+}
+
+/// Escape the characters that stay special inside a POSIX double-quoted
+/// string (`\`, `"`, `$`, backtick) so an untrusted value (e.g. a tmux session
+/// name) can be interpolated into `FOO="..."` without breaking out of the
+/// quotes or triggering command/parameter substitution. Backslash is escaped
+/// first so the backslashes added for the others are not doubled.
+fn sh_double_quote_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
 }
 
 fn session_format() -> &'static str {
