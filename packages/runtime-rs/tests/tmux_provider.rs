@@ -351,6 +351,80 @@ fn tmux_provider_spawns_sidebar_against_edge_pane_and_titles_it() {
 }
 
 #[test]
+fn tmux_provider_escapes_shell_metacharacters_in_session_name() {
+    // spawn_sidebar takes the session name from the target pane's listing, so
+    // the untrusted value lives in the list-panes mock (field 2). A name
+    // carrying double quotes, `$` and a backtick must not break out of the
+    // `OPENSESSIONS_SESSION_NAME="..."` double quotes and inject commands.
+    let evil = r#"x"; touch /tmp/pwned; $(id)`whoami`"#;
+    let runner = Arc::new(RecordingRunner::new(HashMap::from([
+        (
+            "list-panes".to_string(),
+            format!("%1\t{evil}\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tbash\tmain\t80\t24\t0\t79"),
+        ),
+        (
+            "split-window".to_string(),
+            format!("%9\t{evil}\t@1\t0\t1\t0\t/dev/ttys9\t999\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25"),
+        ),
+    ])));
+    let provider = TmuxProvider::new(runner.clone());
+
+    provider.spawn_sidebar("ignored", "@1", 26, SidebarPosition::Left, "/scripts");
+
+    let calls = runner.calls.lock().unwrap().clone();
+    let split_call = calls
+        .iter()
+        .find(|call| call.first().map(String::as_str) == Some("split-window"))
+        .expect("split-window should be called");
+    let command = split_call.last().map(String::as_str).unwrap();
+
+    // Every metacharacter is backslash-escaped inside the double quotes.
+    assert!(
+        command.contains(r#"OPENSESSIONS_SESSION_NAME="x\"; touch /tmp/pwned; \$(id)\`whoami\`""#),
+        "session name not safely escaped: {command}"
+    );
+    // The raw, unescaped breakout sequence must never appear.
+    assert!(
+        !command.contains(r#"="x"; touch"#),
+        "unescaped double quote broke out of the assignment: {command}"
+    );
+}
+
+#[test]
+fn tmux_provider_escapes_single_quotes_in_session_name() {
+    // Single quotes are inert inside the inner double quotes but must survive
+    // the outer `sh -c '...'` wrap via the `'\''` dance.
+    let runner = Arc::new(RecordingRunner::new(HashMap::from([
+        (
+            "list-panes".to_string(),
+            "%1\to'brien\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tbash\tmain\t80\t24\t0\t79"
+                .to_string(),
+        ),
+        (
+            "split-window".to_string(),
+            "%9\to'brien\t@1\t0\t1\t0\t/dev/ttys9\t999\t/repo\tzsh\topensessions-sidebar\t26\t24\t0\t25"
+                .to_string(),
+        ),
+    ])));
+    let provider = TmuxProvider::new(runner.clone());
+
+    provider.spawn_sidebar("ignored", "@1", 26, SidebarPosition::Left, "/scripts");
+
+    let calls = runner.calls.lock().unwrap().clone();
+    let command = calls
+        .iter()
+        .find(|call| call.first().map(String::as_str) == Some("split-window"))
+        .and_then(|call| call.last())
+        .cloned()
+        .expect("split-window should be called");
+
+    assert_eq!(
+        command,
+        r#"sh -c 'OPENSESSIONS_SESSION_NAME="o'\''brien" OPENSESSIONS_WINDOW_ID="@1" REFOCUS_WINDOW="@1" exec "${OPENSESSIONS_DIR:-.}"//scripts/start.sh'"#
+    );
+}
+
+#[test]
 fn std_command_runner_executes_tmux_binary_and_captures_output() {
     let runner = StdCommandRunner::new("printf");
     let output = runner.run(&["hello".to_string()]);

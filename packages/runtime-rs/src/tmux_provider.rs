@@ -677,10 +677,20 @@ impl MuxProvider for TmuxProvider {
         // `default-command`/`default-shell`, which may be a non-POSIX shell
         // (e.g. fish) that cannot parse `FOO=bar exec` or `${VAR:-default}`.
         // Forcing `sh` keeps the launcher portable regardless of the user's
-        // interactive shell. Single quotes in the session name are escaped.
+        // interactive shell.
+        //
+        // Quoting is two-layered: the session name / window id sit inside
+        // double quotes (so `$`, backtick, `"` and `\` are still live to the
+        // inner `sh`), so escape those metacharacters first; then the whole
+        // `inner` is wrapped in single quotes for `sh -c`, with embedded single
+        // quotes escaped via the standard `'\''` dance. Without the inner
+        // escape a session name like `x"; rm -rf ~ #` would break out of the
+        // double quotes and inject commands.
         let inner = format!(
-            "OPENSESSIONS_SESSION_NAME=\"{}\" OPENSESSIONS_WINDOW_ID=\"{window_id}\" REFOCUS_WINDOW=\"{window_id}\" exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
-            target.session_name,
+            "OPENSESSIONS_SESSION_NAME=\"{}\" OPENSESSIONS_WINDOW_ID=\"{}\" REFOCUS_WINDOW=\"{}\" exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
+            sh_double_quote_escape(&target.session_name),
+            sh_double_quote_escape(window_id),
+            sh_double_quote_escape(window_id),
         );
         let command = format!("sh -c '{}'", inner.replace('\'', r"'\''"));
         let new_pane = self.client.split_sidebar_pane(
@@ -697,6 +707,18 @@ impl MuxProvider for TmuxProvider {
     fn get_all_pane_counts(&self) -> HashMap<String, u32> {
         self.client.get_all_pane_counts()
     }
+}
+
+/// Escape the characters that stay special inside a POSIX double-quoted
+/// string (`\`, `"`, `$`, backtick) so an untrusted value (e.g. a tmux session
+/// name) can be interpolated into `FOO="..."` without breaking out of the
+/// quotes or triggering command/parameter substitution. Backslash is escaped
+/// first so the backslashes added for the others are not doubled.
+fn sh_double_quote_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
 }
 
 fn session_format() -> &'static str {
