@@ -21,6 +21,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 sha1_smol = { version = "1", default-features = false }
+libc = "0.2.186"
 
 [dev-dependencies]
 http = "1"

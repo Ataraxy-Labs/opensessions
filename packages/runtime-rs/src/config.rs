@@ -36,6 +36,15 @@ pub struct OpensessionsConfig {
     pub detail_panel_heights: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
+    /// macOS only: automatically follow the system Appearance and switch themes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_theme_follows_system: Option<bool>,
+    /// Theme applied when the macOS system Appearance is Dark (default: catppuccin-mocha).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark_theme: Option<String>,
+    /// Theme applied when the macOS system Appearance is Light (default: catppuccin-latte).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_theme: Option<String>,
 }
 
 pub fn config_path_from_home(home: &Path) -> PathBuf {
@@ -105,6 +114,13 @@ fn update_map(updates: OpensessionsConfig) -> Map<String, Value> {
         );
     }
     insert_option(&mut map, "sessionFilter", updates.session_filter);
+    insert_option(
+        &mut map,
+        "autoThemeFollowsSystem",
+        updates.auto_theme_follows_system,
+    );
+    insert_option(&mut map, "darkTheme", updates.dark_theme);
+    insert_option(&mut map, "lightTheme", updates.light_theme);
 
     map
 }

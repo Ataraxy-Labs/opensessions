@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -14,6 +15,9 @@ use opensessions_runtime::agent_watchers::{
     AgentWatcherSnapshot, amp_snapshot_from_thread_json, claude_code_snapshot_from_jsonl,
     codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
     opencode_snapshot_from_row, parse_codex_session_index,
+};
+use opensessions_runtime::config::{
+    OpensessionsConfig, load_config_from_home, save_config_to_home,
 };
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
@@ -31,6 +35,10 @@ use opensessions_runtime::session_order::SessionOrder;
 use opensessions_runtime::sidebar_coordinator::{SidebarCoordinator, SidebarWidthReportInput};
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
+use opensessions_runtime::system_theme::{
+    SystemAppearance, ThemePersistSlot, manual_persist_slot, resolve_auto_theme,
+    watch_mac_system_appearance,
+};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::frame::{FrameDiff, RenderedRows, diff_rows, render_rows};
@@ -63,6 +71,9 @@ const GIT_CACHE_TTL_MS: u64 = 5_000;
 const PORT_POLL_INTERVAL_MS: u64 = 10_000;
 const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
+/// Drop an agent-watcher dedup entry after this long without its key appearing
+/// in a scan, keeping `last_seen` bounded on a long-running server.
+const AGENT_WATCHER_EVICT_MS: u64 = 15 * 60 * 1000;
 // Mirrors `USER_DRAG_SETTLE_MS` in `packages/runtime/src/server/index.ts`:
 // once a width-report is accepted the coordinator stays in UserDrag for this
 // many milliseconds, then the next snapshot tick clears it so the sidebar
@@ -305,6 +316,9 @@ pub struct ReadOnlyMuxStateSource {
     sidebar_width: Mutex<u32>,
     focused_session: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
+    current_appearance: Mutex<Option<SystemAppearance>>,
+    auto_theme_following: AtomicBool,
+    config_home: Option<PathBuf>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
@@ -322,6 +336,10 @@ pub fn default_state_source_from_env(
         if let Some(width) = env("OPENSESSIONS_WIDTH").and_then(|width| width.parse::<u16>().ok()) {
             source = source.with_sidebar_width(clamp_sidebar_width(width) as u32);
         }
+        let config = load_config_from_home(&server_home_dir());
+        source = source
+            .with_config_home(server_home_dir())
+            .with_auto_theme_follow(config.auto_theme_follows_system.unwrap_or(false));
         return Some(source);
     }
 
@@ -340,6 +358,9 @@ impl ReadOnlyMuxStateSource {
             sidebar_width: Mutex::new(26),
             focused_session: Mutex::new(None),
             theme: Mutex::new(None),
+            current_appearance: Mutex::new(None),
+            auto_theme_following: AtomicBool::new(false),
+            config_home: None,
             session_filter: Mutex::new(None),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
@@ -369,6 +390,163 @@ impl ReadOnlyMuxStateSource {
         self.git_command_runner = runner;
         self
     }
+
+    /// Enable the macOS system-appearance theme follower (off by default so
+    /// tests stay hermetic). The real bootstrap sets this from config.
+    pub fn with_auto_theme_follow(self, enabled: bool) -> Self {
+        self.auto_theme_following.store(enabled, Ordering::SeqCst);
+        self
+    }
+
+    /// Directory whose `.config/opensessions/config.json` theme changes persist
+    /// to. Unset (the default) disables persistence so tests do not touch the
+    /// real config; the real bootstrap sets it to `$HOME`.
+    pub fn with_config_home(mut self, home: PathBuf) -> Self {
+        self.config_home = Some(home);
+        self
+    }
+
+    /// Start the macOS appearance follower when enabled via
+    /// [`with_auto_theme_follow`](Self::with_auto_theme_follow). Returns a task
+    /// that stops the watcher on shutdown, or `None` when disabled. macOS-gated
+    /// via the watcher itself.
+    fn start_system_theme_follower(
+        self: Arc<Self>,
+        state_updates: broadcast::Sender<String>,
+        shutdown: broadcast::Sender<()>,
+    ) -> Option<JoinHandle<()>> {
+        if !self.auto_theme_following.load(Ordering::SeqCst) {
+            return None;
+        }
+
+        let source = self.clone();
+        let updates = state_updates.clone();
+        let watcher = watch_mac_system_appearance(
+            move |mode| source.on_system_appearance_change(mode, &updates),
+            Some(60_000),
+        );
+
+        let mut shutdown_rx = shutdown.subscribe();
+        Some(tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+            watcher.stop();
+        }))
+    }
+
+    /// Apply the configured dark/light theme for a new system appearance,
+    /// re-reading config each time so a manual override is honored, and
+    /// broadcast only when the active theme actually changes.
+    fn on_system_appearance_change(
+        &self,
+        mode: SystemAppearance,
+        state_updates: &broadcast::Sender<String>,
+    ) {
+        *self.current_appearance.lock().unwrap() = Some(mode);
+        let Some(home) = self.config_home.clone() else {
+            return;
+        };
+        let config = load_config_from_home(&home);
+        let desired = resolve_auto_theme(mode, &config);
+        let mut theme = self.theme.lock().unwrap();
+        if theme.as_deref() == Some(desired.as_str()) {
+            return;
+        }
+        *theme = Some(desired);
+        drop(theme);
+        let _ = state_updates.send(self.snapshot_json());
+    }
+
+    /// Persist a manual theme choice to the appropriate config slot (per current
+    /// appearance when following). No-op when no config home is configured.
+    fn persist_theme_choice(&self, theme: &str) {
+        let Some(home) = self.config_home.clone() else {
+            return;
+        };
+        let following = self.auto_theme_following.load(Ordering::SeqCst);
+        let mode = *self.current_appearance.lock().unwrap();
+        let updates = match manual_persist_slot(following, mode) {
+            ThemePersistSlot::DarkTheme => OpensessionsConfig {
+                dark_theme: Some(theme.to_string()),
+                ..Default::default()
+            },
+            ThemePersistSlot::LightTheme => OpensessionsConfig {
+                light_theme: Some(theme.to_string()),
+                ..Default::default()
+            },
+            ThemePersistSlot::Theme => OpensessionsConfig {
+                theme: Some(serde_json::json!(theme)),
+                ..Default::default()
+            },
+        };
+        let _ = save_config_to_home(&home, updates);
+    }
+}
+
+fn server_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// Parse a PID from pid-file contents.
+pub fn parse_pid(contents: &str) -> Option<u32> {
+    contents.trim().parse().ok()
+}
+
+/// True if a process with `pid` is currently running, via a signal-0 probe
+/// (`kill(pid, 0)`): 0 means it exists and is signalable; `EPERM` means it
+/// exists but is owned by another user.
+pub fn pid_is_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// If `pid_file` names a live process, return its PID — another opensessions
+/// server already owns the port. A missing file or a stale (dead) PID yields
+/// `None`, so a crashed server's leftover pid file does not block startup.
+pub fn running_server_pid(pid_file: &Path) -> Option<u32> {
+    let contents = fs::read_to_string(pid_file).ok()?;
+    let pid = parse_pid(&contents)?;
+    pid_is_alive(pid).then_some(pid)
+}
+
+#[cfg(test)]
+mod singleton_tests {
+    use super::{parse_pid, pid_is_alive, running_server_pid};
+
+    #[test]
+    fn parse_pid_trims_and_rejects_garbage() {
+        assert_eq!(parse_pid(" 1234\n"), Some(1234));
+        assert_eq!(parse_pid("not-a-pid"), None);
+        assert_eq!(parse_pid(""), None);
+    }
+
+    #[test]
+    fn pid_is_alive_for_current_process_but_not_for_unused_pid() {
+        assert!(pid_is_alive(std::process::id()));
+        assert!(!pid_is_alive(999_999_999));
+    }
+
+    #[test]
+    fn running_server_pid_detects_live_and_ignores_stale() {
+        let dir = std::env::temp_dir().join(format!("os-singleton-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("server.pid");
+
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        assert_eq!(running_server_pid(&pid_file), Some(std::process::id()));
+
+        std::fs::write(&pid_file, "999999999").unwrap();
+        assert_eq!(running_server_pid(&pid_file), None);
+
+        std::fs::remove_file(&pid_file).unwrap();
+        assert_eq!(running_server_pid(&pid_file), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 impl StateSource for ReadOnlyMuxStateSource {
@@ -377,7 +555,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         state_updates: broadcast::Sender<String>,
         shutdown: broadcast::Sender<()>,
     ) -> Vec<JoinHandle<()>> {
-        vec![
+        let mut tasks = vec![
             tokio::spawn(run_agent_watcher_loop(
                 self.clone(),
                 state_updates.clone(),
@@ -388,8 +566,19 @@ impl StateSource for ReadOnlyMuxStateSource {
                 state_updates.clone(),
                 shutdown.clone(),
             )),
-            tokio::spawn(run_tmux_state_poll_loop(self, state_updates, shutdown)),
-        ]
+        ];
+        if let Some(task) = self
+            .clone()
+            .start_system_theme_follower(state_updates.clone(), shutdown.clone())
+        {
+            tasks.push(task);
+        }
+        tasks.push(tokio::spawn(run_tmux_state_poll_loop(
+            self,
+            state_updates,
+            shutdown,
+        )));
+        tasks
     }
 
     fn snapshot_json(&self) -> String {
@@ -553,7 +742,8 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "set-theme" => {
                 let theme = command.get("theme")?.as_str()?.to_string();
-                *self.theme.lock().unwrap() = Some(theme);
+                *self.theme.lock().unwrap() = Some(theme.clone());
+                self.persist_theme_choice(&theme);
                 Some(self.snapshot_json())
             }
             "set-filter" => {
@@ -1243,6 +1433,10 @@ impl ReadOnlyMuxStateSource {
             return;
         };
         provider.switch_session(&name, client_tty);
+        // Move the sidebar highlight to the switched-to session, mirroring the
+        // move_focus path. Without this, Alt+digit switches the tmux session but
+        // the highlighted selection stays on the previously focused session.
+        *self.focused_session.lock().unwrap() = Some(name);
     }
 
     fn move_focus(&self, delta: i64, current_session: Option<&str>) -> Option<String> {
@@ -1464,6 +1658,7 @@ async fn run_agent_watcher_loop(
     let mut interval = tokio::time::interval(Duration::from_millis(AGENT_WATCHER_POLL_MS));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
+    let mut last_seen_at = HashMap::<String, u64>::new();
 
     loop {
         tokio::select! {
@@ -1477,6 +1672,15 @@ async fn run_agent_watcher_loop(
                     "agent_watcher_loop: tick scanned {} snapshots",
                     snapshots.len()
                 ));
+                for snapshot in &snapshots {
+                    // Track liveness only for keys the dedup cache (`last_seen`)
+                    // can hold — non-Idle — so the two maps stay consistent and
+                    // Idle keys do not linger in `last_seen_at`.
+                    if snapshot.status == AgentStatus::Idle {
+                        continue;
+                    }
+                    last_seen_at.insert(agent_watcher_key(snapshot), now);
+                }
                 for snapshot in snapshots {
                     if snapshot.status == AgentStatus::Idle {
                         continue;
@@ -1501,6 +1705,12 @@ async fn run_agent_watcher_loop(
                         ));
                     }
                 }
+                evict_stale_watcher_keys(
+                    &mut last_seen,
+                    &mut last_seen_at,
+                    now,
+                    AGENT_WATCHER_EVICT_MS,
+                );
             }
         }
     }
@@ -1533,6 +1743,52 @@ fn agent_watcher_key(snapshot: &AgentWatcherSnapshot) -> String {
             .or(snapshot.project_dir.as_deref())
             .unwrap_or_default(),
     )
+}
+
+/// Drop `last_seen` fingerprints whose key has not appeared in a scan within
+/// `evict_ms`. `last_seen_at` records the last scan time per key; both maps are
+/// pruned together so the agent-watcher dedup cache stays bounded.
+fn evict_stale_watcher_keys(
+    last_seen: &mut std::collections::HashMap<String, AgentWatcherFingerprint>,
+    last_seen_at: &mut std::collections::HashMap<String, u64>,
+    now: u64,
+    evict_ms: u64,
+) {
+    last_seen_at.retain(|_, seen_at| now.saturating_sub(*seen_at) < evict_ms);
+    last_seen.retain(|key, _| last_seen_at.contains_key(key));
+}
+
+#[cfg(test)]
+mod agent_watcher_eviction_tests {
+    use super::{evict_stale_watcher_keys, AgentStatus, AgentWatcherFingerprint};
+    use std::collections::HashMap;
+
+    fn fingerprint() -> AgentWatcherFingerprint {
+        AgentWatcherFingerprint {
+            status: AgentStatus::Running,
+            thread_name: None,
+            project_dir: None,
+        }
+    }
+
+    #[test]
+    fn evicts_keys_not_seen_within_window() {
+        let now = 100 * 60 * 1000;
+        let evict_ms = 15 * 60 * 1000;
+        let mut last_seen = HashMap::new();
+        last_seen.insert("stale".to_string(), fingerprint());
+        last_seen.insert("fresh".to_string(), fingerprint());
+        let mut last_seen_at = HashMap::new();
+        last_seen_at.insert("stale".to_string(), now - 16 * 60 * 1000);
+        last_seen_at.insert("fresh".to_string(), now - 5 * 60 * 1000);
+
+        evict_stale_watcher_keys(&mut last_seen, &mut last_seen_at, now, evict_ms);
+
+        assert!(!last_seen.contains_key("stale"), "stale key dropped from last_seen");
+        assert!(!last_seen_at.contains_key("stale"), "stale key dropped from last_seen_at");
+        assert!(last_seen.contains_key("fresh"), "fresh key retained in last_seen");
+        assert!(last_seen_at.contains_key("fresh"), "fresh timestamp retained");
+    }
 }
 
 fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {

@@ -2,7 +2,7 @@ use opensessions_sidebar::app::App;
 use opensessions_sidebar::generated::protocol::{
     ClientCommand, ServerMessage, ServerState, SessionFilterMode,
 };
-use opensessions_sidebar::renderer::palette_for_theme;
+use opensessions_sidebar::renderer::{palette_for_theme, Rgb};
 use opensessions_sidebar::snapshot::{buffer_to_ansi, render_to_buffer};
 
 fn empty_state(theme: Option<&str>) -> ServerState {
@@ -106,4 +106,22 @@ fn rendered_output_uses_active_theme_palette_for_focused_session_text() {
         latte_ansi.contains(&latte_text_sgr),
         "latte rendering must emit the latte text color SGR escape; got latte text fg: {latte_text_sgr:?}"
     );
+}
+
+#[test]
+fn tokyo_night_storm_resolves_to_distinct_palette() {
+    let storm = palette_for_theme(Some("tokyo-night-storm"));
+    let night = palette_for_theme(Some("tokyo-night"));
+    let default = palette_for_theme(None);
+    assert_ne!(storm, default, "tokyo-night-storm must be a real entry, not the default fallback");
+    assert_ne!(storm, night, "tokyo-night-storm must differ from base tokyo-night");
+}
+
+#[test]
+fn tango_adapted_is_a_distinct_light_palette() {
+    let tango = palette_for_theme(Some("tango-adapted"));
+    let default = palette_for_theme(None);
+    assert_ne!(tango, default, "tango-adapted must be a real entry, not the default fallback");
+    // Light theme: near-black text on a light background.
+    assert_eq!(tango.text, Rgb::new(0, 0, 0), "tango-adapted text is black");
 }

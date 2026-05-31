@@ -14,6 +14,7 @@ pub mod session_order;
 pub mod shared;
 pub mod sidebar_coordinator;
 pub mod sidebar_width_sync;
+pub mod system_theme;
 pub mod tmux_provider;
 pub mod tracker;
 pub mod watch_plan;

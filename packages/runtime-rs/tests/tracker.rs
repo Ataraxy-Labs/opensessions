@@ -235,6 +235,71 @@ fn synthetic_pane_entry_merges_when_watcher_event_arrives_for_same_thread() {
     assert_eq!(agents[0].liveness, Some(AgentLiveness::Alive));
 }
 
+#[test]
+fn prune_terminal_hard_prunes_unseen_after_15min() {
+    let mut tracker = AgentTracker::new();
+    tracker.apply_event(event_at(
+        "sess-1",
+        "claude-code",
+        AgentStatus::Done,
+        now_ms() - 16 * 60 * 1000,
+    ));
+    assert!(tracker.is_unseen("sess-1"));
+
+    tracker.prune_terminal();
+
+    assert_eq!(
+        tracker.get_agents("sess-1"),
+        Vec::<AgentEvent>::new(),
+        "a 16-min-old unseen terminal instance must be hard-pruned"
+    );
+    assert!(
+        !tracker.is_unseen("sess-1"),
+        "the unseen flag must be cleared when an instance is hard-pruned"
+    );
+}
+
+#[test]
+fn prune_terminal_keeps_unseen_under_15min() {
+    let mut tracker = AgentTracker::new();
+    tracker.apply_event(event_at(
+        "sess-1",
+        "claude-code",
+        AgentStatus::Done,
+        now_ms() - 10 * 60 * 1000,
+    ));
+    assert!(tracker.is_unseen("sess-1"));
+
+    tracker.prune_terminal();
+
+    assert_eq!(
+        tracker.get_agents("sess-1").len(),
+        1,
+        "a 10-min-old unseen terminal instance must survive (under the 15-min hard cap)"
+    );
+}
+
+#[test]
+fn prune_terminal_prunes_seen_after_5min() {
+    let mut tracker = AgentTracker::new();
+    tracker.apply_event(event_at(
+        "sess-1",
+        "claude-code",
+        AgentStatus::Done,
+        now_ms() - 6 * 60 * 1000,
+    ));
+    tracker.mark_seen("sess-1");
+    assert!(!tracker.is_unseen("sess-1"));
+
+    tracker.prune_terminal();
+
+    assert_eq!(
+        tracker.get_agents("sess-1"),
+        Vec::<AgentEvent>::new(),
+        "a 6-min-old seen terminal instance must be pruned at the 5-min tier"
+    );
+}
+
 fn event(session: &str, agent: &str, status: AgentStatus) -> AgentEvent {
     event_at(session, agent, status, now_ms())
 }
