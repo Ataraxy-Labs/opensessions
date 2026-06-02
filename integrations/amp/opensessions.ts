@@ -134,6 +134,12 @@ function resolveServerPort(): number {
       const port = 22000 + key;
       if (port > 0 && port <= 65535) return port;
     }
+    // Mirror packages/runtime-rs/src/shared.rs: an explicit-but-invalid
+    // OPENSESSIONS_SERVER_KEY must fall back to DEFAULT_SERVER_PORT, not
+    // to the TMUX-derived port. Otherwise client and Rust server would
+    // talk to different ports (server sees the same bad env var and
+    // returns DEFAULT_SERVER_PORT, client would derive a TMUX hash port).
+    return DEFAULT_SERVER_PORT;
   }
 
   const tmux = process.env.TMUX?.trim();

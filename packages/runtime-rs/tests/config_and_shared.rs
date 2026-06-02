@@ -16,6 +16,14 @@ fn server_key_hash_and_port_resolution_match_typescript() {
     assert_eq!(resolve_server_port(None, None), DEFAULT_SERVER_PORT);
     assert_eq!(resolve_server_port(Some("19916"), None), 41_916);
     assert_eq!(resolve_server_port(Some("19916"), Some("8123")), 8_123);
+    // Overflow fallback: keys that push base+key above u16::MAX (and
+    // even values that overflow the u32 checked_add) must fall back to
+    // DEFAULT_SERVER_PORT rather than silently wrap.
+    assert_eq!(resolve_server_port(Some("50000"), None), DEFAULT_SERVER_PORT);
+    assert_eq!(
+        resolve_server_port(Some("4294967295"), None),
+        DEFAULT_SERVER_PORT
+    );
 }
 
 #[test]

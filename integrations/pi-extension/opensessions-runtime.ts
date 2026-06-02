@@ -37,6 +37,11 @@ function resolveServerPort(): number {
       const port = 22000 + key;
       if (port > 0 && port <= 65535) return port;
     }
+    // Mirror packages/runtime-rs/src/shared.rs: an explicit-but-invalid
+    // OPENSESSIONS_SERVER_KEY must fall back to DEFAULT_SERVER_PORT, not
+    // to the TMUX-derived port. Otherwise the heartbeat client and Rust
+    // server would resolve to different ports.
+    return DEFAULT_SERVER_PORT;
   }
 
   const tmux = process.env.TMUX?.trim();

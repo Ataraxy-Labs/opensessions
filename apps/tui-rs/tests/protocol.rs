@@ -78,4 +78,8 @@ fn server_key_hash_matches_typescript_runtime() {
     assert_eq!(resolve_server_port(None, None), 7_391);
     assert_eq!(resolve_server_port(Some(19_916), None), 41_916);
     assert_eq!(resolve_server_port(Some(19_916), Some("8123")), 8_123);
+    // Overflow fallback: any key that pushes 22000+key above u16::MAX
+    // must fall back to DEFAULT_SERVER_PORT rather than silently wrap.
+    assert_eq!(resolve_server_port(Some(50_000), None), 7_391);
+    assert_eq!(resolve_server_port(Some(u16::MAX), None), 7_391);
 }
