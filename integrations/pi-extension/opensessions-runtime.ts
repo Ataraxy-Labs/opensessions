@@ -31,7 +31,9 @@ function hashServerKey(input: string): number {
 // `Number()` both accept formats Rust rejects ("123abc", "0.5", "1e3",
 // "0x10"); the heartbeat client must Err on the same inputs or it will
 // post to a different port than the server binds.
-const DECIMAL_INTEGER_RE = /^[0-9]+$/;
+// The optional leading `+` mirrors Rust's `u16::from_str` / `u32::from_str`
+// (verified: `"+8123".parse::<u16>()` => Ok(8123) on rustc 1.96).
+const DECIMAL_INTEGER_RE = /^\+?[0-9]+$/;
 
 function resolveServerPort(): number {
   const explicitPort = process.env.OPENSESSIONS_PORT?.trim();

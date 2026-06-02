@@ -128,7 +128,9 @@ function hashServerKey(input: string): number {
 // lenient ("123abc" -> 123, "0.5" -> 0) and `Number()` is too permissive
 // ("1.0", "1e3", "0x10" all coerce to integers); both diverge from Rust,
 // which would Err on those inputs and fall back to DEFAULT_SERVER_PORT.
-const DECIMAL_INTEGER_RE = /^[0-9]+$/;
+// The optional leading `+` mirrors Rust's `u16::from_str` / `u32::from_str`
+// (verified: `"+8123".parse::<u16>()` => Ok(8123) on rustc 1.96).
+const DECIMAL_INTEGER_RE = /^\+?[0-9]+$/;
 
 function resolveServerPort(): number {
   const explicitPort = process.env.OPENSESSIONS_PORT?.trim();
