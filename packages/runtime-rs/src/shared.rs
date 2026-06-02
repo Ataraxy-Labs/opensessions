@@ -1,5 +1,8 @@
 pub const DEFAULT_SERVER_PORT: u16 = 7_391;
 pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
+// SERVER_PORT_BASE is canonically defined here. apps/tui-rs/src/runtime_config.rs
+// keeps a duplicate copy because the TUI sidebar binary does not depend on this
+// crate; both values must stay in sync.
 pub const SERVER_PORT_BASE: u32 = 22_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,9 +43,10 @@ pub fn resolve_server_port(server_key: Option<&str>, explicit: Option<&str>) -> 
 }
 
 /// Compute the port like [`resolve_server_port`] but with a configurable base.
-/// `base + server_key` is computed in `u32` and then cast to `u16`; callers must
-/// ensure `base + server_key <= u16::MAX`. Mirrors `PORT_BASE` in
-/// `integrations/tmux-plugin/scripts/server-common.sh`.
+/// `base + server_key` is computed in `u32`; if the sum overflows `u32` or
+/// exceeds `u16::MAX`, falls back to `DEFAULT_SERVER_PORT` (matching the
+/// parse-failure branch) and emits an `opensessions: ...` warning to stderr.
+/// Mirrors `PORT_BASE` in `integrations/tmux-plugin/scripts/server-common.sh`.
 pub fn resolve_server_port_with_base(
     server_key: Option<&str>,
     explicit: Option<&str>,
@@ -63,7 +67,13 @@ pub fn resolve_server_port_with_base(
         Ok(key) => base
             .checked_add(key)
             .and_then(|sum| u16::try_from(sum).ok())
-            .unwrap_or(DEFAULT_SERVER_PORT),
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "opensessions: server_key {key} + base {base} overflows port range, \
+                     falling back to DEFAULT_SERVER_PORT {DEFAULT_SERVER_PORT}",
+                );
+                DEFAULT_SERVER_PORT
+            }),
         Err(_) => DEFAULT_SERVER_PORT,
     }
 }

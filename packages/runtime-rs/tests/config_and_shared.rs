@@ -46,35 +46,33 @@ fn resolve_server_settings_ignores_opensessions_rust_env_var() {
     // (17000+server_key) coexisted with the Rust stack. The TS server is
     // gone (commit 89168a3) and the Rust stack now always binds
     // 22000+server_key (`SERVER_PORT_BASE`) regardless of this env var.
-    let settings = resolve_server_settings(|key| match key {
-        "TMUX" => Some("/private/tmp/tmux-501/os-rs-test,123,0".to_string()),
+    let tmux = "/private/tmp/tmux-501/os-rs-test,123,0";
+    let with_env_set = resolve_server_settings(|key| match key {
+        "TMUX" => Some(tmux.to_string()),
         "OPENSESSIONS_RUST" => Some("1".to_string()),
         _ => None,
     });
-
-    assert_eq!(settings.server_key.as_deref(), Some("8011"));
-    assert_eq!(
-        settings.port, 30_011,
-        "Rust stack must bind base 22000 (got {})",
-        settings.port
-    );
-}
-
-#[test]
-fn resolve_server_settings_uses_default_port_base_without_opensessions_rust() {
-    let settings = resolve_server_settings(|key| match key {
-        "TMUX" => Some("/private/tmp/tmux-501/os-rs-test,123,0".to_string()),
+    let with_env_unset = resolve_server_settings(|key| match key {
+        "TMUX" => Some(tmux.to_string()),
         _ => None,
     });
 
-    assert_eq!(settings.port, 30_011);
+    assert_eq!(with_env_set.server_key.as_deref(), Some("8011"));
+    assert_eq!(
+        with_env_set.port, 30_011,
+        "Rust stack must bind base 22000 (got {})",
+        with_env_set.port
+    );
+    assert_eq!(
+        with_env_unset.port, with_env_set.port,
+        "OPENSESSIONS_RUST must have no effect on port resolution"
+    );
 }
 
 #[test]
 fn resolve_server_settings_explicit_port_overrides_port_base() {
     let settings = resolve_server_settings(|key| match key {
         "TMUX" => Some("/private/tmp/tmux-501/os-rs-test,123,0".to_string()),
-        "OPENSESSIONS_RUST" => Some("1".to_string()),
         "OPENSESSIONS_PORT" => Some("42424".to_string()),
         _ => None,
     });

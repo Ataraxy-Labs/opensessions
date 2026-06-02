@@ -129,16 +129,18 @@ function resolveServerPort(): number {
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
   if (explicitKey) {
-    const key = Number.parseInt(explicitKey, 10);
-    if (Number.isFinite(key) && key >= 0) {
+    // Use Number() + Number.isInteger to match the strictness of Rust's
+    // `parse::<u32>()` in packages/runtime-rs/src/shared.rs. `Number.parseInt`
+    // is too lenient ("123abc" -> 123, "0.5" -> 0) and would diverge from
+    // the Rust server, which Err's on those inputs and falls back to
+    // DEFAULT_SERVER_PORT.
+    const key = Number(explicitKey);
+    if (Number.isInteger(key) && key >= 0) {
       const port = 22000 + key;
       if (port > 0 && port <= 65535) return port;
     }
-    // Mirror packages/runtime-rs/src/shared.rs: an explicit-but-invalid
-    // OPENSESSIONS_SERVER_KEY must fall back to DEFAULT_SERVER_PORT, not
-    // to the TMUX-derived port. Otherwise client and Rust server would
-    // talk to different ports (server sees the same bad env var and
-    // returns DEFAULT_SERVER_PORT, client would derive a TMUX hash port).
+    // Any explicit-but-invalid OPENSESSIONS_SERVER_KEY falls back to the
+    // default port (matching the Rust server) so client and server agree.
     return DEFAULT_SERVER_PORT;
   }
 

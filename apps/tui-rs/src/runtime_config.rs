@@ -1,4 +1,8 @@
 pub const DEFAULT_SERVER_PORT: u16 = 7_391;
+// SERVER_PORT_BASE is duplicated here for the TUI sidebar binary (which does
+// not depend on packages/runtime-rs). The canonical definition lives in
+// packages/runtime-rs/src/shared.rs and must be kept in sync — both values
+// describe the same port range the server binds.
 pub const SERVER_PORT_BASE: u32 = 22_000;
 
 pub fn hash_server_key(input: &str) -> u16 {
@@ -18,8 +22,13 @@ pub fn resolve_server_port(server_key: Option<u16>, explicit: Option<&str>) -> u
     }
 
     match server_key {
-        Some(key) => u16::try_from(SERVER_PORT_BASE + u32::from(key))
-            .unwrap_or(DEFAULT_SERVER_PORT),
+        Some(key) => u16::try_from(SERVER_PORT_BASE + u32::from(key)).unwrap_or_else(|_| {
+            eprintln!(
+                "opensessions: server_key {key} + base {SERVER_PORT_BASE} overflows port range, \
+                 falling back to DEFAULT_SERVER_PORT {DEFAULT_SERVER_PORT}",
+            );
+            DEFAULT_SERVER_PORT
+        }),
         None => DEFAULT_SERVER_PORT,
     }
 }
