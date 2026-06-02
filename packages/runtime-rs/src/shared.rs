@@ -60,7 +60,10 @@ pub fn resolve_server_port_with_base(
     };
 
     match server_key.trim().parse::<u32>() {
-        Ok(key) => (base + key) as u16,
+        Ok(key) => base
+            .checked_add(key)
+            .and_then(|sum| u16::try_from(sum).ok())
+            .unwrap_or(DEFAULT_SERVER_PORT),
         Err(_) => DEFAULT_SERVER_PORT,
     }
 }

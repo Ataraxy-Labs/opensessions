@@ -18,7 +18,8 @@ pub fn resolve_server_port(server_key: Option<u16>, explicit: Option<&str>) -> u
     }
 
     match server_key {
-        Some(key) => (SERVER_PORT_BASE + u32::from(key)) as u16,
+        Some(key) => u16::try_from(SERVER_PORT_BASE + u32::from(key))
+            .unwrap_or(DEFAULT_SERVER_PORT),
         None => DEFAULT_SERVER_PORT,
     }
 }

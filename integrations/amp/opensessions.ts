@@ -128,7 +128,13 @@ function resolveServerPort(): number {
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
-  if (explicitKey) return 22000 + Number.parseInt(explicitKey, 10);
+  if (explicitKey) {
+    const key = Number.parseInt(explicitKey, 10);
+    if (Number.isFinite(key) && key >= 0) {
+      const port = 22000 + key;
+      if (port > 0 && port <= 65535) return port;
+    }
+  }
 
   const tmux = process.env.TMUX?.trim();
   if (tmux) {
