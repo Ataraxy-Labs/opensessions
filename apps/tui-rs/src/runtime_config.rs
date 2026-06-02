@@ -17,7 +17,7 @@ pub fn resolve_server_port(server_key: Option<u16>, explicit: Option<&str>) -> u
     }
 
     match server_key {
-        Some(key) => 17_000 + key,
+        Some(key) => 22_000 + key,
         None => DEFAULT_SERVER_PORT,
     }
 }

@@ -35,7 +35,7 @@ pub fn resolve_server_key(env: impl Fn(&str) -> Option<String>) -> Option<String
 }
 
 pub fn resolve_server_port(server_key: Option<&str>, explicit: Option<&str>) -> u16 {
-    resolve_server_port_with_base(server_key, explicit, 17_000)
+    resolve_server_port_with_base(server_key, explicit, 22_000)
 }
 
 /// Compute the port like [`resolve_server_port`] but with a configurable base.
@@ -87,18 +87,10 @@ pub fn resolve_pid_file(server_key: Option<&str>, explicit: Option<&str>) -> Str
 pub fn resolve_server_settings(env: impl Fn(&str) -> Option<String>) -> ServerSettings {
     let server_key = resolve_server_key(&env);
     let host = resolve_server_host(env("OPENSESSIONS_HOST").as_deref());
-    let base = if env("OPENSESSIONS_RUST")
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false)
-    {
-        22_000
-    } else {
-        17_000
-    };
     let port = resolve_server_port_with_base(
         server_key.as_deref(),
         env("OPENSESSIONS_PORT").as_deref(),
-        base,
+        22_000,
     );
     let pid_file = resolve_pid_file(
         server_key.as_deref(),
