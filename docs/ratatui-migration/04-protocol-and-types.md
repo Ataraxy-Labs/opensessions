@@ -9,7 +9,7 @@ source); use `#[serde(rename_all = "camelCase")]` on every struct.
 
 - URL: `ws://{SERVER_HOST}:{SERVER_PORT}/`  (no path used today)
 - Default `SERVER_HOST = 127.0.0.1`, port resolved from `OPENSESSIONS_PORT`
-  env or hashed from `$TMUX` socket path → `17000 + (hash % 20000)`.
+  env or hashed from `$TMUX` socket path → `22000 + (hash % 20000)`.
 - Single connection per pane. Auto-reconnect on close.
 - Text frames only (JSON). No binary.
 

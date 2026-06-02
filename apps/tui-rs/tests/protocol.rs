@@ -76,6 +76,6 @@ fn parses_state_with_nested_agent_and_filter() {
 fn server_key_hash_matches_typescript_runtime() {
     assert_eq!(hash_server_key("/private/tmp/tmux-501/default"), 19_916);
     assert_eq!(resolve_server_port(None, None), 7_391);
-    assert_eq!(resolve_server_port(Some(19_916), None), 36_916);
+    assert_eq!(resolve_server_port(Some(19_916), None), 41_916);
     assert_eq!(resolve_server_port(Some(19_916), Some("8123")), 8_123);
 }

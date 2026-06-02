@@ -29,7 +29,7 @@ fn resolves_tmux_derived_endpoint_from_environment_like_typescript_client() {
     });
 
     assert_eq!(endpoint.server_host, "127.0.0.1");
-    assert_eq!(endpoint.server_port, 36_916);
+    assert_eq!(endpoint.server_port, 41_916);
 }
 
 #[test]

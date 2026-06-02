@@ -31,12 +31,12 @@ function resolveServerPort(): number {
   if (Number.isFinite(explicit) && explicit > 0) return explicit;
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
-  if (explicitKey) return 17000 + Number.parseInt(explicitKey, 10);
+  if (explicitKey) return 22000 + Number.parseInt(explicitKey, 10);
 
   const tmux = process.env.TMUX?.trim();
   if (tmux) {
     const socketPath = tmux.split(",", 1)[0];
-    if (socketPath) return 17000 + hashServerKey(socketPath);
+    if (socketPath) return 22000 + hashServerKey(socketPath);
   }
   return DEFAULT_SERVER_PORT;
 }

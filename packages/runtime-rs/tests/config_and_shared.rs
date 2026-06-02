@@ -14,7 +14,7 @@ use opensessions_runtime::shared::{
 fn server_key_hash_and_port_resolution_match_typescript() {
     assert_eq!(hash_server_key("/private/tmp/tmux-501/default"), 19_916);
     assert_eq!(resolve_server_port(None, None), DEFAULT_SERVER_PORT);
-    assert_eq!(resolve_server_port(Some("19916"), None), 36_916);
+    assert_eq!(resolve_server_port(Some("19916"), None), 41_916);
     assert_eq!(resolve_server_port(Some("19916"), Some("8123")), 8_123);
 }
 
@@ -28,16 +28,17 @@ fn resolves_server_settings_from_tmux_socket_and_env_overrides() {
 
     assert_eq!(settings.server_key.as_deref(), Some("19916"));
     assert_eq!(settings.host, "0.0.0.0");
-    assert_eq!(settings.port, 36_916);
+    assert_eq!(settings.port, 41_916);
     assert_eq!(settings.pid_file, "/tmp/opensessions.19916.pid");
 }
 
 #[test]
 fn resolve_server_settings_uses_rust_port_base_when_opensessions_rust_set() {
-    // When OPENSESSIONS_RUST=1 the Rust server stack must bind a different
-    // port range (22000+server_key) so it can coexist with the TS bun server
-    // (17000+server_key) on the same tmux socket. Mirrors the PORT_BASE
-    // branch in integrations/tmux-plugin/scripts/server-common.sh.
+    // OPENSESSIONS_RUST=1 was an opt-in toggle while the TS bun server
+    // (17000+server_key) coexisted with the Rust stack. The TS server is
+    // gone (commit 89168a3) and the Rust stack now always binds
+    // 22000+server_key (`SERVER_PORT_BASE`). The env var is still accepted
+    // for backwards-compatibility but no longer affects the port.
     let settings = resolve_server_settings(|key| match key {
         "TMUX" => Some("/private/tmp/tmux-501/os-rs-test,123,0".to_string()),
         "OPENSESSIONS_RUST" => Some("1".to_string()),
@@ -59,7 +60,7 @@ fn resolve_server_settings_keeps_ts_port_base_when_opensessions_rust_unset() {
         _ => None,
     });
 
-    assert_eq!(settings.port, 25_011);
+    assert_eq!(settings.port, 30_011);
 }
 
 #[test]

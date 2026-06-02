@@ -193,7 +193,7 @@ fn server_port() -> u16 {
     }
     let key = server_key();
     match key {
-        Some(k) => 17000 + k,
+        Some(k) => 22000 + k,
         None => 7391,  // DEFAULT_SERVER_PORT
     }
 }

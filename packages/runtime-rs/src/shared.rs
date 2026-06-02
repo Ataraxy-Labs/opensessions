@@ -1,5 +1,6 @@
 pub const DEFAULT_SERVER_PORT: u16 = 7_391;
 pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
+pub const SERVER_PORT_BASE: u32 = 22_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSettings {
@@ -35,14 +36,13 @@ pub fn resolve_server_key(env: impl Fn(&str) -> Option<String>) -> Option<String
 }
 
 pub fn resolve_server_port(server_key: Option<&str>, explicit: Option<&str>) -> u16 {
-    resolve_server_port_with_base(server_key, explicit, 22_000)
+    resolve_server_port_with_base(server_key, explicit, SERVER_PORT_BASE)
 }
 
 /// Compute the port like [`resolve_server_port`] but with a configurable base.
-/// Mirrors the `PORT_BASE` branch in
-/// `integrations/tmux-plugin/scripts/server-common.sh` so the Rust server can
-/// pin 22000+server_key when `OPENSESSIONS_RUST=1` and coexist with the TS
-/// bun server (17000+server_key) on the same tmux socket.
+/// `base + server_key` is computed in `u32` and then cast to `u16`; callers must
+/// ensure `base + server_key <= u16::MAX`. Mirrors `PORT_BASE` in
+/// `integrations/tmux-plugin/scripts/server-common.sh`.
 pub fn resolve_server_port_with_base(
     server_key: Option<&str>,
     explicit: Option<&str>,
@@ -90,7 +90,7 @@ pub fn resolve_server_settings(env: impl Fn(&str) -> Option<String>) -> ServerSe
     let port = resolve_server_port_with_base(
         server_key.as_deref(),
         env("OPENSESSIONS_PORT").as_deref(),
-        22_000,
+        SERVER_PORT_BASE,
     );
     let pid_file = resolve_pid_file(
         server_key.as_deref(),

@@ -1,4 +1,5 @@
 pub const DEFAULT_SERVER_PORT: u16 = 7_391;
+pub const SERVER_PORT_BASE: u32 = 22_000;
 
 pub fn hash_server_key(input: &str) -> u16 {
     let mut hash = 0_u32;
@@ -17,7 +18,7 @@ pub fn resolve_server_port(server_key: Option<u16>, explicit: Option<&str>) -> u
     }
 
     match server_key {
-        Some(key) => 22_000 + key,
+        Some(key) => (SERVER_PORT_BASE + u32::from(key)) as u16,
         None => DEFAULT_SERVER_PORT,
     }
 }
