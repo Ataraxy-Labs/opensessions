@@ -26,19 +26,28 @@ function hashServerKey(input: string): number {
   return hash;
 }
 
+// Mirror Rust's strict integer parse (`parse::<u32>()` / `parse::<u16>()` in
+// packages/runtime-rs/src/shared.rs). JavaScript's `Number.parseInt` and
+// `Number()` both accept formats Rust rejects ("123abc", "0.5", "1e3",
+// "0x10"); the heartbeat client must Err on the same inputs or it will
+// post to a different port than the server binds.
+const DECIMAL_INTEGER_RE = /^[0-9]+$/;
+
 function resolveServerPort(): number {
-  const explicit = Number.parseInt(process.env.OPENSESSIONS_PORT ?? "", 10);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const explicitPort = process.env.OPENSESSIONS_PORT?.trim();
+  if (explicitPort && DECIMAL_INTEGER_RE.test(explicitPort)) {
+    const port = Number(explicitPort);
+    if (Number.isInteger(port) && port > 0 && port <= 65535) return port;
+  }
 
   const explicitKey = process.env.OPENSESSIONS_SERVER_KEY?.trim();
   if (explicitKey) {
-    // Use Number() + Number.isInteger to match Rust's strict `parse::<u32>()`
-    // in packages/runtime-rs/src/shared.rs. `Number.parseInt` is too lenient
-    // ("123abc" -> 123, "0.5" -> 0) and would diverge from the Rust server.
-    const key = Number(explicitKey);
-    if (Number.isInteger(key) && key >= 0) {
-      const port = 22000 + key;
-      if (port > 0 && port <= 65535) return port;
+    if (DECIMAL_INTEGER_RE.test(explicitKey)) {
+      const key = Number(explicitKey);
+      if (Number.isInteger(key) && key >= 0) {
+        const port = 22000 + key;
+        if (port > 0 && port <= 65535) return port;
+      }
     }
     // Any explicit-but-invalid OPENSESSIONS_SERVER_KEY falls back to the
     // default port (matching the Rust server) so heartbeat client and
