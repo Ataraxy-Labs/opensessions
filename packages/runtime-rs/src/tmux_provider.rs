@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -453,10 +454,10 @@ impl MuxProvider for TmuxProvider {
             .map(|session| MuxSessionInfo {
                 name: session.name.clone(),
                 created_at: session.created_at,
-                dir: active_dirs
-                    .get(&session.name)
-                    .cloned()
-                    .unwrap_or(session.dir),
+                dir: choose_session_dir(
+                    &session.dir,
+                    active_dirs.get(&session.name).map(String::as_str),
+                ),
                 windows: session.window_count,
             })
             .collect()
@@ -907,6 +908,23 @@ fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
     None
 }
 
+fn choose_session_dir(session_dir: &str, active_dir: Option<&str>) -> String {
+    let Some(active_dir) = active_dir.filter(|dir| !dir.is_empty()) else {
+        return session_dir.to_string();
+    };
+    if session_dir.is_empty() || session_dir == "/" || is_home_dir(session_dir) {
+        return active_dir.to_string();
+    }
+    if Path::new(active_dir).starts_with(Path::new(session_dir)) {
+        return active_dir.to_string();
+    }
+    session_dir.to_string()
+}
+
+fn is_home_dir(dir: &str) -> bool {
+    std::env::var("HOME").is_ok_and(|home| dir == home)
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1064,6 +1082,25 @@ mod tests {
                 "-p".to_string(),
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn session_dir_keeps_worktree_path_when_active_pane_is_outside_it() {
+        assert_eq!(
+            choose_session_dir("/repo-wt/workspace-1", Some("/repo/packages/app"),),
+            "/repo-wt/workspace-1",
+        );
+    }
+
+    #[test]
+    fn session_dir_uses_active_subdirectory_inside_session_path() {
+        assert_eq!(
+            choose_session_dir(
+                "/repo-wt/workspace-1",
+                Some("/repo-wt/workspace-1/packages/app"),
+            ),
+            "/repo-wt/workspace-1/packages/app",
         );
     }
 }
