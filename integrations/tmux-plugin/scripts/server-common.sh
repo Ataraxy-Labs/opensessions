@@ -52,12 +52,13 @@ PLUGIN_DIR="$(tmux show-environment -g OPENSESSIONS_DIR 2>/dev/null | cut -d= -f
 PLUGIN_DIR="${PLUGIN_DIR:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 SERVER_LOG="/tmp/opensessions.${SERVER_KEY:-default}.server.log"
 START_LOCK_DIR="/tmp/opensessions.${SERVER_KEY:-default}.start.lock"
+EXPECTED_SERVER_VERSION="opensessions-server 0.2.0-alpha.12 protocol 1"
 
 RUST_SERVER_BIN=""
-if [ -x "$PLUGIN_DIR/bin/opensessions-server" ]; then
-  RUST_SERVER_BIN="$PLUGIN_DIR/bin/opensessions-server"
-elif [ -x "$PLUGIN_DIR/target/release/opensessions-server" ]; then
+if [ -x "$PLUGIN_DIR/target/release/opensessions-server" ]; then
   RUST_SERVER_BIN="$PLUGIN_DIR/target/release/opensessions-server"
+elif [ -x "$PLUGIN_DIR/bin/opensessions-server" ]; then
+  RUST_SERVER_BIN="$PLUGIN_DIR/bin/opensessions-server"
 elif [ -x "$PLUGIN_DIR/target/debug/opensessions-server" ]; then
   RUST_SERVER_BIN="$PLUGIN_DIR/target/debug/opensessions-server"
 fi
@@ -69,7 +70,24 @@ show_startup_error() {
 }
 
 server_alive() {
-  curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
+  [ "$(curl -s -m 0.2 "http://${HOST}:${PORT}/version" 2>/dev/null)" = "$EXPECTED_SERVER_VERSION" ]
+}
+
+kill_stale_server() {
+  [ -f "$PID_FILE" ] || return 0
+  stale_pid="$(cat "$PID_FILE" 2>/dev/null)"
+  [ -n "$stale_pid" ] || return 0
+  kill -0 "$stale_pid" 2>/dev/null || return 0
+  command_path="$(ps -p "$stale_pid" -o command= 2>/dev/null | awk '{ print $1 }')"
+  if [ "$command_path" = "$RUST_SERVER_BIN" ] && server_alive; then
+    return 0
+  fi
+  kill "$stale_pid" 2>/dev/null || true
+  attempt=0
+  while kill -0 "$stale_pid" 2>/dev/null && [ "$attempt" -lt 20 ]; do
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
 }
 
 acquire_start_lock() {
@@ -110,6 +128,8 @@ ensure_server() {
   if server_alive; then
     return 0
   fi
+
+  kill_stale_server
 
   acquire_start_lock
   lock_status=$?

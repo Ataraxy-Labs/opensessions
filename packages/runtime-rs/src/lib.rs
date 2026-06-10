@@ -1,4 +1,5 @@
 pub mod agent_parsers;
+pub mod agent_screen;
 pub mod agent_watchers;
 pub mod config;
 pub mod git_info;
@@ -12,6 +13,7 @@ pub mod project_dir_session;
 pub mod protocol;
 pub mod server_state;
 pub mod session_order;
+pub mod session_projection;
 pub mod shared;
 pub mod sidebar_coordinator;
 pub mod sidebar_width_sync;

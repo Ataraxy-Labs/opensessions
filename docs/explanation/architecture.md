@@ -36,6 +36,14 @@ That state is assembled from several sources:
 
 The result is one live view of the current tmux universe.
 
+## Authority, Observations, And Projections
+
+Server/query state is the authority. Tmux pane geometry, terminal frames, and visible screen text are observations of the outside world.
+
+That boundary prevents feedback loops: a sidebar may observe that tmux temporarily resized a pane, but the persisted sidebar width changes only through a typed `SetSidebarWidth` command and the server's `SidebarLayout` query result. Likewise, terminal text can help diagnose or map a pane to an agent, but the TUI renders typed agent/session state instead of scraping panes directly.
+
+A projection is a read-only view derived from deeper state. For example, the raw state may contain all sessions, worktree groups, collapsed groups, focused pane, agent instances, and unseen markers; the sidebar projection is the exact row order and glyphs shown to the user. Projection rules should stay pure and derived from typed state so the UI behaves like a React app: server data is fetched/subscribed, local UI state is separate, and rendering is a deterministic function of both.
+
 ## Agent Tracking Model
 
 Watchers and external integrations do not know about the TUI. They only emit `AgentEvent`s into the server, either through built-in Rust scanners or `POST /api/agent-event`.
@@ -115,7 +123,7 @@ The repository now follows a Rust-first monorepo boundary model:
 - `apps/server-rs` contains the Rust control-plane server
 - `apps/tui-rs` contains the Rust ratatui sidebar client
 - `packages/runtime-rs` contains reusable runtime logic that both apps depend on
-- `packages/sidebar-core-rs` contains shared sidebar state, input, layout, and rendering logic
+- `apps/tui-rs` contains sidebar state, input, layout, rendering, and terminal client logic
 - `integrations/tmux-plugin` contains host-specific tmux glue instead of runtime library code
 
 That keeps entrypoints, reusable libraries, mux adapters, and host integrations separate enough that new contributors can tell what owns what at a glance.

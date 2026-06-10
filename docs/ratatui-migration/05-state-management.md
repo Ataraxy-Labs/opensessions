@@ -144,7 +144,7 @@ impl App {
     }
 
     pub fn send(&self, cmd: ClientCommand) {
-        // Non-blocking try_send; drop if full (server will reconcile via state broadcast)
+        // Non-blocking try_send; drop if full (server will reconcile via invalidation + typed refetch)
         let _ = self.ws_tx.try_send(cmd);
     }
 }
@@ -152,27 +152,15 @@ impl App {
 
 ## Reconciliation
 
-On `ServerMessage::State`, replace `App.sessions` wholesale (cheap; ~10–100 KB).
-Don't try to diff — server is source of truth, just trust it.
+On `ServerMessage::QueryResult`, update the read model named by the query key.
+Don't read tmux/git/agent files from the TUI — server is source of truth, and query payloads are the client read models.
 
 ```rust
 impl App {
     pub fn handle_server_message(&mut self, msg: ServerMessage) {
         match msg {
-            ServerMessage::State(s) => {
-                self.sessions = s.sessions;
-                // Don't blindly overwrite focused_session if user just optimistically moved
-                if self.focused_session.is_none() {
-                    self.focused_session = s.focused_session;
-                }
-                self.current_session = s.current_session.or(self.current_session.take());
-                if let Some(t) = s.theme { self.set_theme_by_name(&t); }
-                if let Some(f) = s.session_filter { self.session_filter = f; }
-                self.sidebar_width = s.sidebar_width;
-                self.initializing = s.initializing;
-                self.init_label = s.init_label.unwrap_or_default();
-                self.connected = true;
-            }
+            ServerMessage::QueryResult { key, data, ts } => self.apply_query_result(key, data, ts),
+            ServerMessage::Invalidate { keys, .. } => self.query_cache.invalidate(keys),
             ServerMessage::Quit => self.should_quit = true,
             ServerMessage::YourSession { name, client_tty } => {
                 self.my_session = Some(name);

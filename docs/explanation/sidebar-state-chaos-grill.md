@@ -519,7 +519,7 @@ Smallest useful slice:
 1. introduce explicit `ClientId` / `ClientViewState` in the Rust server
 2. make websocket identify establish a client view
 3. derive `currentSession` per client, not globally
-4. keep shared state broadcast separate from client state response
+4. keep shared invalidation broadcasts separate from typed client query responses
 5. make switch-session update only the requesting client's view immediately
 6. keep old protocol compatibility only as a temporary adapter
 

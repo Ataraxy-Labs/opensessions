@@ -17,11 +17,26 @@ pub struct ProtocolHello {
 )]
 pub enum ServerMessage {
     Hello(ProtocolHello),
-    State(ServerState),
+    Invalidate {
+        keys: Vec<ServerQueryKey>,
+        ts: u64,
+    },
+    QueryResult {
+        key: ServerQueryKey,
+        data: ServerQueryData,
+        ts: u64,
+    },
     Quit,
     YourSession {
         name: String,
         client_tty: Option<String>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ui_focus: Option<ClientUiFocus>,
+    },
+    UiFocus {
+        client_tty: String,
+        focus: ClientUiFocus,
     },
     ActivateSession {
         name: String,
@@ -29,6 +44,57 @@ pub enum ServerMessage {
         source_pane_id: Option<String>,
     },
     ReIdentify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerQueryKey {
+    Sessions,
+    Agents,
+    Focus,
+    SidebarLayout,
+    Settings,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ServerQueryData {
+    Sessions {
+        sessions: Vec<SessionData>,
+    },
+    Agents {
+        sessions: Vec<SessionAgentsData>,
+    },
+    Focus {
+        focused_session: Option<String>,
+        current_session: Option<String>,
+    },
+    SidebarLayout {
+        sidebar_width: u32,
+        detail_panel_height: u32,
+        initializing: bool,
+        init_label: Option<String>,
+        collapsed_worktree_groups: Vec<String>,
+    },
+    Settings {
+        theme: Option<String>,
+        session_filter: Option<SessionFilterMode>,
+        agent_panel_scope: AgentPanelScope,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAgentsData {
+    pub session: String,
+    pub unseen: bool,
+    pub agent_state: Option<AgentEvent>,
+    pub agents: Vec<AgentEvent>,
+    pub event_timestamps: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -170,6 +236,43 @@ pub struct AgentEvent {
     pub liveness: Option<AgentLiveness>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPaneDiagnostic {
+    pub session: String,
+    pub pane_id: String,
+    pub window_id: String,
+    pub active: bool,
+    pub command: String,
+    pub title: String,
+    pub mapped_agent: Option<String>,
+    pub mapping_reason: String,
+    pub parsed_status: Option<AgentStatus>,
+    pub thread_name: Option<String>,
+    pub visible_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionDiagnostic {
+    pub session: String,
+    pub focused: bool,
+    pub current: bool,
+    pub pane_candidates: Vec<AgentPaneDiagnostic>,
+    pub tracker_agent_state: Option<AgentEvent>,
+    pub tracker_agents: Vec<AgentEvent>,
+    pub projected_current_panel_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDiagnostics {
+    pub focused_session: Option<String>,
+    pub current_session: Option<String>,
+    pub agent_panel_scope: AgentPanelScope,
+    pub sessions: Vec<AgentSessionDiagnostic>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MetadataTone {
@@ -244,6 +347,9 @@ pub enum SessionFilterMode {
     rename_all_fields = "camelCase"
 )]
 pub enum ClientCommand {
+    FetchQuery {
+        key: ServerQueryKey,
+    },
     SwitchSession {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +393,9 @@ pub enum ClientCommand {
     SetAgentPanelScope {
         scope: AgentPanelScope,
     },
+    SetUiFocus {
+        focus: ClientUiFocus,
+    },
     RepairWidth,
     SetFilter {
         filter: SessionFilterMode,
@@ -321,4 +430,31 @@ pub enum ClientCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         pane_id: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientUiFocus {
+    pub panel: ClientUiPanel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidebar: Option<ClientSidebarFocus>,
+    pub agent_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientUiPanel {
+    Sessions,
+    Agents,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ClientSidebarFocus {
+    Session { name: String },
+    WorktreeGroup { key: String },
 }

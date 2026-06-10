@@ -159,6 +159,18 @@ pub fn sidebar_width_repair_pipeline() -> String {
     resize_sidebar_width_pipeline(sidebar_width_repair_filter())
 }
 
+pub fn sidebar_width_repair_hook_command(background: bool) -> String {
+    run_shell_command(&sidebar_width_repair_pipeline(), background)
+}
+
+pub fn current_sidebar_pane_width_repair_hook_command(background: bool) -> String {
+    run_shell_command(&resize_current_sidebar_pane_pipeline(), background)
+}
+
+pub fn current_window_sidebar_width_repair_hook_command(background: bool) -> String {
+    run_shell_command(&resize_current_window_sidebar_width_pipeline(), background)
+}
+
 pub fn close_orphan_sidebar_pipeline() -> String {
     format!(
         "tmux -S #{{socket_path}} list-panes -a -f '{}' -F '{}' | while IFS=$(printf '\\t') read -r session pane windows; do if [ \"$windows\" -le 1 ]; then fallback=$(tmux -S #{{socket_path}} list-sessions -F '{}' | awk -v s=\"$session\" '$0==s {{ if (prev != \"\") {{ print prev; exit }}; seen=1; next }} seen {{ print; exit }} {{ prev=$0 }}'); tmux -S #{{socket_path}} list-clients -t \"=$session:\" -F '{}' | while IFS= read -r client; do [ -n \"$client\" ] && [ -n \"$fallback\" ] && tmux -S #{{socket_path}} switch-client -c \"$client\" -t \"=$fallback:\" >/dev/null 2>&1 || true; done; fi; tmux -S #{{socket_path}} kill-pane -t \"$pane\" >/dev/null 2>&1 || true; done",
@@ -171,18 +183,20 @@ pub fn close_orphan_sidebar_pipeline() -> String {
 
 pub fn pane_exited_hook_command(base: &str) -> String {
     format!(
-        "{} ; {} ; {}",
-        run_shell_command(&close_orphan_sidebar_pipeline(), false),
-        http_hook_command(base, "/pane-exited", None, false),
+        "{} ; {} ; {} ; {}",
+        run_shell_command(&resize_current_window_sidebar_width_pipeline(), false),
+        run_shell_command(&close_orphan_sidebar_pipeline(), true),
+        http_hook_command(base, "/pane-exited", None, true),
         run_shell_command(&sidebar_width_repair_pipeline(), true),
     )
 }
 
 pub fn pane_died_hook_command(base: &str) -> String {
     format!(
-        "{} ; {} ; {}",
-        run_shell_command(&close_dead_content_pane_pipeline(), false),
-        http_hook_command(base, "/pane-exited", None, false),
+        "{} ; {} ; {} ; {}",
+        run_shell_command(&resize_current_window_sidebar_width_pipeline(), false),
+        run_shell_command(&close_dead_content_pane_pipeline(), true),
+        http_hook_command(base, "/pane-exited", None, true),
         run_shell_command(&sidebar_width_repair_pipeline(), true),
     )
 }
@@ -218,8 +232,27 @@ fn orphan_sidebar_row_format() -> String {
 
 fn resize_sidebar_width_pipeline(filter: TmuxFormat) -> String {
     format!(
-        "tmux -S #{{socket_path}} list-panes -a -f '{}' -F '{}' | xargs -n1 -I{{}} tmux -S #{{socket_path}} resize-pane -t {{}} -x $(tmux -S #{{socket_path}} show-option -gqv @opensessions_width)",
+        "width=$(tmux -S #{{socket_path}} show-option -gqv @opensessions_width); tmux -S #{{socket_path}} list-panes -a -f '{}' -F '{}' | while IFS= read -r pane; do [ -n \"$pane\" ] && [ -n \"$width\" ] && tmux -S #{{socket_path}} resize-pane -t \"$pane\" -x \"$width\" >/dev/null 2>&1 || true; done",
         filter.render_for_hook(),
+        TmuxVar::PaneId.format().render_for_hook(),
+    )
+}
+
+fn resize_current_sidebar_pane_pipeline() -> String {
+    format!(
+        "pane='{}'; width=$(tmux -S #{{socket_path}} show-option -gqv @opensessions_width); if [ -n \"$pane\" ] && [ -n \"$width\" ]; then title=$(tmux -S #{{socket_path}} display-message -p -t \"$pane\" '{}'); current=$(tmux -S #{{socket_path}} display-message -p -t \"$pane\" '{}'); if [ \"$title\" = \"{}\" ] && [ \"$current\" != \"$width\" ]; then tmux -S #{{socket_path}} resize-pane -t \"$pane\" -x \"$width\" >/dev/null 2>&1 || true; fi; fi",
+        TmuxVar::PaneId.format().render(),
+        TmuxVar::PaneTitle.format().render_for_hook(),
+        TmuxVar::PaneWidth.format().render_for_hook(),
+        SIDEBAR_PANE_TITLE,
+    )
+}
+
+fn resize_current_window_sidebar_width_pipeline() -> String {
+    format!(
+        "window='{}'; width=$(tmux -S #{{socket_path}} show-option -gqv @opensessions_width); [ -n \"$window\" ] && [ -n \"$width\" ] && tmux -S #{{socket_path}} list-panes -t \"$window\" -f '{}' -F '{}' | while IFS= read -r pane; do [ -n \"$pane\" ] && tmux -S #{{socket_path}} resize-pane -t \"$pane\" -x \"$width\" >/dev/null 2>&1 || true; done",
+        TmuxFormat::var_name("window_id").render(),
+        sidebar_pane_filter().render_for_hook(),
         TmuxVar::PaneId.format().render_for_hook(),
     )
 }
@@ -279,7 +312,7 @@ mod tests {
     fn renders_sidebar_width_repair_pipeline_without_call_site_hash_math() {
         assert_eq!(
             sidebar_width_repair_pipeline(),
-            "tmux -S #{socket_path} list-panes -a -f '##{&&:##{>:##{window_panes},1},##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}}' -F '##{pane_id}' | xargs -n1 -I{} tmux -S #{socket_path} resize-pane -t {} -x $(tmux -S #{socket_path} show-option -gqv @opensessions_width)"
+            "width=$(tmux -S #{socket_path} show-option -gqv @opensessions_width); tmux -S #{socket_path} list-panes -a -f '##{&&:##{>:##{window_panes},1},##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}}' -F '##{pane_id}' | while IFS= read -r pane; do [ -n \"$pane\" ] && [ -n \"$width\" ] && tmux -S #{socket_path} resize-pane -t \"$pane\" -x \"$width\" >/dev/null 2>&1 || true; done"
         );
     }
 
@@ -287,8 +320,10 @@ mod tests {
     fn renders_pane_exited_hook_with_orphan_close_before_server_cleanup() {
         let hook = pane_exited_hook_command("http://127.0.0.1:1234");
 
-        assert!(hook.starts_with(
-            "run-shell \"tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{window_panes},1},##{==:##{pane_title},opensessions-sidebar}}'"
+        assert!(hook.starts_with("run-shell "));
+        assert!(hook.contains("list-panes -t \\\"\\$window\\\""));
+        assert!(hook.contains(
+            "tmux -S #{socket_path} list-panes -a -f '##{&&:##{==:##{window_panes},1},##{==:##{pane_title},opensessions-sidebar}}'"
         ));
         assert!(
             hook.contains("switch-client -c \\\"\\$client\\\" -t \\\"=\\$fallback:\\\"")
@@ -300,5 +335,27 @@ mod tests {
         );
         assert!(hook.contains("-X POST http://127.0.0.1:1234/pane-exited"));
         assert!(hook.ends_with(&run_shell_command(&sidebar_width_repair_pipeline(), true)));
+    }
+
+    #[test]
+    fn renders_current_sidebar_width_repair_without_global_pane_scan() {
+        let hook = current_sidebar_pane_width_repair_hook_command(true);
+
+        assert!(hook.starts_with("run-shell -b "));
+        assert!(hook.contains("pane='#{pane_id}'"));
+        assert!(hook.contains("display-message -p -t \\\"\\$pane\\\" '##{pane_title}'"));
+        assert!(hook.contains("resize-pane -t \\\"\\$pane\\\" -x \\\"\\$width\\\""));
+        assert!(!hook.contains("list-panes -a"));
+    }
+
+    #[test]
+    fn renders_current_window_width_repair_without_global_pane_scan() {
+        let hook = current_window_sidebar_width_repair_hook_command(false);
+
+        assert!(hook.starts_with("run-shell "));
+        assert!(hook.contains("window='#{window_id}'"));
+        assert!(hook.contains("list-panes -t \\\"\\$window\\\""));
+        assert!(hook.contains("resize-pane -t \\\"\\$pane\\\" -x \\\"\\$width\\\""));
+        assert!(!hook.contains("list-panes -a"));
     }
 }

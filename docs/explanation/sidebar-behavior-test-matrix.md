@@ -17,7 +17,7 @@ The intended test surface is product E2E only: each test creates real fake git r
 | Pane topology repair must not let tmux permanently donate freed space to the sidebar. | `tmux_sidebar_pane_exit_does_not_steal_sidebar_width` |
 | Resizing and immediately switching sessions preserves the latest drag-owned width through handoff. | `tmux_sidebar_resize_immediately_before_switch_survives_handoff` |
 | A single resize immediately followed by a switch is adopted from the source window even if no prior drag report established an owner. | `tmux_sidebar_single_resize_immediately_before_switch_is_adopted` |
-| Session switching remains responsive while 100 websocket sidebar clients are connected and state broadcasts are bursting. | `tmux_sidebar_switch_stays_responsive_with_100_connected_clients` |
+| Session switching remains responsive while 100 websocket sidebar clients are connected and invalidation/refetch traffic is bursting. | `tmux_sidebar_switch_stays_responsive_with_100_connected_clients` |
 
 ## Important Invariants Covered Indirectly
 

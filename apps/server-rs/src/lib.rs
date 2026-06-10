@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::path::PathBuf;
@@ -29,17 +30,20 @@ use opensessions_runtime::project_dir_session::{
     build_dir_session_map, resolve_session_for_project_dir,
 };
 use opensessions_runtime::protocol::{
-    AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ServerMessage,
-    SessionFilterMode,
+    AgentDiagnostics, AgentEvent, AgentLiveness, AgentPanelScope, AgentSessionDiagnostic,
+    AgentStatus, ClientUiFocus, MetadataTone, ServerMessage, ServerQueryData, ServerQueryKey,
+    ServerState, SessionAgentsData, SessionFilterMode,
 };
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
+use opensessions_runtime::session_projection::{
+    SessionProjectionOptions, display_session_names, reordered_session_names,
+    reordered_worktree_group_names,
+};
 use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
-use opensessions_sidebar_core::app::App as SidebarApp;
-use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,16 +57,18 @@ pub const SERVER_VERSION: &str = "0.2.0-alpha.12";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.2.0-alpha.12"}"#;
 pub const QUIT_JSON: &str = r#"{"type":"quit"}"#;
+pub const VERSION_HTTP_BODY: &str = "opensessions-server 0.2.0-alpha.12 protocol 1";
 
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
 const GIT_CACHE_TTL_MS: u64 = 5_000;
 const PORT_POLL_INTERVAL_MS: u64 = 10_000;
-const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
+const ENABLE_JSONL_AGENT_WATCHERS: bool = false;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 const TMUX_STATE_POLL_MS: u64 = 2_000;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
+const SIDEBAR_STAGGER_MS: u64 = 35;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
@@ -115,7 +121,15 @@ fn debug_log(line: impl AsRef<str>) {
 }
 
 pub trait StateSource: Send + Sync + 'static {
-    fn snapshot_json(&self) -> String;
+    fn query_result_json(&self, key: ServerQueryKey) -> Option<String>;
+
+    fn invalidate_queries_json(&self, keys: Vec<ServerQueryKey>) -> String {
+        invalidate_queries_json(keys)
+    }
+
+    fn invalidate_all_queries_json(&self) -> String {
+        self.invalidate_queries_json(all_query_keys())
+    }
 
     fn setup_mux_hooks(&self, _server_host: &str, _server_port: u16) {}
 
@@ -141,7 +155,7 @@ pub trait StateSource: Send + Sync + 'static {
         self.handle_client_command(command)
     }
 
-    fn handle_sender_command(&self, _command: &Value) -> Option<String> {
+    fn handle_sender_command(&self, _command: &Value) -> Option<SenderCommandOutcome> {
         None
     }
 
@@ -149,7 +163,7 @@ pub trait StateSource: Send + Sync + 'static {
         &self,
         command: &Value,
         _context: &mut ClientConnectionContext,
-    ) -> Option<String> {
+    ) -> Option<SenderCommandOutcome> {
         self.handle_sender_command(command)
     }
 
@@ -158,6 +172,10 @@ pub trait StateSource: Send + Sync + 'static {
     }
 
     fn handle_http_text(&self, _path: &str, _body: &str) -> Option<String> {
+        None
+    }
+
+    fn debug_agents_json(&self, _session: Option<&str>) -> Option<String> {
         None
     }
 
@@ -192,6 +210,17 @@ pub struct ClientConnectionContext {
     pane_id: Option<String>,
     session_name: Option<String>,
     window_id: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SenderCommandOutcome {
+    reply: Option<String>,
+    broadcast: Option<String>,
+}
+
+#[derive(Default)]
+struct FocusObservation {
+    agents_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,10 +265,10 @@ impl PiRuntimeError {
 
 impl<F> StateSource for F
 where
-    F: Fn() -> String + Send + Sync + 'static,
+    F: Fn(ServerQueryKey) -> Option<String> + Send + Sync + 'static,
 {
-    fn snapshot_json(&self) -> String {
-        self()
+    fn query_result_json(&self, key: ServerQueryKey) -> Option<String> {
+        self(key)
     }
 }
 
@@ -341,12 +370,25 @@ struct CachedPortSnapshot {
     ts: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedQueryJson {
+    generation: u64,
+    json: String,
+}
+
+#[derive(Debug, Default)]
+struct QueryJsonCache {
+    generation: u64,
+    results_by_key: HashMap<ServerQueryKey, CachedQueryJson>,
+}
+
 pub struct ReadOnlyMuxStateSource {
     providers: Vec<Arc<dyn MuxProvider>>,
     port_command_runner: Arc<dyn PortCommandRunner>,
     port_snapshot_cache: Mutex<Option<CachedPortSnapshot>>,
     git_command_runner: Arc<dyn GitCommandRunner>,
     git_info_cache: Mutex<HashMap<String, CachedGitInfo>>,
+    query_json_cache: Mutex<QueryJsonCache>,
     // The sidebar coordinator owns the single source of truth for the current
     // width (`SidebarCoordinator::state().width`), so there is no separate
     // mirror field to drift out of sync.
@@ -356,6 +398,7 @@ pub struct ReadOnlyMuxStateSource {
     focused_session: Mutex<Option<String>>,
     focused_pane_by_session: Mutex<HashMap<String, String>>,
     focused_client_tty: Mutex<Option<String>>,
+    ui_focus_by_client_tty: Mutex<HashMap<String, ClientUiFocus>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
@@ -395,12 +438,14 @@ impl ReadOnlyMuxStateSource {
             port_snapshot_cache: Mutex::new(None),
             git_command_runner: Arc::new(SystemGitCommandRunner),
             git_info_cache: Mutex::new(HashMap::new()),
+            query_json_cache: Mutex::new(QueryJsonCache::default()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
             detail_panel_height: Mutex::new(DEFAULT_DETAIL_PANEL_HEIGHT),
             agent_panel_scope: Mutex::new(AgentPanelScope::Current),
             focused_session: Mutex::new(None),
             focused_pane_by_session: Mutex::new(HashMap::new()),
             focused_client_tty: Mutex::new(None),
+            ui_focus_by_client_tty: Mutex::new(HashMap::new()),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
@@ -508,6 +553,7 @@ impl ReadOnlyMuxStateSource {
                             agent: pane.agent,
                             pane_id: pane.pane_id,
                             active: pane.active,
+                            status: pane.status,
                             thread_id: pane.thread_id,
                             thread_name: pane.thread_name,
                         }
@@ -560,25 +606,30 @@ impl ReadOnlyMuxStateSource {
         changed
     }
 
-    fn remember_focused_pane(&self, context: &HttpContext) -> bool {
+    fn observe_tmux_agent_state(&self) -> bool {
+        self.sync_agent_pane_presence() || self.mark_focused_agent_panes_seen()
+    }
+
+    fn remember_focused_pane(&self, context: &HttpContext) -> FocusObservation {
         if context.pane_active == Some(false) {
             debug_log(format!(
                 "focus-pane ignored inactive session={} pane={:?}",
                 context.session, context.pane_id,
             ));
-            return false;
+            return FocusObservation::default();
         }
         let Some(pane_id) = context
             .pane_id
             .as_deref()
             .filter(|pane_id| !pane_id.is_empty())
         else {
-            return false;
+            return FocusObservation::default();
         };
         if context.client_tty.is_some() {
             *self.focused_client_tty.lock().unwrap() = context.client_tty.clone();
         }
-        self.focused_pane_by_session
+        let previous_pane = self
+            .focused_pane_by_session
             .lock()
             .unwrap()
             .insert(context.session.clone(), pane_id.to_string());
@@ -591,49 +642,13 @@ impl ReadOnlyMuxStateSource {
             "focus-pane session={} pane={} changed={changed}",
             context.session, pane_id,
         ));
-        changed
-    }
-}
-
-impl StateSource for ReadOnlyMuxStateSource {
-    fn setup_mux_hooks(&self, server_host: &str, server_port: u16) {
-        let width = self.current_sidebar_width_u16();
-        for provider in &self.providers {
-            provider.set_sidebar_width_hint(width);
-            provider.setup_hooks(server_host, server_port);
+        let _pane_changed = previous_pane.as_deref() != Some(pane_id);
+        FocusObservation {
+            agents_changed: changed,
         }
     }
 
-    fn cleanup_mux_hooks(&self) {
-        for provider in &self.providers {
-            provider.cleanup_hooks();
-        }
-    }
-
-    fn start_background_tasks(
-        self: Arc<Self>,
-        state_updates: broadcast::Sender<String>,
-        shutdown: broadcast::Sender<()>,
-    ) -> Vec<JoinHandle<()>> {
-        vec![
-            tokio::spawn(run_agent_watcher_loop(
-                self.clone(),
-                state_updates.clone(),
-                shutdown.clone(),
-            )),
-            tokio::spawn(run_sidebar_lifecycle_loop(
-                self.clone(),
-                state_updates.clone(),
-                shutdown.clone(),
-            )),
-            tokio::spawn(run_tmux_state_poll_loop(self, state_updates, shutdown)),
-        ]
-    }
-
-    fn snapshot_json(&self) -> String {
-        self.sync_agent_pane_presence();
-        self.mark_focused_agent_panes_seen();
-
+    fn snapshot_state(&self) -> ServerState {
         let providers = self
             .providers
             .iter()
@@ -680,10 +695,10 @@ impl StateSource for ReadOnlyMuxStateSource {
         let ports_by_session = self.discover_live_ports(visible_session_names.as_deref());
         let sidebar_state = self.sidebar_coordinator.lock().unwrap().state();
         debug_log(format!(
-            "snapshot_json mode={} init={} width={}",
+            "snapshot_state mode={} init={} width={}",
             sidebar_state.mode, sidebar_state.initializing, sidebar_state.width,
         ));
-        let state = build_read_only_state(ReadOnlyStateInput {
+        build_read_only_state(ReadOnlyStateInput {
             providers,
             visible_session_names,
             metadata_by_session,
@@ -711,9 +726,213 @@ impl StateSource for ReadOnlyMuxStateSource {
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
             now_ms: (self.now_ms)(),
-        });
+        })
+    }
 
-        serde_json::to_string(&ServerMessage::State(state)).expect("state must serialize")
+    fn query_result_json_for_key(&self, key: ServerQueryKey) -> String {
+        loop {
+            let generation = {
+                let cache = self.query_json_cache.lock().unwrap();
+                if let Some(cached) = cache
+                    .results_by_key
+                    .get(&key)
+                    .filter(|cached| cached.generation == cache.generation)
+                {
+                    return cached.json.clone();
+                }
+                cache.generation
+            };
+
+            let json = self.compute_query_result_json(key);
+            let mut cache = self.query_json_cache.lock().unwrap();
+            if cache.generation == generation {
+                cache.results_by_key.insert(
+                    key,
+                    CachedQueryJson {
+                        generation,
+                        json: json.clone(),
+                    },
+                );
+                return json;
+            }
+        }
+    }
+
+    fn compute_query_result_json(&self, key: ServerQueryKey) -> String {
+        let ts = current_time_ms();
+        match key {
+            ServerQueryKey::Sessions => {
+                query_result_json_from_state(key, self.snapshot_state(), ts)
+            }
+            ServerQueryKey::Agents => {
+                query_result_json_from_data(key, self.agents_query_data(), ts)
+            }
+            ServerQueryKey::Focus => query_result_json_from_data(
+                key,
+                ServerQueryData::Focus {
+                    focused_session: self.focused_session.lock().unwrap().clone(),
+                    current_session: self
+                        .providers
+                        .first()
+                        .and_then(|provider| provider.get_current_session()),
+                },
+                ts,
+            ),
+            ServerQueryKey::SidebarLayout => {
+                let sidebar_state = self.sidebar_coordinator.lock().unwrap().state();
+                query_result_json_from_data(
+                    key,
+                    ServerQueryData::SidebarLayout {
+                        sidebar_width: sidebar_state.width,
+                        detail_panel_height: u32::from(*self.detail_panel_height.lock().unwrap()),
+                        initializing: sidebar_state.initializing,
+                        init_label: (!sidebar_state.init_label.is_empty())
+                            .then_some(sidebar_state.init_label),
+                        collapsed_worktree_groups: self
+                            .collapsed_worktree_groups
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .cloned()
+                            .collect(),
+                    },
+                    ts,
+                )
+            }
+            ServerQueryKey::Settings => query_result_json_from_data(
+                key,
+                ServerQueryData::Settings {
+                    theme: self.theme.lock().unwrap().clone(),
+                    session_filter: *self.session_filter.lock().unwrap(),
+                    agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
+                },
+                ts,
+            ),
+        }
+    }
+
+    fn invalidate_cached_query_json(&self, _keys: &[ServerQueryKey]) {
+        let mut cache = self.query_json_cache.lock().unwrap();
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.results_by_key.clear();
+    }
+
+    fn agents_query_data(&self) -> ServerQueryData {
+        let session_names = self.sorted_session_names();
+        let tracker = self.agent_tracker.lock().unwrap();
+        ServerQueryData::Agents {
+            sessions: session_names
+                .into_iter()
+                .map(|session| SessionAgentsData {
+                    unseen: tracker.is_unseen(&session),
+                    agent_state: tracker.get_state(&session),
+                    agents: tracker.get_agents(&session),
+                    event_timestamps: tracker.get_event_timestamps(&session),
+                    session,
+                })
+                .collect(),
+        }
+    }
+
+    fn debug_agent_diagnostics_json(&self, only_session: Option<&str>) -> String {
+        let focused_session = self.focused_session.lock().unwrap().clone();
+        let current_session = self
+            .providers
+            .first()
+            .and_then(|provider| provider.get_current_session());
+        let agent_panel_scope = *self.agent_panel_scope.lock().unwrap();
+        let tracker = self.agent_tracker.lock().unwrap();
+        let sessions = self
+            .sorted_session_names()
+            .into_iter()
+            .filter(|session| only_session.is_none_or(|only| only == session))
+            .map(|session| {
+                let pane_candidates = self
+                    .providers
+                    .iter()
+                    .flat_map(|provider| provider.list_agent_pane_diagnostics(&session))
+                    .collect::<Vec<_>>();
+                let tracker_agents = tracker.get_agents(&session);
+                let projected_current_panel_count = focused_session
+                    .as_deref()
+                    .filter(|focused| *focused == session)
+                    .map(|_| tracker_agents.len())
+                    .unwrap_or(0);
+                AgentSessionDiagnostic {
+                    focused: focused_session.as_deref() == Some(session.as_str()),
+                    current: current_session.as_deref() == Some(session.as_str()),
+                    tracker_agent_state: tracker.get_state(&session),
+                    tracker_agents,
+                    projected_current_panel_count,
+                    pane_candidates,
+                    session,
+                }
+            })
+            .collect();
+        serde_json::to_string_pretty(&AgentDiagnostics {
+            focused_session,
+            current_session,
+            agent_panel_scope,
+            sessions,
+        })
+        .expect("agent diagnostics must serialize")
+    }
+}
+
+impl StateSource for ReadOnlyMuxStateSource {
+    fn setup_mux_hooks(&self, server_host: &str, server_port: u16) {
+        let width = self.current_sidebar_width_u16();
+        for provider in &self.providers {
+            provider.set_sidebar_width_hint(width);
+            provider.setup_hooks(server_host, server_port);
+        }
+    }
+
+    fn cleanup_mux_hooks(&self) {
+        for provider in &self.providers {
+            provider.cleanup_hooks();
+        }
+    }
+
+    fn start_background_tasks(
+        self: Arc<Self>,
+        state_updates: broadcast::Sender<String>,
+        shutdown: broadcast::Sender<()>,
+    ) -> Vec<JoinHandle<()>> {
+        let mut tasks = Vec::new();
+        if ENABLE_JSONL_AGENT_WATCHERS {
+            tasks.push(tokio::spawn(run_agent_watcher_loop(
+                self.clone(),
+                state_updates.clone(),
+                shutdown.clone(),
+            )));
+        }
+        tasks.extend([
+            tokio::spawn(run_sidebar_lifecycle_loop(
+                self.clone(),
+                state_updates.clone(),
+                shutdown.clone(),
+            )),
+            tokio::spawn(run_tmux_state_poll_loop(self, state_updates, shutdown)),
+        ]);
+        tasks
+    }
+
+    fn query_result_json(&self, key: ServerQueryKey) -> Option<String> {
+        Some(self.query_result_json_for_key(key))
+    }
+
+    fn invalidate_queries_json(&self, keys: Vec<ServerQueryKey>) -> String {
+        self.invalidate_cached_query_json(&keys);
+        invalidate_queries_json(keys)
+    }
+
+    fn invalidate_all_queries_json(&self) -> String {
+        self.invalidate_queries_json(all_query_keys())
+    }
+
+    fn debug_agents_json(&self, session: Option<&str>) -> Option<String> {
+        Some(self.debug_agent_diagnostics_json(session))
     }
 
     fn begin_shutdown(&self) -> Option<String> {
@@ -721,7 +940,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             let mut coordinator = self.sidebar_coordinator.lock().unwrap();
             coordinator.begin_closing();
         }
-        Some(self.snapshot_json())
+        Some(self.invalidate_all_queries_json())
     }
 
     fn handle_client_command(&self, command: &Value) -> Option<String> {
@@ -737,7 +956,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         match command.get("type").and_then(Value::as_str)? {
             "new-session" => {
                 provider.create_session(None, None);
-                Some(self.snapshot_json())
+                Some(self.invalidate_all_queries_json())
             }
             "switch-session" => {
                 let name = command.get("name")?.as_str()?;
@@ -763,16 +982,16 @@ impl StateSource for ReadOnlyMuxStateSource {
                     *self.focused_session.lock().unwrap() = Some(next);
                 }
                 provider.kill_session(name);
-                Some(self.snapshot_json())
+                Some(self.invalidate_all_queries_json())
             }
             "hide-session" => {
                 let name = command.get("name")?.as_str()?;
                 self.session_order.lock().unwrap().hide(name);
-                Some(self.snapshot_json())
+                Some(self.invalidate_all_queries_json())
             }
             "show-all-sessions" => {
                 self.session_order.lock().unwrap().show_all();
-                Some(self.snapshot_json())
+                Some(self.invalidate_all_queries_json())
             }
             "reorder-session" => {
                 let name = command.get("name")?.as_str()?;
@@ -780,7 +999,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if let Some(names) = self.sidebar_reordered_session_names(name, delta) {
                     self.session_order.lock().unwrap().set_visible_order(names);
                 }
-                Some(self.snapshot_json())
+                Some(self.invalidate_all_queries_json())
             }
             "reorder-worktree-group" => {
                 let key = command.get("key")?.as_str()?;
@@ -788,12 +1007,12 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if let Some(names) = self.sidebar_reordered_worktree_group_names(key, delta) {
                     self.session_order.lock().unwrap().set_visible_order(names);
                 }
-                Some(self.snapshot_json())
+                Some(self.invalidate_all_queries_json())
             }
             "set-theme" => {
                 let theme = command.get("theme")?.as_str()?.to_string();
                 *self.theme.lock().unwrap() = Some(theme);
-                Some(self.snapshot_json())
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
             }
             "set-sidebar-width" => {
                 let width = command.get("width")?.as_u64()?.min(u16::MAX as u64) as u16;
@@ -807,19 +1026,32 @@ impl StateSource for ReadOnlyMuxStateSource {
                     provider.set_sidebar_width_hint(width);
                 }
                 self.enforce_sidebar_width(width);
-                Some(self.snapshot_json())
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "set-detail-panel-height" => {
                 let height = command.get("height")?.as_u64()?.min(u16::MAX as u64) as u16;
                 let height = clamp_detail_panel_height(height);
                 *self.detail_panel_height.lock().unwrap() = height;
                 self.persist_detail_panel_height(height);
-                Some(self.snapshot_json())
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "set-agent-panel-scope" => {
                 let scope = parse_agent_panel_scope(command.get("scope")?.as_str()?)?;
                 *self.agent_panel_scope.lock().unwrap() = scope;
-                Some(self.snapshot_json())
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
+            }
+            "set-ui-focus" => {
+                let client_tty = context
+                    .and_then(|context| context.client_tty.as_deref())
+                    .filter(|client_tty| !client_tty.is_empty())?;
+                let focus: ClientUiFocus =
+                    serde_json::from_value(command.get("focus")?.clone()).ok()?;
+                let mut focuses = self.ui_focus_by_client_tty.lock().unwrap();
+                if focuses.get(client_tty) == Some(&focus) {
+                    return None;
+                }
+                focuses.insert(client_tty.to_string(), focus.clone());
+                Some(ui_focus_json(client_tty.to_string(), focus))
             }
             "repair-width" => {
                 if self.is_sidebar_visible() {
@@ -838,7 +1070,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     _ => return None,
                 };
                 *self.session_filter.lock().unwrap() = Some(filter);
-                Some(self.snapshot_json())
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
             }
             "toggle-worktree-group" => {
                 let key = command.get("key")?.as_str()?.to_string();
@@ -847,7 +1079,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     collapsed.remove(command.get("key")?.as_str()?);
                 }
                 drop(collapsed);
-                Some(self.snapshot_json())
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "focus-agent-pane" => {
                 let session = command.get("session")?.as_str()?;
@@ -871,7 +1103,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     ) || seen_changed;
                     provider.focus_pane(&pane_id);
                 }
-                seen_changed.then(|| self.snapshot_json())
+                seen_changed.then(|| self.invalidate_queries_json(vec![ServerQueryKey::Agents]))
             }
             "kill-agent-pane" => {
                 let session = command.get("session")?.as_str()?;
@@ -890,7 +1122,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         }
     }
 
-    fn handle_sender_command(&self, command: &Value) -> Option<String> {
+    fn handle_sender_command(&self, command: &Value) -> Option<SenderCommandOutcome> {
         self.handle_sender_command_with_context(command, &mut ClientConnectionContext::default())
     }
 
@@ -898,7 +1130,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         &self,
         command: &Value,
         context: &mut ClientConnectionContext,
-    ) -> Option<String> {
+    ) -> Option<SenderCommandOutcome> {
         if command.get("type").and_then(Value::as_str)? != "identify-pane" {
             return None;
         }
@@ -919,10 +1151,11 @@ impl StateSource for ReadOnlyMuxStateSource {
             "identify-pane session={:?} pane={:?} window={:?} -> acknowledge_sidebar_connected",
             context.session_name, context.pane_id, context.window_id,
         ));
-        self.sidebar_coordinator
+        let lifecycle_changed = self
+            .sidebar_coordinator
             .lock()
             .unwrap()
-            .acknowledge_sidebar_connected();
+            .acknowledge_sidebar_window_connected(context.window_id.as_deref());
         if let Some(window_id) = context.window_id.as_deref() {
             for provider in &self.providers {
                 provider.prepare_sidebar_window(window_id);
@@ -935,11 +1168,26 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
         }
         let client_tty = self.providers.first()?.get_client_tty();
-        Some(format!(
-            r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
-            json_string_or_null(Some(session_name)),
-            json_string_or_null(Some(&client_tty)),
-        ))
+        let client_tty = (!client_tty.is_empty()).then_some(client_tty);
+        context.client_tty = client_tty.clone();
+        let ui_focus = client_tty.as_deref().and_then(|client_tty| {
+            self.ui_focus_by_client_tty
+                .lock()
+                .unwrap()
+                .get(client_tty)
+                .cloned()
+        });
+        let reply = serde_json::to_string(&ServerMessage::YourSession {
+            name: session_name.to_string(),
+            client_tty,
+            ui_focus,
+        })
+        .ok();
+        Some(SenderCommandOutcome {
+            reply,
+            broadcast: lifecycle_changed
+                .then(|| self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout])),
+        })
     }
 
     fn handle_http_json(&self, path: &str, body: &Value) -> Option<String> {
@@ -1007,12 +1255,12 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             _ => return None,
         }
-        Some(self.snapshot_json())
+        Some(self.invalidate_queries_json(vec![ServerQueryKey::Sessions]))
     }
 
     fn handle_agent_event_json(&self, body: &Value) -> Result<String, AgentEventError> {
         self.apply_agent_event(body)?;
-        Ok(self.snapshot_json())
+        Ok(self.invalidate_queries_json(vec![ServerQueryKey::Agents]))
     }
 
     fn handle_pi_runtime_upsert(&self, body: &Value) -> Result<(), PiRuntimeError> {
@@ -1038,42 +1286,52 @@ impl StateSource for ReadOnlyMuxStateSource {
         }
         let context = parse_context(body)?;
         let name = context.session.clone();
-        *self.focused_session.lock().unwrap() = Some(name.clone());
-        if self.remember_focused_pane(&context) {
-            return Some(self.snapshot_json());
+        let current_session = self
+            .providers
+            .iter()
+            .find_map(|provider| provider.get_current_session());
+        if current_session.as_deref() != Some(name.as_str()) {
+            let observation = self.remember_focused_pane(&context);
+            return observation
+                .agents_changed
+                .then(|| self.invalidate_queries_json(vec![ServerQueryKey::Agents]));
         }
-        None
+        let previous_session = self.focused_session.lock().unwrap().replace(name.clone());
+        let observation = self.remember_focused_pane(&context);
+        let mut keys = Vec::new();
+        if previous_session.as_deref() != Some(name.as_str()) {
+            keys.push(ServerQueryKey::Focus);
+        }
+        if observation.agents_changed {
+            keys.push(ServerQueryKey::Agents);
+        }
+        (!keys.is_empty()).then(|| self.invalidate_queries_json(keys))
     }
 
     fn handle_http_hook(&self, path: &str, body: &str) -> Option<String> {
         match path {
             "/toggle" => {
-                self.toggle_sidebar();
-                Some(self.snapshot_json())
+                self.toggle_sidebar(body);
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "/ensure-sidebar" => {
                 let spawned = self.ensure_sidebar(body);
                 parse_context_session(body)
                     .map(|name| activate_session_json(name, None))
-                    .or_else(|| spawned.then(|| self.snapshot_json()))
+                    .or_else(|| spawned.then(|| self.invalidate_all_queries_json()))
             }
             "/pane-exited" => {
-                let fallback_sessions = self
+                let display_names = self.sidebar_display_session_names().unwrap_or_default();
+                let sidebar_sessions = self
                     .providers
                     .iter()
                     .flat_map(|provider| provider.list_sidebar_panes(None))
-                    .filter_map(|pane| {
-                        let fallback = self
-                            .session_before(&pane.session_name)
-                            .or_else(|| self.session_after(&pane.session_name))?;
-                        Some((pane.session_name, fallback))
-                    })
-                    .collect::<HashMap<_, _>>();
+                    .map(|pane| pane.session_name)
+                    .collect::<HashSet<_>>();
+                let fallback_sessions =
+                    fallback_sessions_for_sidebar_sessions(&display_names, sidebar_sessions);
                 for provider in &self.providers {
                     provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
-                }
-                if self.is_sidebar_visible() {
-                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
                 }
                 None
             }
@@ -1091,6 +1349,24 @@ impl StateSource for ReadOnlyMuxStateSource {
         let client_tty = parse_context(body).and_then(|context| context.client_tty);
         self.switch_visible_index(index, client_tty.as_deref())
     }
+}
+
+fn fallback_sessions_for_sidebar_sessions(
+    display_names: &[String],
+    sidebar_sessions: HashSet<String>,
+) -> HashMap<String, String> {
+    sidebar_sessions
+        .into_iter()
+        .filter_map(|session| {
+            let index = display_names.iter().position(|name| name == &session)?;
+            let fallback = index
+                .checked_sub(1)
+                .and_then(|idx| display_names.get(idx))
+                .or_else(|| display_names.get(index + 1))
+                .cloned()?;
+            Some((session, fallback))
+        })
+        .collect()
 }
 
 impl ReadOnlyMuxStateSource {
@@ -1141,12 +1417,7 @@ impl ReadOnlyMuxStateSource {
             pane_id,
         });
         if let Some(pane_id) = event_pane_id
-            && self
-                .focused_pane_by_session
-                .lock()
-                .unwrap()
-                .get(&event_session)
-                .is_some_and(|focused_pane| focused_pane == &pane_id)
+            && self.is_focused_pane(&event_session, &pane_id)
         {
             debug_log(format!(
                 "agent-event-focused-pane session={} pane={} -> mark seen",
@@ -1158,6 +1429,24 @@ impl ReadOnlyMuxStateSource {
                 .mark_pane_seen(&event_session, &pane_id);
         }
         Ok(())
+    }
+
+    fn is_focused_pane(&self, session: &str, pane_id: &str) -> bool {
+        if self
+            .focused_pane_by_session
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|focused_pane| focused_pane == pane_id)
+        {
+            return true;
+        }
+        let focused_client_tty = self.focused_client_tty.lock().unwrap().clone();
+        self.providers.iter().any(|provider| {
+            provider
+                .get_client_focus(focused_client_tty.as_deref())
+                .is_some_and(|focus| focus.session_name == session && focus.pane_id == pane_id)
+        })
     }
 
     fn apply_agent_watcher_snapshot(&self, snapshot: AgentWatcherSnapshot) -> bool {
@@ -1476,15 +1765,17 @@ impl ReadOnlyMuxStateSource {
         Some(ports_by_session)
     }
 
-    fn toggle_sidebar(&self) {
+    fn toggle_sidebar(&self, body: &str) {
+        let context = parse_context(body);
         let providers = self
             .providers
             .iter()
             .filter(|provider| provider.is_full_sidebar_capable())
+            .cloned()
             .collect::<Vec<_>>();
         let panes_by_provider = providers
             .iter()
-            .map(|provider| (*provider, provider.list_sidebar_panes(None)))
+            .map(|provider| (provider.clone(), provider.list_sidebar_panes(None)))
             .collect::<Vec<_>>();
 
         if panes_by_provider.iter().any(|(_, panes)| !panes.is_empty()) {
@@ -1498,42 +1789,27 @@ impl ReadOnlyMuxStateSource {
         }
 
         let warmup_until = (self.now_ms)().saturating_add(SIDEBAR_WARMUP_MS);
-        self.sidebar_coordinator
-            .lock()
-            .unwrap()
-            .begin_warmup_until(warmup_until);
         let width = self.current_sidebar_width_u16();
         for provider in providers {
-            let mut unique_windows = Vec::<ActiveWindow>::new();
-            for window in provider.list_active_windows() {
-                if let Some(current) = unique_windows
-                    .iter_mut()
-                    .find(|current| current.id == window.id)
-                {
-                    if !current.active && window.active {
-                        *current = window;
-                    } else {
-                        debug_log(format!(
-                            "toggle_sidebar: skipping duplicate linked window session={} window={}",
-                            window.session_name, window.id,
-                        ));
-                    }
-                    continue;
-                }
-                unique_windows.push(window);
-            }
+            let windows = sidebar_launch_plan(provider.as_ref(), context.as_ref());
+            self.sidebar_coordinator
+                .lock()
+                .unwrap()
+                .begin_warmup_for_windows(
+                    windows.iter().map(|window| window.id.clone()),
+                    warmup_until,
+                );
 
-            for window in unique_windows {
-                debug_log(format!(
-                    "toggle_sidebar: spawning in session={} window={} width={width}",
-                    window.session_name, window.id,
-                ));
-                provider.spawn_sidebar(
-                    &window.session_name,
-                    &window.id,
+            let Some((first, rest)) = windows.split_first() else {
+                continue;
+            };
+            spawn_sidebar_window(provider.as_ref(), first, width, "toggle_sidebar: immediate");
+            if !rest.is_empty() {
+                spawn_staggered_sidebars(
+                    provider,
+                    rest.to_vec(),
                     width,
-                    SidebarPosition::Left,
-                    SIDEBAR_SCRIPTS_DIR,
+                    "toggle_sidebar: staggered",
                 );
             }
         }
@@ -1577,13 +1853,16 @@ impl ReadOnlyMuxStateSource {
             self.sidebar_coordinator
                 .lock()
                 .unwrap()
-                .begin_warmup_until(warmup_until);
-            provider.spawn_sidebar(
-                &session_name,
-                &window_id,
+                .begin_warmup_for_windows([window_id.clone()], warmup_until);
+            spawn_sidebar_window(
+                provider.as_ref(),
+                &ActiveWindow {
+                    id: window_id,
+                    session_name,
+                    active: true,
+                },
                 width,
-                SidebarPosition::Left,
-                SIDEBAR_SCRIPTS_DIR,
+                "ensure_sidebar",
             );
             spawned = true;
         }
@@ -1615,20 +1894,34 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn sidebar_display_session_names(&self) -> Option<Vec<String>> {
-        app_from_state_json(&self.snapshot_json()).map(|app| {
-            app.display_sessions()
-                .into_iter()
-                .map(|session| session.name.clone())
-                .collect()
-        })
+        let state = self.snapshot_state();
+        let collapsed_groups = collapsed_worktree_group_set(&state);
+        Some(display_session_names(
+            &state.sessions,
+            session_projection_options(&state, &collapsed_groups),
+        ))
     }
 
     fn sidebar_reordered_session_names(&self, name: &str, delta: i8) -> Option<Vec<String>> {
-        app_from_state_json(&self.snapshot_json())?.reordered_session_names(name, delta)
+        let state = self.snapshot_state();
+        let collapsed_groups = collapsed_worktree_group_set(&state);
+        reordered_session_names(
+            &state.sessions,
+            session_projection_options(&state, &collapsed_groups),
+            name,
+            delta,
+        )
     }
 
     fn sidebar_reordered_worktree_group_names(&self, key: &str, delta: i8) -> Option<Vec<String>> {
-        app_from_state_json(&self.snapshot_json())?.reordered_worktree_group_names(key, delta)
+        let state = self.snapshot_state();
+        let collapsed_groups = collapsed_worktree_group_set(&state);
+        reordered_worktree_group_names(
+            &state.sessions,
+            session_projection_options(&state, &collapsed_groups),
+            key,
+            delta,
+        )
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
@@ -1683,36 +1976,31 @@ async fn run_sidebar_lifecycle_loop(
                     coordinator.tick_timers(now)
                 };
                 if changed {
-                    debug_log("sidebar_lifecycle_loop: lifecycle changed, broadcasting fresh state");
-                    let _ = state_updates.send(source.snapshot_json());
+                    debug_log("sidebar_lifecycle_loop: lifecycle changed, invalidating queries");
+                    let _ = state_updates
+                        .send(source.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]));
                 }
             }
         }
     }
 }
 
-/// Poll tmux state on a fixed cadence and broadcast a fresh snapshot whenever
-/// the JSON differs from the last broadcast, so the sidebar picks up new
-/// sessions, agent panes, focus changes, and other mux state without requiring
-/// an explicit hook.
+/// Poll tmux state on a fixed cadence and broadcast invalidation whenever the
+/// read model differs from the last poll, so sidebars refetch only their active
+/// typed queries without requiring an explicit hook.
 async fn run_tmux_state_poll_loop(
     source: Arc<ReadOnlyMuxStateSource>,
     state_updates: broadcast::Sender<String>,
     shutdown: broadcast::Sender<()>,
 ) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     let mut shutdown_rx = shutdown.subscribe();
     let mut interval = tokio::time::interval(Duration::from_millis(TMUX_STATE_POLL_MS));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Seed `last_hash` from the current state so the first tick does not
     // broadcast an unprovoked snapshot. Subsequent broadcasts only happen
     // when something other than `ts` actually changes.
-    let mut last_hash: u64 = {
-        let mut hasher = DefaultHasher::new();
-        strip_ts_field(&source.snapshot_json()).hash(&mut hasher);
-        hasher.finish()
-    };
+    source.observe_tmux_agent_state();
+    let mut last_hashes = query_hashes_from_state(&source.snapshot_state());
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => return,
@@ -1720,65 +2008,57 @@ async fn run_tmux_state_poll_loop(
                 // Hooks correct tmux layout churn immediately; this slower poll
                 // is only a backstop for missed external tmux changes.
 
-                let snapshot = source.snapshot_json();
-                // Hash the snapshot ignoring the per-tick `ts` field so that
+                // Hash the state ignoring the per-tick `ts` field so that
                 // identical state on consecutive ticks does not trigger a
-                // wasteful re-broadcast. Anything else changing (sessions,
+                // wasteful invalidation. Anything else changing (sessions,
                 // panes, widths, init state, focus) flips the hash and the
-                // sidebar receives a fresh state.
-                let stripped = strip_ts_field(&snapshot);
-                let mut hasher = DefaultHasher::new();
-                stripped.hash(&mut hasher);
-                let hash = hasher.finish();
-                if hash != last_hash {
-                    last_hash = hash;
-                    debug_log("tmux_state_poll_loop: state changed, broadcasting");
-                    let _ = state_updates.send(snapshot);
+                // sidebar refetches its active typed queries.
+                let agent_observation_changed = source.observe_tmux_agent_state();
+                let next_state = source.snapshot_state();
+                let next_hashes = query_hashes_from_state(&next_state);
+                let mut changed_keys = [
+                    (ServerQueryKey::Focus, 2_usize),
+                    (ServerQueryKey::SidebarLayout, 3_usize),
+                ]
+                    .into_iter()
+                    .filter_map(|(key, index)| {
+                        (last_hashes.get(index) != next_hashes.get(index)).then_some(key)
+                    })
+                    .collect::<Vec<_>>();
+                if agent_observation_changed {
+                    changed_keys.push(ServerQueryKey::Agents);
+                }
+                if !changed_keys.is_empty() {
+                    let mut deduped_keys = Vec::new();
+                    for key in changed_keys {
+                        if !deduped_keys.contains(&key) {
+                            deduped_keys.push(key);
+                        }
+                    }
+                    let changed_keys = deduped_keys;
+                    last_hashes = next_hashes;
+                    debug_log(format!(
+                        "tmux_state_poll_loop: state changed, invalidating {changed_keys:?}",
+                    ));
+                    let _ = state_updates.send(source.invalidate_queries_json(changed_keys));
                 }
             }
         }
     }
 }
 
-/// Remove `,"ts":\d+` (or leading variant) from a JSON snapshot string so a
-/// monotonically increasing timestamp does not defeat the change-detection
-/// hash in `run_tmux_state_poll_loop`. Cheap byte scan; no full JSON parse.
-fn strip_ts_field(snapshot: &str) -> String {
-    let mut out = String::with_capacity(snapshot.len());
-    let bytes = snapshot.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest = &snapshot[i..];
-        let key = "\"ts\":";
-        if rest.starts_with(key)
-            || rest.starts_with(&format!(",{key}"))
-            || rest.starts_with(&format!("{{{key}"))
-        {
-            // Preserve a leading `,` or `{` while dropping the rest of the
-            // `"ts":<digits>` token.
-            let mut prefix_len = 0;
-            if rest.starts_with(',') || rest.starts_with('{') {
-                prefix_len = 1;
-                out.push(rest.chars().next().unwrap());
-            }
-            // Skip past `"ts":`
-            let mut j = i + prefix_len + key.len();
-            // Skip digits.
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            // If we left a leading `,`, also drop a trailing `,` to avoid
-            // doubling separators when ts was sandwiched.
-            if prefix_len == 1 && bytes.get(i) == Some(&b',') && bytes.get(j) == Some(&b',') {
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        out.push(snapshot[i..].chars().next().unwrap());
-        i += snapshot[i..].chars().next().unwrap().len_utf8();
-    }
-    out
+fn query_hashes_from_state(state: &ServerState) -> Vec<u64> {
+    all_query_keys()
+        .into_iter()
+        .map(|key| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let data = query_data_from_state(key, state.clone());
+            serde_json::to_string(&data)
+                .expect("query hash serialization must succeed")
+                .hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
 }
 
 async fn run_agent_watcher_loop(
@@ -1820,7 +2100,8 @@ async fn run_agent_watcher_loop(
                             "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
                         ));
                         last_seen.insert(key, fingerprint);
-                        let _ = state_updates.send(source.snapshot_json());
+                        let _ = state_updates
+                            .send(source.invalidate_queries_json(vec![ServerQueryKey::Agents]));
                     } else {
                         debug_log(format!(
                             "agent_watcher_loop: dropped snapshot agent={agent} status={status:?} (no matching session)",
@@ -2171,18 +2452,160 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn json_string_or_null(value: Option<&str>) -> String {
-    value
-        .map(|value| serde_json::to_string(value).expect("string must serialize"))
-        .unwrap_or_else(|| "null".to_string())
-}
-
 fn activate_session_json(name: String, source_pane_id: Option<&str>) -> String {
-    serde_json::to_string(&SidebarServerMessage::ActivateSession {
+    serde_json::to_string(&ServerMessage::ActivateSession {
         name,
         source_pane_id: source_pane_id.map(str::to_string),
     })
     .expect("activate-session must serialize")
+}
+
+fn ui_focus_json(client_tty: String, focus: ClientUiFocus) -> String {
+    serde_json::to_string(&ServerMessage::UiFocus { client_tty, focus })
+        .expect("ui-focus must serialize")
+}
+
+fn all_query_keys() -> Vec<ServerQueryKey> {
+    vec![
+        ServerQueryKey::Sessions,
+        ServerQueryKey::Agents,
+        ServerQueryKey::Focus,
+        ServerQueryKey::SidebarLayout,
+        ServerQueryKey::Settings,
+    ]
+}
+
+fn invalidate_queries_json(keys: Vec<ServerQueryKey>) -> String {
+    serde_json::to_string(&ServerMessage::Invalidate {
+        keys,
+        ts: current_time_ms(),
+    })
+    .expect("invalidate must serialize")
+}
+
+fn sidebar_launch_plan(
+    provider: &dyn MuxProvider,
+    context: Option<&HttpContext>,
+) -> Vec<ActiveWindow> {
+    let existing_sidebar_windows = provider
+        .list_sidebar_panes(None)
+        .into_iter()
+        .map(|pane| pane.window_id)
+        .collect::<HashSet<_>>();
+    let mut windows = Vec::<ActiveWindow>::new();
+    for window in provider.list_sidebar_target_windows() {
+        if existing_sidebar_windows.contains(&window.id) {
+            continue;
+        }
+        if windows.iter().any(|current| current.id == window.id) {
+            continue;
+        }
+        windows.push(window);
+    }
+    windows.sort_by_key(|window| sidebar_launch_rank(window, context));
+    windows
+}
+
+fn sidebar_launch_rank(window: &ActiveWindow, context: Option<&HttpContext>) -> (u8, bool) {
+    let Some(context) = context else {
+        return (u8::from(!window.active), !window.active);
+    };
+    if window.id == context.window_id {
+        return (0, false);
+    }
+    if window.session_name == context.session {
+        return (1, !window.active);
+    }
+    (2, !window.active)
+}
+
+fn spawn_sidebar_window(
+    provider: &dyn MuxProvider,
+    window: &ActiveWindow,
+    width: u16,
+    reason: &str,
+) {
+    debug_log(format!(
+        "{reason}: spawning in session={} window={} width={width}",
+        window.session_name, window.id,
+    ));
+    provider.spawn_sidebar(
+        &window.session_name,
+        &window.id,
+        width,
+        SidebarPosition::Left,
+        SIDEBAR_SCRIPTS_DIR,
+    );
+}
+
+fn spawn_staggered_sidebars(
+    provider: Arc<dyn MuxProvider>,
+    windows: Vec<ActiveWindow>,
+    width: u16,
+    reason: &'static str,
+) {
+    std::thread::spawn(move || {
+        for window in windows {
+            std::thread::sleep(Duration::from_millis(SIDEBAR_STAGGER_MS));
+            spawn_sidebar_window(provider.as_ref(), &window, width, reason);
+        }
+    });
+}
+
+fn query_result_json_from_state(key: ServerQueryKey, state: ServerState, ts: u64) -> String {
+    query_result_json_from_data(key, query_data_from_state(key, state), ts)
+}
+
+fn query_result_json_from_data(key: ServerQueryKey, data: ServerQueryData, ts: u64) -> String {
+    serde_json::to_string(&ServerMessage::QueryResult { key, data, ts })
+        .expect("query result must serialize")
+}
+
+fn query_data_from_state(key: ServerQueryKey, state: ServerState) -> ServerQueryData {
+    match key {
+        ServerQueryKey::Sessions => ServerQueryData::Sessions {
+            sessions: state
+                .sessions
+                .into_iter()
+                .map(|mut session| {
+                    session.unseen = false;
+                    session.agent_state = None;
+                    session.agents.clear();
+                    session.event_timestamps.clear();
+                    session
+                })
+                .collect(),
+        },
+        ServerQueryKey::Agents => ServerQueryData::Agents {
+            sessions: state
+                .sessions
+                .into_iter()
+                .map(|session| SessionAgentsData {
+                    session: session.name,
+                    unseen: session.unseen,
+                    agent_state: session.agent_state,
+                    agents: session.agents,
+                    event_timestamps: session.event_timestamps,
+                })
+                .collect(),
+        },
+        ServerQueryKey::Focus => ServerQueryData::Focus {
+            focused_session: state.focused_session,
+            current_session: state.current_session,
+        },
+        ServerQueryKey::SidebarLayout => ServerQueryData::SidebarLayout {
+            sidebar_width: state.sidebar_width,
+            detail_panel_height: state.detail_panel_height,
+            initializing: state.initializing,
+            init_label: state.init_label,
+            collapsed_worktree_groups: state.collapsed_worktree_groups,
+        },
+        ServerQueryKey::Settings => ServerQueryData::Settings {
+            theme: state.theme,
+            session_filter: state.session_filter,
+            agent_panel_scope: state.agent_panel_scope,
+        },
+    }
 }
 
 fn parse_metadata_tone(value: &str) -> Option<MetadataTone> {
@@ -2501,9 +2924,43 @@ async fn handle_connection(
     let parsed = parse_http_request(&request)?;
     read_remaining_http_body(&mut stream, &mut request, parsed.content_length()).await?;
 
+    if parsed.method == "GET" && parsed.path == "/version" {
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    VERSION_HTTP_BODY.len(),
+                    VERSION_HTTP_BODY
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
+    if parsed.method == "GET" && parsed.path == "/debug/agents" {
+        let body = state_source
+            .as_ref()
+            .and_then(|state_source| state_source.debug_agents_json(parsed.query_param("session")))
+            .unwrap_or_else(|| "{\"error\":\"state source unavailable\"}".to_string());
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
     if parsed.method == "POST" && parsed.path == "/refresh" {
-        if let Some(state_source) = &state_source {
-            let _ = state_updates.send(state_source.snapshot_json());
+        if let Some(state_source) = state_source.as_ref() {
+            let _ = state_updates.send(state_source.invalidate_all_queries_json());
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -2551,10 +3008,11 @@ async fn handle_connection(
 
     if parsed.method == "POST" && is_ok_hook_path(&parsed.path) {
         let body = String::from_utf8_lossy(http_body(&request));
-        if let Some(state_source) = &state_source {
-            if let Some(payload) = state_source.handle_http_hook(&parsed.path, &body) {
-                let _ = state_updates.send(payload);
-            }
+        if let Some(payload) = state_source
+            .as_ref()
+            .and_then(|state_source| state_source.handle_http_hook(&parsed.path, &body))
+        {
+            let _ = state_updates.send(payload);
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -2719,21 +3177,12 @@ async fn handle_connection(
             .await?;
 
         let mut websocket = ServerBuilder::new().serve(stream);
-        debug_log("ws: client connected, sending hello + initial state");
+        debug_log("ws: client connected, sending hello");
         websocket.send(Message::text(HELLO_JSON)).await?;
-        if let Some(state_source) = &state_source {
-            websocket
-                .send(Message::text(state_source.snapshot_json()))
-                .await?;
-        }
 
         let mut connection_shutdown = shutdown.subscribe();
-        let mut state_rx = state_updates.subscribe();
+        let mut state_update_rx = state_updates.subscribe();
         let mut client_context = ClientConnectionContext::default();
-        let mut pending_state: Option<String> = None;
-        let mut state_flush =
-            tokio::time::interval(Duration::from_millis(RENDERED_SIDEBAR_FRAME_MS));
-        state_flush.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
@@ -2756,16 +3205,28 @@ async fn handle_connection(
                                 return Ok(());
                             }
                             if is_command_type(&message, "refresh")
-                                && let Some(state_source) = &state_source
+                                && let Some(state_source) = state_source.as_ref()
                             {
-                                let _ = state_updates.send(state_source.snapshot_json());
+                                let _ = state_updates.send(state_source.invalidate_all_queries_json());
                             }
                             if let Some(command) = parse_command(&message) {
                                 if let Some(reply) = state_source
                                     .as_ref()
-                                    .and_then(|state_source| state_source.handle_sender_command_with_context(&command, &mut client_context))
+                                    .and_then(|state_source| fetch_query_reply(state_source.as_ref(), &command))
                                 {
                                     websocket.send(Message::text(reply)).await?;
+                                    continue;
+                                }
+                                if let Some(outcome) = state_source
+                                    .as_ref()
+                                    .and_then(|state_source| state_source.handle_sender_command_with_context(&command, &mut client_context))
+                                {
+                                    if let Some(reply) = outcome.reply {
+                                        websocket.send(Message::text(reply)).await?;
+                                    }
+                                    if let Some(payload) = outcome.broadcast {
+                                        let _ = state_updates.send(payload);
+                                    }
                                 }
                                 if let Some(name) = switch_session_target(&command) {
                                     let _ = state_updates.send(activate_session_json(
@@ -2790,30 +3251,18 @@ async fn handle_connection(
                         None => return Ok(()),
                     }
                 }
-                _ = state_flush.tick(), if pending_state.is_some() => {
-                    let state = pending_state.take().expect("pending state checked above");
-                    debug_log(format!(
-                        "ws: flushing latest broadcast state ({} bytes) to client",
-                        state.len()
-                    ));
-                    websocket.send(Message::text(state)).await?;
-                }
-                state = state_rx.recv() => {
-                    match state {
-                        Ok(state) => {
-                            if state == QUIT_JSON {
+                payload = state_update_rx.recv() => {
+                    match payload {
+                        Ok(payload) => {
+                            if payload == QUIT_JSON {
                                 let _ = websocket.send(Message::text(QUIT_JSON)).await;
                                 return Ok(());
                             }
-                            if is_immediate_server_message(&state) {
-                                websocket.send(Message::text(state)).await?;
-                                continue;
-                            }
-                            pending_state = Some(state);
+                            websocket.send(Message::text(payload)).await?;
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            debug_log(format!("ws: state_rx lagged by {n} messages"));
+                            debug_log(format!("ws: state_update_rx lagged by {n} messages"));
                         }
                     }
                 }
@@ -2827,13 +3276,18 @@ async fn handle_connection(
     Ok(())
 }
 
-fn app_from_state_json(state_json: &str) -> Option<SidebarApp> {
-    let SidebarServerMessage::State(state) =
-        serde_json::from_str::<SidebarServerMessage>(state_json).ok()?
-    else {
-        return None;
-    };
-    Some(SidebarApp::from_state(state))
+fn collapsed_worktree_group_set(state: &ServerState) -> HashSet<String> {
+    state.collapsed_worktree_groups.iter().cloned().collect()
+}
+
+fn session_projection_options<'a>(
+    state: &ServerState,
+    collapsed_groups: &'a HashSet<String>,
+) -> SessionProjectionOptions<'a> {
+    SessionProjectionOptions {
+        filter: state.session_filter.unwrap_or_default(),
+        collapsed_groups,
+    }
 }
 
 async fn read_http_header(stream: &mut TcpStream) -> Result<Vec<u8>, ServerError> {
@@ -3008,8 +3462,12 @@ fn switch_session_target(command: &Value) -> Option<String> {
         .then(|| command.get("name")?.as_str().map(str::to_string))?
 }
 
-fn is_immediate_server_message(payload: &str) -> bool {
-    payload.contains(r#""type":"activate-session""#)
+fn fetch_query_reply(state_source: &dyn StateSource, command: &Value) -> Option<String> {
+    if command.get("type").and_then(Value::as_str)? != "fetch-query" {
+        return None;
+    }
+    let key = serde_json::from_value(command.get("key")?.clone()).ok()?;
+    state_source.query_result_json(key)
 }
 
 fn clamp_detail_panel_height(height: u16) -> u16 {
@@ -3018,4 +3476,178 @@ fn clamp_detail_panel_height(height: u16) -> u16 {
 
 fn parse_command(message: &Message) -> Option<Value> {
     serde_json::from_str::<Value>(message.as_text()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opensessions_runtime::mux::MuxSessionInfo;
+    use opensessions_runtime::protocol::{AgentStatus, LocalLink, SessionData};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[derive(Default)]
+    struct CountingProvider {
+        list_sessions_calls: AtomicUsize,
+    }
+
+    impl MuxProvider for CountingProvider {
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+            self.list_sessions_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            vec![MuxSessionInfo {
+                name: "work".to_string(),
+                created_at: 1,
+                dir: "/repo".to_string(),
+                windows: 1,
+            }]
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+
+        fn get_current_session(&self) -> Option<String> {
+            Some("work".to_string())
+        }
+
+        fn get_session_dir(&self, _name: &str) -> String {
+            "/repo".to_string()
+        }
+
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+
+        fn get_client_tty(&self) -> String {
+            "/dev/ttys001".to_string()
+        }
+
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    struct EmptyPortCommandRunner;
+
+    impl PortCommandRunner for EmptyPortCommandRunner {
+        fn process_rows(&self) -> Vec<(u32, u32)> {
+            Vec::new()
+        }
+
+        fn lsof_fields(&self) -> String {
+            String::new()
+        }
+    }
+
+    struct EmptyGitCommandRunner;
+
+    impl GitCommandRunner for EmptyGitCommandRunner {
+        fn git_info_output(&self, _dir: &str) -> String {
+            String::new()
+        }
+    }
+
+    fn state() -> ServerState {
+        ServerState {
+            sessions: vec![SessionData {
+                name: "work".to_string(),
+                created_at: 1,
+                dir: "/repo".to_string(),
+                branch: "main".to_string(),
+                dirty: false,
+                changed_files: 0,
+                insertions: 0,
+                deletions: 0,
+                is_worktree: false,
+                unseen: true,
+                panes: 1,
+                ports: Vec::new(),
+                local_links: Vec::<LocalLink>::new(),
+                windows: 1,
+                uptime: "0m".to_string(),
+                agent_state: Some(AgentEvent {
+                    agent: "amp".to_string(),
+                    session: "work".to_string(),
+                    status: AgentStatus::Running,
+                    ts: 10,
+                    thread_id: None,
+                    thread_name: None,
+                    last_user_prompt: None,
+                    unseen: Some(true),
+                    pane_id: None,
+                    liveness: None,
+                }),
+                agents: Vec::new(),
+                event_timestamps: vec![10],
+                metadata: None,
+            }],
+            focused_session: Some("work".to_string()),
+            current_session: Some("work".to_string()),
+            theme: Some("dark".to_string()),
+            session_filter: Some(SessionFilterMode::Running),
+            agent_panel_scope: AgentPanelScope::All,
+            sidebar_width: 44,
+            detail_panel_height: 12,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: vec!["/repo".to_string()],
+            ts: 99,
+        }
+    }
+
+    #[test]
+    fn query_data_from_state_returns_typed_read_models() {
+        match query_data_from_state(ServerQueryKey::Settings, state()) {
+            ServerQueryData::Settings {
+                theme,
+                session_filter,
+                agent_panel_scope,
+            } => {
+                assert_eq!(theme.as_deref(), Some("dark"));
+                assert_eq!(session_filter, Some(SessionFilterMode::Running));
+                assert_eq!(agent_panel_scope, AgentPanelScope::All);
+            }
+            other => panic!("expected settings query data, got {other:?}"),
+        }
+
+        match query_data_from_state(ServerQueryKey::Agents, state()) {
+            ServerQueryData::Agents { sessions } => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].session, "work");
+                assert!(sessions[0].unseen);
+                assert_eq!(sessions[0].event_timestamps, vec![10]);
+            }
+            other => panic!("expected agents query data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_results_are_shared_until_invalidation() {
+        let provider = Arc::new(CountingProvider::default());
+        let source = ReadOnlyMuxStateSource::new(vec![provider.clone()])
+            .with_now_ms(|| 100_000)
+            .with_port_command_runner(Arc::new(EmptyPortCommandRunner))
+            .with_git_command_runner(Arc::new(EmptyGitCommandRunner));
+
+        let _ = source.query_result_json(ServerQueryKey::Sessions);
+        let calls_after_first_fetch = provider.list_sessions_calls.load(AtomicOrdering::Relaxed);
+        let _ = source.query_result_json(ServerQueryKey::Sessions);
+
+        assert_eq!(
+            provider.list_sessions_calls.load(AtomicOrdering::Relaxed),
+            calls_after_first_fetch,
+            "same-generation query result should be reused across clients"
+        );
+
+        let _ = source.invalidate_queries_json(vec![ServerQueryKey::Sessions]);
+        let _ = source.query_result_json(ServerQueryKey::Sessions);
+
+        assert!(
+            provider.list_sessions_calls.load(AtomicOrdering::Relaxed) > calls_after_first_fetch,
+            "invalidating the query should force one fresh read"
+        );
+    }
 }

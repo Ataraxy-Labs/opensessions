@@ -17,39 +17,28 @@ source); use `#[serde(rename_all = "camelCase")]` on every struct.
 
 Tagged union on `type` field.
 
-### `state`
+### `query-result`
 
-The full state broadcast. Sent on connect and after every change.
+The query read-model response. The TUI fetches each read model by key on connect. Server-initiated WebSocket updates broadcast `invalidate` messages; clients refetch the active keys they observe.
 
 ```ts
-interface ServerState {
-  type: "state";
-  sessions: SessionData[];
-  focusedSession: string | null;
-  currentSession: string | null;
-  theme: string | undefined;          // theme name
-  sessionFilter: SessionFilterMode | undefined;
-  sidebarWidth: number;
-  initializing: boolean;
-  initLabel?: string;
-  ts: number;                         // ms epoch
+interface QueryResult {
+  type: "query-result";
+  key: "sessions" | "agents" | "focus" | "sidebar-layout" | "settings";
+  data: ServerQueryData;
+  ts: number;
 }
 ```
 
 ```rust
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerState {
-    pub sessions: Vec<SessionData>,
-    pub focused_session: Option<String>,
-    pub current_session: Option<String>,
-    pub theme: Option<String>,
-    pub session_filter: Option<SessionFilterMode>,
-    pub sidebar_width: u32,
-    pub initializing: bool,
-    #[serde(default)]
-    pub init_label: Option<String>,
-    pub ts: u64,
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ServerQueryData {
+    Sessions { sessions: Vec<SessionData> },
+    Agents { sessions: Vec<SessionAgentsData> },
+    Focus { focused_session: Option<String>, current_session: Option<String> },
+    SidebarLayout { sidebar_width: u32, detail_panel_height: u32, initializing: bool, init_label: Option<String>, collapsed_worktree_groups: Vec<String> },
+    Settings { theme: Option<String>, session_filter: Option<SessionFilterMode>, agent_panel_scope: AgentPanelScope },
 }
 ```
 
@@ -82,7 +71,8 @@ Client should re-send an `identify-pane` command.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ServerMessage {
-    State(ServerState),
+    QueryResult { key: ServerQueryKey, data: ServerQueryData, ts: u64 },
+    Invalidate { keys: Vec<ServerQueryKey>, ts: u64 },
     Quit,
     YourSession { name: String, client_tty: Option<String> },
     ReIdentify,
@@ -91,7 +81,7 @@ pub enum ServerMessage {
 
 > ⚠ Note: TS uses `"your-session"` and `"re-identify"` (kebab-case). Confirm
 > that `#[serde(rename_all = "kebab-case")]` on the **enum tag** matches.
-> `State` → `state`, `Focus` → `focus`, `Quit` → `quit`,
+> `QueryResult` → `query-result`, `Invalidate` → `invalidate`, `Quit` → `quit`,
 > `YourSession` → `your-session`, `ReIdentify` → `re-identify`. ✅
 
 ## Nested types
@@ -365,8 +355,8 @@ pub enum ClientCommand {
 ## Protocol type ownership (current)
 
 Rust protocol types are owned in `packages/runtime-rs/src/protocol.rs`. The
-sidebar re-exports those types from `packages/sidebar-core-rs/src/generated/protocol.rs`
-so server, sidebar core, and TUI code compile against one Rust source of truth.
+sidebar re-exports those types from `apps/tui-rs/src/generated/protocol.rs`
+so server and TUI code compile against one Rust source of truth.
 
 ## Codegen path (future TS sync)
 

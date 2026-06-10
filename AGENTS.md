@@ -30,7 +30,6 @@ opensessions/
 │   └── pi-extension/       # Pi runtime helper integration
 ├── packages/
 │   ├── runtime-rs/         # Shared Rust runtime: config, protocol, tracker, tmux provider, watchers
-│   └── sidebar-core-rs/    # Sidebar app state, input handling, rendering, layout, hit testing
 ├── CONTRACTS.md            # Supported agent event and runtime integration contracts
 ├── opensessions.tmux       # Root TPM entrypoint
 ├── Cargo.toml              # Rust workspace root
@@ -40,7 +39,7 @@ opensessions/
 ## Key Architecture Decisions
 
 1. **Rust-first runtime**: the supported server and TUI are Rust crates in `apps/*-rs` and `packages/*-rs`.
-2. **Ratatui sidebar**: rendering is immediate-mode Ratatui/Crossterm. Shared UI logic lives in `packages/sidebar-core-rs` so renderer, input, tests, and E2E flows use one source of truth.
+2. **Ratatui sidebar**: rendering is immediate-mode Ratatui/Crossterm. Sidebar UI state, input, layout, rendering, and hit testing live in `apps/tui-rs`; shared non-UI runtime logic lives in `packages/runtime-rs`.
 3. **Built-in agent watchers**: the Rust server scans Amp, Claude Code, Codex, OpenCode, Pi, and Droid state directly and converts it into `AgentEvent`s.
 4. **External agent events via HTTP**: third-party agents should POST to `/api/agent-event` or use the metadata endpoints. TypeScript plugin loading is not a supported runtime path right now.
 5. **Tmux is the supported mux**: abstractions remain mux-shaped, but tmux is the only documented supported provider. Older zellij helper code is not part of the support promise.
@@ -100,7 +99,7 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 
 ```bash
 cargo test --workspace                         # Run Rust tests
-cargo test -p opensessions-sidebar-core        # Focused sidebar core tests
+cargo test -p opensessions-sidebar             # Focused sidebar and UI module tests
 cargo test -p opensessions-sidebar --test tmux_e2e -- --nocapture
 cargo build --release                          # Build local dev binaries
 cargo run -p opensessions-server               # Start server directly

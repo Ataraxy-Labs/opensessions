@@ -1,0 +1,11 @@
+[package]
+name = "ratatui-query"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ratatui_query"
+path = "src/lib.rs"
+
+[dependencies]
+query-core = { path = "../query-core-rs" }

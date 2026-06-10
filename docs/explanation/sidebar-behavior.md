@@ -356,7 +356,7 @@ Before shipping any sidebar behavior change, verify all of these.
 - `apps/tui-rs/src/main.rs`
 - `apps/tui-rs/tests/tmux_e2e.rs`
 - `packages/runtime-rs/src/sidebar_coordinator.rs`
-- `packages/sidebar-core-rs/src/app.rs`
+- `apps/tui-rs/src/app.rs`
 - `packages/runtime-rs/src/mux.rs`
 - `packages/runtime-rs/src/tmux_provider.rs`
 - `apps/tui/scripts/start.sh`

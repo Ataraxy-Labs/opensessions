@@ -22,6 +22,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Run Rust lint gates
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Build binaries used by tmux E2E
         run: cargo build --workspace --bins
 

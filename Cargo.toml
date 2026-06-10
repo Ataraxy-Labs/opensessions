@@ -3,7 +3,8 @@ members = [
     "apps/tui-rs",
     "apps/server-rs",
     "packages/runtime-rs",
-    "packages/sidebar-core-rs",
+    "packages/ratatui-query-rs",
+    "packages/query-core-rs",
 ]
 resolver = "2"
 

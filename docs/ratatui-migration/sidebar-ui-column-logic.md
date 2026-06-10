@@ -172,7 +172,7 @@ Interaction remains unchanged:
 
 ## Test coverage
 
-The concrete rendering rules above are covered by `opensessions-sidebar-core`
+The concrete rendering rules above are covered by `opensessions-sidebar`
 unit tests that build the real render model:
 
 - `session_rows_show_inline_agent_signals_and_spaced_header`

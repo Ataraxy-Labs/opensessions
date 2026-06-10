@@ -63,7 +63,7 @@ Legend:
 | Reactive store (sessions) | ✅ | Plain `Vec<SessionData>` in `App` |
 | Memoized derived state | ✅ | Compute on read in render (cheap) |
 | Modal state machine | ✅ | `enum Modal` |
-| Optimistic local updates | ✅ | Set state, then send command; reconcile via state broadcast |
+| Optimistic local updates | ✅ | Set local UI state, then send command; reconcile via invalidation + typed query refetch |
 | Re-identify on session change | ✅ | Periodic check (2 s) or on focus change |
 | `_os_stash` sentinel handling | ✅ | Filter from list; skip identify-pane |
 | Flash messages with TTL | ✅ | `Option<Flash>` with `Instant` expiry |

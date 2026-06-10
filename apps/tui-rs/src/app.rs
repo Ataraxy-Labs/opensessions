@@ -4,12 +4,19 @@ use std::time::{Duration, Instant};
 use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 
 use crate::generated::protocol::{
-    AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, ClientCommand, ServerMessage,
-    ServerState, SessionData, SessionFilterMode,
+    AgentEvent, AgentLiveness, AgentPanelScope, ClientCommand, ClientSidebarFocus, ClientUiFocus,
+    ClientUiPanel, ServerMessage, ServerQueryData, ServerQueryKey, ServerState, SessionAgentsData,
+    SessionData, SessionFilterMode,
 };
 use crate::renderer::{AgentPaneTarget, HitTarget, agent_focus_target};
+use crate::server_query::{QueryResult, ServerStateQuery};
 pub use crate::session_display::DisplaySessionEntry;
-use crate::session_display::{session_display_entries, worktree_group_key};
+use crate::session_display::{
+    SessionProjectionOptions, display_sessions as projection_display_sessions, filtered_sessions,
+    project_sessions, reordered_session_names as projection_reordered_session_names,
+    reordered_worktree_group_names as projection_reordered_worktree_group_names,
+    worktree_group_key, worktree_group_label, worktree_group_session_names,
+};
 
 pub const SESSION_CARD_HEIGHT: usize = 2;
 const MIN_DETAIL_PANEL_HEIGHT: usize = 4;
@@ -85,6 +92,7 @@ pub enum Modal {
 
 #[derive(Debug)]
 pub struct App {
+    pub server_state_query: ServerStateQuery,
     pub sessions: Vec<SessionData>,
     pub sidebar_focus: Option<SidebarFocus>,
     pub current_session: Option<String>,
@@ -118,9 +126,11 @@ pub struct App {
     last_activated_session: Option<String>,
     terminal_width: Option<u16>,
     pane_identity: Option<PaneIdentity>,
+    client_tty: Option<String>,
     pending_sidebar_width_intent: Option<u16>,
     pending_detail_panel_height_intent: Option<usize>,
     pending_agent_panel_scope_intent: Option<AgentPanelScope>,
+    initial_secondary_queries_sent: bool,
     commands: Vec<ClientCommand>,
     pending_launches: Vec<LaunchTarget>,
 }
@@ -133,8 +143,64 @@ pub struct PaneIdentity {
 }
 
 impl App {
-    pub fn from_state(state: ServerState) -> Self {
+    pub fn connecting() -> Self {
         let mut app = Self {
+            server_state_query: ServerStateQuery::connecting(),
+            sessions: Vec::new(),
+            sidebar_focus: None,
+            current_session: None,
+            my_session: None,
+            initializing: true,
+            init_label: Some("loading…".to_string()),
+            sidebar_width: 26,
+            theme: None,
+            ts: 0,
+            spinner_now: 0,
+            session_filter: SessionFilterMode::All,
+            panel_focus: PanelFocus::Sessions,
+            agent_panel_scope: AgentPanelScope::Current,
+            focused_agent_idx: 0,
+            quit_deadline: None,
+            flash_target: None,
+            flash_deadline: None,
+            hover_target: None,
+            modal: Modal::None,
+            detail_panel_height: MIN_DETAIL_PANEL_HEIGHT,
+            session_scroll_offset: 0,
+            session_scroll_follows_focus: true,
+            resize_drag_state: None,
+            pending_switch_session: None,
+            group_focus_surrogate_for: None,
+            collapsed_worktree_groups: HashSet::new(),
+            last_activated_session: None,
+            terminal_width: None,
+            pane_identity: None,
+            client_tty: None,
+            pending_sidebar_width_intent: None,
+            pending_detail_panel_height_intent: None,
+            pending_agent_panel_scope_intent: None,
+            initial_secondary_queries_sent: false,
+            commands: Vec::new(),
+            pending_launches: Vec::new(),
+        };
+        app.commands
+            .extend(ServerStateQuery::initial_fetch_commands());
+        app
+    }
+
+    pub fn from_state(state: ServerState) -> Self {
+        let mut server_state_query = ServerStateQuery::connecting();
+        for key in [
+            ServerQueryKey::Sessions,
+            ServerQueryKey::Agents,
+            ServerQueryKey::Focus,
+            ServerQueryKey::SidebarLayout,
+            ServerQueryKey::Settings,
+        ] {
+            server_state_query.observe_query_success(key, state.ts);
+        }
+        let mut app = Self {
+            server_state_query,
             sessions: state.sessions,
             sidebar_focus: None,
             current_session: None,
@@ -166,9 +232,11 @@ impl App {
             last_activated_session: None,
             terminal_width: None,
             pane_identity: None,
+            client_tty: None,
             pending_sidebar_width_intent: None,
             pending_detail_panel_height_intent: None,
             pending_agent_panel_scope_intent: None,
+            initial_secondary_queries_sent: true,
             commands: Vec::new(),
             pending_launches: Vec::new(),
         };
@@ -245,35 +313,35 @@ impl App {
         self.pane_identity.as_ref()
     }
 
+    pub fn server_state_result(&self) -> QueryResult<'_> {
+        self.server_state_query.result()
+    }
+
     pub fn apply_server_message(&mut self, message: ServerMessage) {
         match message {
-            ServerMessage::State(state) => {
-                let previous_focus = self.sidebar_focus.clone();
-                let server_current = state.current_session.clone();
-                self.sessions = state.sessions;
-                self.initializing = state.initializing;
-                self.init_label = state.init_label;
-                self.apply_server_sidebar_width(state.sidebar_width.min(u16::MAX as u32) as u16);
-                self.theme = state.theme;
-                self.ts = state.ts;
-                self.session_filter = state.session_filter.unwrap_or_default();
-                self.apply_server_agent_panel_scope(state.agent_panel_scope);
-                self.apply_server_detail_panel_height(state.detail_panel_height as usize);
-                self.collapsed_worktree_groups =
-                    state.collapsed_worktree_groups.into_iter().collect();
-                self.clear_missing_pending_switch();
-                self.rehome_expanded_group_surrogate();
-                let focus_still_exists = previous_focus
-                    .as_ref()
-                    .is_some_and(|focus| self.focus_exists(focus));
-                if !focus_still_exists {
-                    self.rehome_missing_focus();
-                }
-                self.clear_background_pending_switch(server_current.as_deref());
-                self.clamp_session_scroll_offset(0);
+            ServerMessage::Invalidate { keys, .. } => {
+                let active = self.server_state_query.observe_invalidation(keys);
+                self.commands
+                    .extend(self.server_state_query.refetch_commands(active));
             }
-            ServerMessage::YourSession { name, .. } => {
+            ServerMessage::QueryResult { key, data, ts } => {
+                self.apply_query_result(key, data, ts);
+            }
+            ServerMessage::YourSession {
+                name,
+                client_tty,
+                ui_focus,
+            } => {
+                self.client_tty = client_tty;
                 self.confirm_local_session(name, true);
+                if let Some(focus) = ui_focus {
+                    self.apply_client_ui_focus(focus);
+                }
+            }
+            ServerMessage::UiFocus { client_tty, focus } => {
+                if self.client_tty.as_deref() == Some(client_tty.as_str()) {
+                    self.apply_client_ui_focus(focus);
+                }
             }
             ServerMessage::ActivateSession {
                 name,
@@ -291,7 +359,8 @@ impl App {
                     .unwrap_or(false);
                 if !from_this_pane
                     && self.confirmed_local_session_name() == Some(name.as_str())
-                    && previous_activated.as_deref() != Some(name.as_str())
+                    && (previous_activated.as_deref() != Some(name.as_str())
+                        || self.activation_focus_needs_rehome(name.as_str()))
                 {
                     self.confirm_local_session(name, true);
                 }
@@ -309,147 +378,185 @@ impl App {
         }
     }
 
-    pub fn filtered_sessions(&self) -> impl Iterator<Item = &SessionData> {
-        let mode = self.session_filter;
-        self.sessions.iter().filter(move |session| {
-            if session.name == "_os_stash" {
-                return false;
+    fn apply_query_result(&mut self, key: ServerQueryKey, data: ServerQueryData, ts: u64) {
+        match data {
+            ServerQueryData::Sessions { sessions } => {
+                self.server_state_query.observe_query_success(key, ts);
+                self.ts = ts;
+                self.apply_sessions_query(sessions);
+                if !self.initial_secondary_queries_sent {
+                    self.initial_secondary_queries_sent = true;
+                    self.commands
+                        .extend(ServerStateQuery::secondary_initial_fetch_commands());
+                }
             }
+            ServerQueryData::Agents { sessions } => {
+                self.server_state_query.observe_query_success(key, ts);
+                self.ts = ts;
+                self.apply_agents_query(sessions);
+            }
+            ServerQueryData::Focus {
+                current_session, ..
+            } => {
+                self.server_state_query.observe_query_success(key, ts);
+                self.ts = ts;
+                self.apply_focus_query(current_session);
+            }
+            ServerQueryData::SidebarLayout {
+                sidebar_width,
+                detail_panel_height,
+                initializing,
+                init_label,
+                collapsed_worktree_groups,
+            } => {
+                self.server_state_query.observe_query_success(key, ts);
+                self.ts = ts;
+                self.apply_sidebar_layout_query(
+                    sidebar_width,
+                    detail_panel_height,
+                    initializing,
+                    init_label,
+                    collapsed_worktree_groups,
+                );
+            }
+            ServerQueryData::Settings {
+                theme,
+                session_filter,
+                agent_panel_scope,
+            } => {
+                self.server_state_query.observe_query_success(key, ts);
+                self.ts = ts;
+                self.apply_settings_query(theme, session_filter, agent_panel_scope);
+            }
+        }
+    }
 
-            match mode {
-                SessionFilterMode::All => true,
-                SessionFilterMode::Active => {
-                    !session.agents.is_empty() || session.agent_state.is_some()
-                }
-                SessionFilterMode::Running => {
-                    matches!(
-                        session.agent_state.as_ref().map(|agent| agent.status),
-                        Some(
-                            AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting
-                        ),
-                    ) || session.agents.iter().any(|agent| {
-                        matches!(
-                            agent.status,
-                            AgentStatus::Running | AgentStatus::ToolRunning | AgentStatus::Waiting
-                        )
-                    })
-                }
+    fn apply_sessions_query(&mut self, mut sessions: Vec<SessionData>) {
+        let previous_focus = self.sidebar_focus.clone();
+        for session in &mut sessions {
+            if let Some(previous) = self
+                .sessions
+                .iter()
+                .find(|previous| previous.name == session.name)
+                && (!previous.agents.is_empty()
+                    || previous.agent_state.is_some()
+                    || !previous.event_timestamps.is_empty())
+            {
+                session.unseen = previous.unseen;
+                session.agent_state = previous.agent_state.clone();
+                session.agents = previous.agents.clone();
+                session.event_timestamps = previous.event_timestamps.clone();
             }
-        })
+        }
+        self.sessions = sessions;
+        self.clear_missing_pending_switch();
+        self.rehome_expanded_group_surrogate();
+        let focus_still_exists = previous_focus
+            .as_ref()
+            .is_some_and(|focus| self.focus_exists(focus));
+        if !focus_still_exists {
+            self.rehome_missing_focus();
+        }
+        self.clamp_session_scroll_offset(0);
+    }
+
+    fn apply_agents_query(&mut self, sessions: Vec<SessionAgentsData>) {
+        for agents in sessions {
+            if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.name == agents.session)
+            {
+                session.unseen = agents.unseen;
+                session.agent_state = agents.agent_state;
+                session.agents = agents.agents;
+                session.event_timestamps = agents.event_timestamps;
+            }
+        }
+    }
+
+    fn apply_focus_query(&mut self, current_session: Option<String>) {
+        self.clear_background_pending_switch(current_session.as_deref());
+    }
+
+    fn apply_sidebar_layout_query(
+        &mut self,
+        sidebar_width: u32,
+        detail_panel_height: u32,
+        initializing: bool,
+        init_label: Option<String>,
+        collapsed_worktree_groups: Vec<String>,
+    ) {
+        self.initializing = initializing;
+        self.init_label = init_label;
+        self.apply_server_sidebar_width(sidebar_width.min(u16::MAX as u32) as u16);
+        self.apply_server_detail_panel_height(detail_panel_height as usize);
+        self.collapsed_worktree_groups = collapsed_worktree_groups.into_iter().collect();
+        self.clamp_session_scroll_offset(0);
+    }
+
+    fn apply_settings_query(
+        &mut self,
+        theme: Option<String>,
+        session_filter: Option<SessionFilterMode>,
+        agent_panel_scope: AgentPanelScope,
+    ) {
+        self.theme = theme;
+        self.session_filter = session_filter.unwrap_or_default();
+        self.apply_server_agent_panel_scope(agent_panel_scope);
+        self.clamp_session_scroll_offset(0);
+    }
+
+    pub fn filtered_sessions(&self) -> impl Iterator<Item = &SessionData> {
+        filtered_sessions(&self.sessions, self.session_filter)
     }
 
     pub fn display_session_entries(&self) -> Vec<DisplaySessionEntry<'_>> {
-        session_display_entries(
-            self.filtered_sessions().collect(),
-            &self.collapsed_worktree_groups,
-        )
+        project_sessions(&self.sessions, self.session_projection_options())
     }
 
     pub fn display_sessions(&self) -> Vec<&SessionData> {
-        self.display_session_entries()
-            .into_iter()
-            .filter_map(|entry| match entry {
-                DisplaySessionEntry::Session { session, .. } => Some(session),
-                DisplaySessionEntry::Group { .. } => None,
-            })
-            .collect()
+        projection_display_sessions(&self.sessions, self.session_projection_options())
     }
 
     pub fn reordered_session_names(&self, name: &str, delta: i8) -> Option<Vec<String>> {
-        let entries = self.display_session_entries();
-        let index = entries.iter().position(|entry| match entry {
-            DisplaySessionEntry::Session { session, .. } => session.name == name,
-            DisplaySessionEntry::Group { .. } => false,
-        })?;
-        let target_index = index as isize + delta as isize;
-        if target_index < 0 || target_index >= entries.len() as isize {
-            return None;
-        }
-
-        let mut names = self
-            .display_sessions()
-            .into_iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
-        match &entries[target_index as usize] {
-            DisplaySessionEntry::Session {
-                session, indented, ..
-            } => {
-                let current = names.iter().position(|candidate| candidate == name)?;
-                if *indented && delta < 0 {
-                    let key = worktree_group_key(session)?;
-                    let group_indices = self
-                        .display_sessions()
-                        .into_iter()
-                        .filter_map(|session| {
-                            (worktree_group_key(session).as_deref() == Some(key.as_str()))
-                                .then(|| {
-                                    names
-                                        .iter()
-                                        .position(|candidate| candidate == &session.name)
-                                })
-                                .flatten()
-                        })
-                        .collect::<Vec<_>>();
-                    let name = names.remove(current);
-                    names.insert(group_indices.into_iter().min()?, name);
-                } else {
-                    let target = names
-                        .iter()
-                        .position(|candidate| candidate == &session.name)?;
-                    names.swap(current, target);
-                }
-            }
-            DisplaySessionEntry::Group { key, .. } => {
-                let current = names.iter().position(|candidate| candidate == name)?;
-                let name = names.remove(current);
-                let group_indices = self
-                    .display_sessions()
-                    .into_iter()
-                    .filter_map(|session| {
-                        (worktree_group_key(session).as_deref() == Some(key.as_str()))
-                            .then(|| {
-                                names
-                                    .iter()
-                                    .position(|candidate| candidate == &session.name)
-                            })
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>();
-                let insert_at = if delta < 0 {
-                    group_indices.into_iter().min()?
-                } else {
-                    group_indices.into_iter().max()?.saturating_add(1)
-                };
-                names.insert(insert_at.min(names.len()), name);
-            }
-        }
-        Some(names)
+        projection_reordered_session_names(
+            &self.sessions,
+            self.session_projection_options(),
+            name,
+            delta,
+        )
     }
 
     pub fn reordered_worktree_group_names(&self, key: &str, delta: i8) -> Option<Vec<String>> {
-        let mut blocks = self.session_order_blocks();
-        let current = blocks
-            .iter()
-            .position(|block| block.group_key.as_deref() == Some(key))?;
-        let target =
-            (current as isize + delta as isize).clamp(0, blocks.len() as isize - 1) as usize;
-        if current == target {
-            return None;
-        }
-
-        let block = blocks.remove(current);
-        blocks.insert(target, block);
-        Some(
-            blocks
-                .into_iter()
-                .flat_map(|block| block.names)
-                .collect::<Vec<_>>(),
+        projection_reordered_worktree_group_names(
+            &self.sessions,
+            self.session_projection_options(),
+            key,
+            delta,
         )
+    }
+
+    fn session_projection_options(&self) -> SessionProjectionOptions<'_> {
+        SessionProjectionOptions {
+            filter: self.session_filter,
+            collapsed_groups: &self.collapsed_worktree_groups,
+        }
     }
 
     pub fn focused_session_name(&self) -> Option<&str> {
         self.sidebar_focus.as_ref()?.session_name()
+    }
+
+    fn activation_focus_needs_rehome(&self, session_name: &str) -> bool {
+        match self.sidebar_focus.as_ref() {
+            Some(SidebarFocus::Session(focused)) => focused != session_name,
+            Some(SidebarFocus::WorktreeGroup(_)) => matches!(
+                self.visible_focus_for_session(session_name),
+                Some(SidebarFocus::Session(focused)) if focused == session_name
+            ),
+            None => true,
+        }
     }
 
     pub fn focused_group_key(&self) -> Option<&str> {
@@ -462,6 +569,53 @@ impl App {
         self.panel_focus = PanelFocus::Sessions;
         self.focused_agent_idx = 0;
         self.session_scroll_follows_focus = true;
+    }
+
+    fn client_ui_focus(&self) -> ClientUiFocus {
+        ClientUiFocus {
+            panel: match self.panel_focus {
+                PanelFocus::Sessions => ClientUiPanel::Sessions,
+                PanelFocus::Agents => ClientUiPanel::Agents,
+            },
+            sidebar: self.sidebar_focus.as_ref().map(|focus| match focus {
+                SidebarFocus::Session(name) => ClientSidebarFocus::Session { name: name.clone() },
+                SidebarFocus::WorktreeGroup(key) => {
+                    ClientSidebarFocus::WorktreeGroup { key: key.clone() }
+                }
+            }),
+            agent_index: self.focused_agent_idx,
+        }
+    }
+
+    fn publish_client_ui_focus(&mut self) {
+        if self.client_tty.is_none() {
+            return;
+        }
+        self.commands.push(ClientCommand::SetUiFocus {
+            focus: self.client_ui_focus(),
+        });
+    }
+
+    fn apply_client_ui_focus(&mut self, focus: ClientUiFocus) {
+        if let Some(sidebar) = focus.sidebar {
+            let sidebar_focus = match sidebar {
+                ClientSidebarFocus::Session { name } => SidebarFocus::Session(name),
+                ClientSidebarFocus::WorktreeGroup { key } => SidebarFocus::WorktreeGroup(key),
+            };
+            if self.focus_exists(&sidebar_focus) {
+                self.group_focus_surrogate_for = None;
+                self.sidebar_focus = Some(sidebar_focus);
+                self.session_scroll_follows_focus = true;
+            }
+        }
+        self.focused_agent_idx = focus
+            .agent_index
+            .min(self.focused_agents_len().saturating_sub(1));
+        self.panel_focus = match focus.panel {
+            ClientUiPanel::Sessions => PanelFocus::Sessions,
+            ClientUiPanel::Agents if self.focused_agents_len() > 0 => PanelFocus::Agents,
+            ClientUiPanel::Agents => PanelFocus::Sessions,
+        };
     }
 
     fn set_sidebar_focus_for_session(&mut self, session_name: &str, focus: SidebarFocus) {
@@ -589,6 +743,7 @@ impl App {
         let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
         if next_idx != current_idx {
             self.set_sidebar_focus(targets[next_idx].clone());
+            self.publish_client_ui_focus();
         }
     }
 
@@ -643,7 +798,10 @@ impl App {
     }
 
     pub fn focus_sessions_panel(&mut self) {
-        self.panel_focus = PanelFocus::Sessions;
+        if self.panel_focus != PanelFocus::Sessions {
+            self.panel_focus = PanelFocus::Sessions;
+            self.publish_client_ui_focus();
+        }
     }
 
     pub fn focus_agents_panel(&mut self) {
@@ -651,8 +809,12 @@ impl App {
         if agent_count == 0 {
             return;
         }
-        self.panel_focus = PanelFocus::Agents;
-        self.focused_agent_idx = self.focused_agent_idx.min(agent_count - 1);
+        let next_idx = self.focused_agent_idx.min(agent_count - 1);
+        if self.panel_focus != PanelFocus::Agents || self.focused_agent_idx != next_idx {
+            self.panel_focus = PanelFocus::Agents;
+            self.focused_agent_idx = next_idx;
+            self.publish_client_ui_focus();
+        }
     }
 
     pub fn toggle_agent_panel_scope(&mut self) {
@@ -678,8 +840,12 @@ impl App {
             return;
         }
         let max_idx = agent_count - 1;
-        self.focused_agent_idx =
+        let next_idx =
             (self.focused_agent_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
+        if self.focused_agent_idx != next_idx {
+            self.focused_agent_idx = next_idx;
+            self.publish_client_ui_focus();
+        }
     }
 
     pub fn activate_focused_item(&mut self) {
@@ -728,6 +894,7 @@ impl App {
             HitTarget::Session(name) => self.switch_to_session(name),
             HitTarget::Group(key) => {
                 self.set_sidebar_focus(SidebarFocus::WorktreeGroup(key.clone()));
+                self.publish_client_ui_focus();
                 self.toggle_worktree_group(&key);
             }
             HitTarget::DiffCount(name) => {
@@ -748,6 +915,7 @@ impl App {
         }
         self.panel_focus = PanelFocus::Agents;
         self.focused_agent_idx = idx;
+        self.publish_client_ui_focus();
         self.activate_focused_agent();
     }
 
@@ -810,9 +978,8 @@ impl App {
     }
 
     pub fn open_width_slider(&mut self) {
-        self.modal = Modal::WidthSlider {
-            draft_width: self.sidebar_width,
-        };
+        let draft_width = self.sidebar_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+        self.modal = Modal::WidthSlider { draft_width };
     }
 
     pub fn open_kill_confirm_for_focus(&mut self) {
@@ -1046,6 +1213,7 @@ impl App {
         } else {
             self.rehome_focus_to_local_session();
         }
+        self.publish_client_ui_focus();
         self.commands.push(ClientCommand::SwitchSession {
             name,
             client_tty: None,
@@ -1181,6 +1349,9 @@ impl App {
     }
 
     fn toggle_worktree_group(&mut self, key: &str) {
+        if !self.collapsed_worktree_groups.insert(key.to_string()) {
+            self.collapsed_worktree_groups.remove(key);
+        }
         self.commands.push(ClientCommand::ToggleWorktreeGroup {
             key: key.to_string(),
         });
@@ -1222,36 +1393,7 @@ impl App {
     }
 
     fn worktree_group_session_names(&self, key: &str) -> Vec<String> {
-        self.sessions
-            .iter()
-            .filter(|session| worktree_group_key(session).as_deref() == Some(key))
-            .map(|session| session.name.clone())
-            .collect()
-    }
-
-    fn session_order_blocks(&self) -> Vec<SessionOrderBlock> {
-        let mut blocks = Vec::new();
-        for entry in self.display_session_entries() {
-            match entry {
-                DisplaySessionEntry::Group { key, .. } => {
-                    blocks.push(SessionOrderBlock {
-                        group_key: Some(key.clone()),
-                        names: self.worktree_group_session_names(&key),
-                    });
-                }
-                DisplaySessionEntry::Session {
-                    session, indented, ..
-                } => {
-                    if !indented {
-                        blocks.push(SessionOrderBlock {
-                            group_key: None,
-                            names: vec![session.name.clone()],
-                        });
-                    }
-                }
-            }
-        }
-        blocks
+        worktree_group_session_names(&self.sessions, key)
     }
 
     fn focused_agents_len(&self) -> usize {
@@ -1316,21 +1458,13 @@ fn entry_focus(entry: &DisplaySessionEntry<'_>) -> SidebarFocus {
 }
 
 fn worktree_group_display_label(key: &str) -> String {
-    key.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(key)
-        .to_string()
-}
-
-struct SessionOrderBlock {
-    group_key: Option<String>,
-    names: Vec<String>,
+    worktree_group_label(key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated::protocol::AgentStatus;
 
     fn empty_state(detail_panel_height: u32) -> ServerState {
         ServerState {
@@ -1388,14 +1522,226 @@ mod tests {
         }
     }
 
+    fn sidebar_layout_message(state: ServerState) -> ServerMessage {
+        ServerMessage::QueryResult {
+            key: ServerQueryKey::SidebarLayout,
+            data: ServerQueryData::SidebarLayout {
+                sidebar_width: state.sidebar_width,
+                detail_panel_height: state.detail_panel_height,
+                initializing: state.initializing,
+                init_label: state.init_label,
+                collapsed_worktree_groups: state.collapsed_worktree_groups,
+            },
+            ts: state.ts,
+        }
+    }
+
+    fn settings_message(state: ServerState) -> ServerMessage {
+        ServerMessage::QueryResult {
+            key: ServerQueryKey::Settings,
+            data: ServerQueryData::Settings {
+                theme: state.theme,
+                session_filter: state.session_filter,
+                agent_panel_scope: state.agent_panel_scope,
+            },
+            ts: state.ts,
+        }
+    }
+
     #[test]
     fn detail_panel_height_comes_from_server_state() {
         let mut app = App::from_state(empty_state(14));
 
         assert_eq!(app.detail_panel_height, 14);
 
-        app.apply_server_message(ServerMessage::State(empty_state(7)));
+        app.apply_server_message(sidebar_layout_message(empty_state(7)));
         assert_eq!(app.detail_panel_height, 7);
+    }
+
+    #[test]
+    fn query_invalidation_refetches_active_read_models() {
+        let mut app = App::from_state(empty_state(14));
+
+        app.apply_server_message(ServerMessage::Invalidate {
+            keys: vec![ServerQueryKey::SidebarLayout, ServerQueryKey::Settings],
+            ts: 20,
+        });
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![
+                ClientCommand::FetchQuery {
+                    key: ServerQueryKey::SidebarLayout,
+                },
+                ClientCommand::FetchQuery {
+                    key: ServerQueryKey::Settings,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_query_invalidation_refetches_that_read_model() {
+        let mut app = App::from_state(empty_state(14));
+
+        app.apply_server_message(ServerMessage::Invalidate {
+            keys: vec![ServerQueryKey::Agents],
+            ts: 20,
+        });
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::FetchQuery {
+                key: ServerQueryKey::Agents,
+            }]
+        );
+    }
+
+    #[test]
+    fn moving_session_focus_publishes_client_scoped_ui_focus() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("work", "/repo/work", false),
+            session("ops", "/repo/ops", false),
+        ];
+        let mut app = App::from_state(state);
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "work".to_string(),
+            client_tty: Some("/dev/ttys001".to_string()),
+            ui_focus: None,
+        });
+
+        app.move_focus(1);
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetUiFocus {
+                focus: ClientUiFocus {
+                    panel: ClientUiPanel::Sessions,
+                    sidebar: Some(ClientSidebarFocus::Session {
+                        name: "ops".to_string(),
+                    }),
+                    agent_index: 0,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn ui_focus_messages_apply_only_for_this_tmux_client() {
+        let mut state = empty_state(10);
+        let mut work = session("work", "/repo/work", false);
+        work.agents
+            .push(agent_without_pane("amp", AgentStatus::Running));
+        state.sessions = vec![work, session("ops", "/repo/ops", false)];
+        let mut app = App::from_state(state);
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "work".to_string(),
+            client_tty: Some("/dev/ttys001".to_string()),
+            ui_focus: None,
+        });
+
+        app.apply_server_message(ServerMessage::UiFocus {
+            client_tty: "/dev/ttys002".to_string(),
+            focus: ClientUiFocus {
+                panel: ClientUiPanel::Agents,
+                sidebar: Some(ClientSidebarFocus::Session {
+                    name: "ops".to_string(),
+                }),
+                agent_index: 0,
+            },
+        });
+
+        assert_eq!(app.panel_focus, PanelFocus::Sessions);
+        assert_eq!(app.focused_session_name(), Some("work"));
+
+        app.apply_server_message(ServerMessage::UiFocus {
+            client_tty: "/dev/ttys001".to_string(),
+            focus: ClientUiFocus {
+                panel: ClientUiPanel::Agents,
+                sidebar: Some(ClientSidebarFocus::Session {
+                    name: "work".to_string(),
+                }),
+                agent_index: 0,
+            },
+        });
+
+        assert_eq!(app.panel_focus, PanelFocus::Agents);
+        assert_eq!(app.focused_session_name(), Some("work"));
+    }
+
+    #[test]
+    fn query_result_updates_server_state_read_model() {
+        let mut app = App::from_state(empty_state(14));
+
+        app.apply_server_message(ServerMessage::QueryResult {
+            key: ServerQueryKey::SidebarLayout,
+            data: ServerQueryData::SidebarLayout {
+                sidebar_width: 40,
+                detail_panel_height: 9,
+                initializing: false,
+                init_label: None,
+                collapsed_worktree_groups: Vec::new(),
+            },
+            ts: 42,
+        });
+
+        assert_eq!(app.detail_panel_height, 9);
+        assert_eq!(app.ts, 42);
+        assert!(app.server_state_result().is_success());
+    }
+
+    #[test]
+    fn typed_query_results_update_independent_read_models() {
+        let mut state = empty_state(10);
+        state.sessions = vec![session("work", "/repo", false)];
+        let mut app = App::from_state(state);
+
+        app.apply_server_message(ServerMessage::QueryResult {
+            key: ServerQueryKey::Settings,
+            data: ServerQueryData::Settings {
+                theme: Some("dark".to_string()),
+                session_filter: Some(SessionFilterMode::Running),
+                agent_panel_scope: AgentPanelScope::All,
+            },
+            ts: 50,
+        });
+        app.apply_server_message(ServerMessage::QueryResult {
+            key: ServerQueryKey::SidebarLayout,
+            data: ServerQueryData::SidebarLayout {
+                sidebar_width: 52,
+                detail_panel_height: 16,
+                initializing: true,
+                init_label: Some("warming".to_string()),
+                collapsed_worktree_groups: vec!["/repo".to_string()],
+            },
+            ts: 51,
+        });
+        app.apply_server_message(ServerMessage::QueryResult {
+            key: ServerQueryKey::Agents,
+            data: ServerQueryData::Agents {
+                sessions: vec![SessionAgentsData {
+                    session: "work".to_string(),
+                    unseen: true,
+                    agent_state: Some(agent_without_pane("amp", AgentStatus::Running)),
+                    agents: vec![agent_without_pane("amp", AgentStatus::Running)],
+                    event_timestamps: vec![123],
+                }],
+            },
+            ts: 52,
+        });
+
+        assert_eq!(app.theme.as_deref(), Some("dark"));
+        assert_eq!(app.session_filter, SessionFilterMode::Running);
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+        assert_eq!(app.sidebar_width, 52);
+        assert_eq!(app.detail_panel_height, 16);
+        assert!(app.initializing);
+        assert_eq!(app.init_label.as_deref(), Some("warming"));
+        assert!(app.is_group_collapsed("/repo"));
+        assert!(app.sessions[0].unseen);
+        assert_eq!(app.sessions[0].agents.len(), 1);
+        assert_eq!(app.sessions[0].event_timestamps, vec![123]);
     }
 
     #[test]
@@ -1403,14 +1749,14 @@ mod tests {
         let mut app = App::from_state(empty_state(10));
 
         app.set_detail_panel_height(14);
-        app.apply_server_message(ServerMessage::State(empty_state(11)));
+        app.apply_server_message(sidebar_layout_message(empty_state(11)));
 
         assert_eq!(app.detail_panel_height, 14);
 
-        app.apply_server_message(ServerMessage::State(empty_state(14)));
+        app.apply_server_message(sidebar_layout_message(empty_state(14)));
         assert_eq!(app.detail_panel_height, 14);
 
-        app.apply_server_message(ServerMessage::State(empty_state(9)));
+        app.apply_server_message(sidebar_layout_message(empty_state(9)));
         assert_eq!(app.detail_panel_height, 9);
     }
 
@@ -1438,18 +1784,18 @@ mod tests {
         let mut app = App::from_state(empty_state(10));
 
         app.toggle_agent_panel_scope();
-        app.apply_server_message(ServerMessage::State(empty_state(10)));
+        app.apply_server_message(settings_message(empty_state(10)));
 
         assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
 
         let mut acknowledged = empty_state(10);
         acknowledged.agent_panel_scope = AgentPanelScope::All;
-        app.apply_server_message(ServerMessage::State(acknowledged));
+        app.apply_server_message(settings_message(acknowledged));
         assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
 
         let mut later = empty_state(10);
         later.agent_panel_scope = AgentPanelScope::Current;
-        app.apply_server_message(ServerMessage::State(later));
+        app.apply_server_message(settings_message(later));
         assert_eq!(app.agent_panel_scope, AgentPanelScope::Current);
     }
 

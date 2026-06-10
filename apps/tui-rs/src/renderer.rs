@@ -463,6 +463,15 @@ enum TreePosition {
     Rail,
 }
 
+#[derive(Clone, Copy)]
+struct GroupRow<'a> {
+    key: &'a str,
+    label: &'a str,
+    count: usize,
+    collapsed: bool,
+    summary: &'a crate::session_display::GroupSummary,
+}
+
 impl<'a> SessionListRow<'a> {
     fn entry_idx(self) -> usize {
         match self {
@@ -492,7 +501,18 @@ impl<'a> SessionListRow<'a> {
                 collapsed,
                 summary,
                 ..
-            } => build_group_row(app, palette, key, label, count, collapsed, summary, width),
+            } => build_group_row(
+                app,
+                palette,
+                GroupRow {
+                    key,
+                    label,
+                    count,
+                    collapsed,
+                    summary,
+                },
+                width,
+            ),
             Self::SessionName {
                 index,
                 session,
@@ -584,16 +604,14 @@ fn row_index_for_entry(rows: &[SessionListRow<'_>], entry_idx: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn build_group_row(
-    app: &App,
-    palette: &Palette,
-    key: &str,
-    label: &str,
-    count: usize,
-    collapsed: bool,
-    summary: &crate::session_display::GroupSummary,
-    width: usize,
-) -> StyledLine {
+fn build_group_row(app: &App, palette: &Palette, group: GroupRow<'_>, width: usize) -> StyledLine {
+    let GroupRow {
+        key,
+        label,
+        count,
+        collapsed,
+        summary,
+    } = group;
     let hit = HitTarget::Group(key.to_string());
     let focused =
         app.panel_focus == crate::app::PanelFocus::Sessions && app.focused_group_key() == Some(key);
@@ -614,9 +632,7 @@ fn build_group_row(
     } else {
         palette.lavender
     };
-    let marker = if active_surrogate {
-        "▌"
-    } else if focused {
+    let marker = if focused {
         "›"
     } else {
         " "
@@ -883,7 +899,7 @@ fn session_agent_badges(
         .into_iter()
         .map(|agent| (agent_visual_kind(agent), agent_focus_target(session, agent)))
         .collect::<Vec<_>>();
-    badge_sources.sort_by(|a, b| b.0.cmp(&a.0));
+    badge_sources.sort_by_key(|(kind, _)| std::cmp::Reverse(*kind));
     let overflow_count = badge_sources.len().saturating_sub(3);
     badge_sources.truncate(3);
     let mut badges = badge_sources
@@ -1128,12 +1144,9 @@ fn render_detail(
     max_lines: usize,
     width: usize,
 ) -> Option<ScrollbarSpec> {
-    let Some(session) = app
+    let session = app
         .focused_session_name()
-        .and_then(|focused| app.sessions.iter().find(|session| session.name == focused))
-    else {
-        return None;
-    };
+        .and_then(|focused| app.sessions.iter().find(|session| session.name == focused))?;
 
     if lines.len() >= max_lines {
         return None;
@@ -1742,11 +1755,10 @@ fn render_width_slider_overlay(
     let track_width = inner_width.saturating_sub(6).clamp(4, 18);
     let range = u32::from(MAX_SIDEBAR_WIDTH - MIN_SIDEBAR_WIDTH);
     let offset = u32::from(draft_width.saturating_sub(MIN_SIDEBAR_WIDTH));
-    let thumb = if range == 0 {
-        0
-    } else {
-        ((offset * (track_width.saturating_sub(1) as u32)) / range) as usize
-    };
+    let thumb = offset
+        .checked_mul(track_width.saturating_sub(1) as u32)
+        .and_then(|value| value.checked_div(range))
+        .unwrap_or(0) as usize;
     slider.push(format!("{MIN_SIDEBAR_WIDTH} "), palette.overlay0);
     for index in 0..track_width {
         if index == thumb {

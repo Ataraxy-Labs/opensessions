@@ -467,7 +467,6 @@ dependencies = [
  "futures-util",
  "http",
  "opensessions-runtime",
- "opensessions-sidebar-core",
  "serde_json",
  "sha1_smol",
  "tokio",
@@ -483,23 +482,14 @@ dependencies = [
  "crossterm",
  "futures-util",
  "http",
- "opensessions-sidebar-core",
+ "opensessions-runtime",
  "ratatui",
+ "ratatui-query",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
  "tokio-websockets",
- "unicode-width",
-]
-
-[[package]]
-name = "opensessions-sidebar-core"
-version = "0.1.0"
-dependencies = [
- "opensessions-runtime",
- "ratatui",
- "serde",
  "unicode-width",
 ]
 
@@ -554,6 +544,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "query-core"
+version = "0.1.0"
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -604,6 +598,13 @@ dependencies = [
  "crossterm",
  "instability",
  "ratatui-core",
+]
+
+[[package]]
+name = "ratatui-query"
+version = "0.1.0"
+dependencies = [
+ "query-core",
 ]
 
 [[package]]

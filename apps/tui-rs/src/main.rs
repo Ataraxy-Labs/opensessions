@@ -116,10 +116,17 @@ async fn main() -> Result<()> {
 
     let mut terminal = TerminalGuard::enter()?;
     let mut events = EventStream::new();
-    let mut app: Option<App> = None;
+    let mut app = App::connecting();
+    if let Some(identity) = identity.clone() {
+        app.set_pane_identity(identity.pane_id, identity.session_name, identity.window_id);
+    }
     let mut last_lazydiff_launch: Option<std::time::Instant> = None;
     let mut pending_sidebar_width: Option<PendingSidebarWidthCommand> = None;
     let mut startup_refocused = false;
+    for command in app.drain_commands() {
+        send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
+    }
+    terminal.draw(&app)?;
     // Render-tick interval: advance the spinner clock and redraw at ~120ms so
     // the "warming up…" / agent-running spinners animate even when no server
     // state arrives.
@@ -133,11 +140,11 @@ async fn main() -> Result<()> {
         // HTTP /quit fallback tears us down before then, we exit anyway so the
         // user is never stuck in a dead TUI while still giving the quit command
         // a short grace period to reach the server before restoring the terminal.
-        let quit_deadline = app.as_ref().and_then(|app| app.quit_deadline);
+        let quit_deadline = app.quit_deadline;
         // Click-flash expiry: when a click arms a 150ms flash highlight, force
         // a re-render at the deadline so the highlight clears even without any
         // other event.
-        let flash_deadline = app.as_ref().and_then(|app| app.flash_deadline);
+        let flash_deadline = app.flash_deadline;
         let sidebar_width_due = pending_sidebar_width.as_ref().map(|pending| pending.due_at);
 
         tokio::select! {
@@ -153,15 +160,14 @@ async fn main() -> Result<()> {
             }
 
             _ = render_tick.tick() => {
-                if let Some(app) = &mut app {
-                    let now_ms = render_epoch.elapsed().as_millis() as u64;
-                    if app.spinner_now != now_ms {
-                        app.spinner_now = now_ms;
+                let now_ms = render_epoch.elapsed().as_millis() as u64;
+                if app.spinner_now != now_ms {
+                    app.spinner_now = now_ms;
                         // Only redraw if there's something animating. Otherwise
                         // a 120ms idle wakeup costs about a single buffer diff
                         // which still fights the terminal for cursor focus.
-                        let needs_redraw = app.initializing
-                            || app.sessions.iter().any(|session| {
+                    let needs_redraw = app.initializing
+                        || app.sessions.iter().any(|session| {
                                 session.agents.iter().any(|agent| {
                                     matches!(
                                         agent.status,
@@ -180,9 +186,8 @@ async fn main() -> Result<()> {
                                         })
                                         .unwrap_or(false)
                             });
-                        if needs_redraw {
-                            terminal.draw(app)?;
-                        }
+                    if needs_redraw {
+                        terminal.draw(&app)?;
                     }
                 }
                 continue;
@@ -194,11 +199,9 @@ async fn main() -> Result<()> {
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                if let Some(app) = &mut app {
-                    app.flash_target = None;
-                    app.flash_deadline = None;
-                    terminal.draw(app)?;
-                }
+                app.flash_target = None;
+                app.flash_deadline = None;
+                terminal.draw(&app)?;
                 continue;
             }
 
@@ -226,12 +229,8 @@ async fn main() -> Result<()> {
                     {
                         return Ok(());
                     }
-                    let Some(app) = &mut app else {
-                        continue;
-                    };
-
-                    handle_key(app, key);
-                    terminal.draw(app)?;
+                    handle_key(&mut app, key);
+                    terminal.draw(&app)?;
                     for command in app.drain_commands() {
                         let is_quit = send_or_queue_client_command(
                             command,
@@ -263,27 +262,24 @@ async fn main() -> Result<()> {
                         maybe_launch_lazydiff(launch, dir, branch, &mut last_lazydiff_launch);
                     }
                 } else if let Event::Resize(width, _) = event {
-                    if let Some(app) = &mut app {
-                        app.set_terminal_width(width);
+                    app.set_terminal_width(width);
                         debug_log(format!(
                             "resize-event: pane_identity={identity:?} local_session={:?} current_session={:?} width={width}",
                             app.my_session,
                             app.current_session,
                         ));
-                        if width != app.sidebar_width {
-                            ws.send(Message::text(encode_client_command(
-                                &ClientCommand::RepairWidth,
-                            )?))
-                            .await?;
-                        }
-                        terminal.draw(app)?;
+                    if width != app.sidebar_width {
+                        ws.send(Message::text(encode_client_command(
+                            &ClientCommand::RepairWidth,
+                        )?))
+                        .await?;
                     }
+                    terminal.draw(&app)?;
                 } else if let Event::Mouse(mouse) = event
-                    && let Some(app) = &mut app
                     && let Some(ui_mouse) = ui_mouse_from_crossterm(mouse)
                 {
-                    apply_ui_mouse(app, ui_mouse);
-                    terminal.draw(app)?;
+                    apply_ui_mouse(&mut app, ui_mouse);
+                    terminal.draw(&app)?;
                     for command in app.drain_commands() {
                         send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
                     }
@@ -315,52 +311,19 @@ async fn main() -> Result<()> {
                     if matches!(decoded, ServerMessage::Quit) {
                         return Ok(());
                     }
-                    match (&mut app, decoded) {
-                        (slot @ None, ServerMessage::State(state)) => {
-                            debug_log(format!(
-                                "ws: initial state received init={} init_label={:?} sessions={}",
-                                state.initializing,
-                                state.init_label,
-                                state.sessions.len(),
-                            ));
-                            let mut new_app = App::from_state(state);
-                            if let Some(identity) = identity.clone() {
-                                new_app.set_pane_identity(
-                                    identity.pane_id,
-                                    identity.session_name,
-                                    identity.window_id,
-                                );
-                            }
-                            *slot = Some(new_app);
-                        }
-                        (Some(app), ServerMessage::State(state)) => {
-                            debug_log(format!(
-                                "ws: state update init={} init_label={:?} sessions={}",
-                                state.initializing,
-                                state.init_label,
-                                state.sessions.len(),
-                            ));
-                            app.apply_server_message(ServerMessage::State(state));
-                        }
-                        (Some(app), message) => {
-                            debug_log(format!("ws: received {message:?}"));
-                            app.apply_server_message(message);
-                        }
-                        (None, _) => {}
+                    debug_log(format!("ws: received {decoded:?}"));
+                    app.apply_server_message(decoded);
+                    for command in app.drain_commands() {
+                        send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
                     }
-                    if let Some(app) = &mut app {
-                        for command in app.drain_commands() {
-                            send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
-                        }
-                        terminal.draw(app)?;
-                        if let Ok((width, _)) = terminal::size() {
-                            app.set_terminal_width(width);
-                        }
-                        if !startup_refocused {
-                            startup_refocused = true;
-                            if let Some(identity) = identity.as_ref() {
-                                do_startup_refocus(&identity.pane_id);
-                            }
+                    terminal.draw(&app)?;
+                    if let Ok((width, _)) = terminal::size() {
+                        app.set_terminal_width(width);
+                    }
+                    if !startup_refocused {
+                        startup_refocused = true;
+                        if let Some(identity) = identity.as_ref() {
+                            do_startup_refocus(&identity.pane_id);
                         }
                     }
                 }
@@ -664,6 +627,40 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.hide_cursor()?;
+        Ok(Self { terminal })
+    }
+
+    fn draw(&mut self, app: &App) -> Result<()> {
+        self.terminal.draw(|frame| render_app(frame, app))?;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.terminal.show_cursor();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,39 +695,5 @@ mod tests {
             resolve_lazydiff_binary_from(Some(current), None, |_| false),
             lazydiff_binary_name()
         );
-    }
-}
-
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-}
-
-impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        terminal::enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-        terminal.hide_cursor()?;
-        Ok(Self { terminal })
-    }
-
-    fn draw(&mut self, app: &App) -> Result<()> {
-        self.terminal.draw(|frame| render_app(frame, app))?;
-        Ok(())
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = self.terminal.show_cursor();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
-        let _ = terminal::disable_raw_mode();
     }
 }

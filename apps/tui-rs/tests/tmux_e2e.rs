@@ -173,6 +173,9 @@ fn tmux_sidebar_alt_reorders_worktree_group_as_block() {
     });
 
     lab.click_session_row(&source, "os-demo-worktrees");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "os-demo-worktrees").is_some_and(|row| row.trim_start().starts_with("›"))
+    });
     lab.send_sidebar_key(&source, "M-Up");
     lab.wait_for_session_order(|names| {
         position(names, "os-demo-feat-agent-panel").is_some_and(|first| {
@@ -273,7 +276,7 @@ fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
         "test setup should leave every opensessions sidebar with stale temporary focus; got:\n{second_stale_capture}",
     );
 
-    lab.tmux_ok(["send-keys", "-t", source.as_str(), "1"]);
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
     lab.wait_for_client_session("effect-ts");
     let effect = lab.sidebar_pane("effect-ts");
     lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
@@ -293,6 +296,33 @@ fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
     lab.wait_for_capture_pane(&second, |text| {
         row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
             && !has_non_active_focus_marker(text, "opensessions")
+    });
+}
+
+#[test]
+fn tmux_sidebar_syncs_keyboard_focus_between_windows_in_same_client() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-client-focus-sync");
+    let second_window = lab.spawn_window_with_sidebar("opensessions", "second-sidebar");
+    let first = lab.sidebar_pane("opensessions");
+    let second = lab.sidebar_pane_in_window("opensessions", &second_window);
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions:1"]);
+    lab.tmux_ok(["select-pane", "-t", first.as_str()]);
+    lab.wait_for_capture_pane(&first, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+    });
+    lab.wait_for_capture_pane(&second, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+    });
+
+    lab.send_sidebar_key(&first, "j");
+
+    lab.wait_for_capture_pane(&first, |text| {
+        row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
+    });
+    lab.wait_for_capture_pane(&second, |text| {
+        row_with(text, "os-demo-worktrees").is_some_and(|row| row.contains("›"))
     });
 }
 
@@ -332,6 +362,36 @@ fn tmux_sidebar_tracks_agent_state_per_focused_pane() {
     lab.wait_for_capture_pane(&sidebar, |text| {
         row_with(text, "opensessions").is_some_and(|row| row.contains("◉ ● ✓"))
     });
+}
+
+#[test]
+fn tmux_agent_debug_endpoint_explains_multiple_amp_panes() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-agent-debug");
+    lab.install_fake_agent_bins();
+
+    let idle = lab.spawn_fake_agent_pane("opensessions", "amp", "idle");
+    let tools = lab.spawn_fake_agent_pane("opensessions", "amp", "tools");
+    assert_ne!(idle, tools, "fake amp panes must be distinct");
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", idle.as_str()]);
+    post_refresh(lab.port);
+
+    let debug = lab.wait_for_debug_agents("opensessions", |debug| {
+        debug.matches("\"mappedAgent\": \"amp\"").count() >= 2
+            && debug.contains("\"parsedStatus\": \"idle\"")
+            && debug.contains("\"parsedStatus\": \"tool-running\"")
+            && debug.contains("\"projectedCurrentPanelCount\": 2")
+    });
+    assert!(
+        debug.contains(&format!("\"paneId\": \"{idle}\""))
+            && debug.contains(&format!("\"paneId\": \"{tools}\"")),
+        "debug endpoint must name both amp panes; got:\n{debug}"
+    );
+
+    let sidebar = lab.sidebar_pane("opensessions");
+    lab.wait_for_capture_pane(&sidebar, |text| text.contains("agents 2"));
 }
 
 #[test]
@@ -504,7 +564,7 @@ fn tmux_sidebar_width_slider_is_the_only_width_author() {
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "w"]);
     lab.wait_for_capture_pane(&source, |text| text.contains("Sidebar width"));
     for _ in 0..4 {
-        lab.tmux_ok(["send-keys", "-t", source.as_str(), "H"]);
+        lab.send_sidebar_key(&source, "H");
     }
     lab.wait_for_all_sidebar_widths(20);
     assert_eq!(
@@ -973,6 +1033,25 @@ fn post_body(port: u16, path: &str, content_type: &str, body: &str) {
     );
 }
 
+fn get_body(port: u16, path: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect get body");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write get body");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read get body");
+    assert!(
+        response.starts_with("HTTP/1.1 2"),
+        "unexpected response for {path}: {response}"
+    );
+    response
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn assert_active_row(capture: &str, session: &str) {
     assert!(
         row_with(capture, session).is_some_and(|row| row.contains("▌")),
@@ -1281,11 +1360,15 @@ time.sleep(300)
     }
 
     fn spawn_agent_pane(&self, session: &str, title: &str) -> String {
+        let title = title
+            .split_once(" - amp - ")
+            .map(|(thread_name, state)| format!("amp - {thread_name} - {state}"))
+            .unwrap_or_else(|| title.to_string());
         let command = format!(
             "sh -c 'printf \"\\033]2;{}\\033\\\\\"; while :; do sleep 60; done'",
             title.replace('"', "")
         );
-        let pane = self.tmux([
+        self.tmux([
             "split-window",
             "-h",
             "-d",
@@ -1295,8 +1378,90 @@ time.sleep(300)
             "-t",
             session,
             &command,
-        ]);
-        pane
+        ])
+    }
+
+    fn install_fake_agent_bins(&self) {
+        let bin = self.root.join("bin");
+        fs::create_dir_all(&bin).expect("create fake agent bin dir");
+        self.write_fake_agent_script("amp");
+        self.write_fake_agent_script("claude");
+    }
+
+    fn write_fake_agent_script(&self, name: &str) {
+        let path = self.root.join("bin").join(name);
+        let script = format!(
+            r#"#!/bin/sh
+mode="${{1:-idle}}"
+printf '\033]2;{name} - fake-%s - %s\033\\' "$mode" "$PWD"
+case "$mode" in
+  tools)
+    printf '  ✓ Search fake task\n  ≈ Running tools...         Esc to cancel\n'
+    ;;
+  waiting)
+    printf 'Run this command?\n▸● Approve [Alt+1]\n ○ Allow All for This Session [Alt+2]\n ○ Deny with feedback [Alt+4]\nWaiting for approval...\n'
+    ;;
+  claude-running)
+    printf '✻ Pouncing…\nEsc to interrupt\n'
+    ;;
+  claude-waiting)
+    printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\n'
+    ;;
+  *)
+    printf 'Hey! What would you like to work on?\n╭──────────────── deep² ─╮\n│                        │\n╰────────────────────────╯\n'
+    ;;
+esac
+while :; do sleep 60; done
+"#
+        );
+        fs::write(&path, script).expect("write fake agent script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&path)
+                .expect("fake agent metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("chmod fake agent");
+        }
+    }
+
+    fn spawn_fake_agent_pane(&self, session: &str, agent: &str, mode: &str) -> String {
+        let bin = self.root.join("bin");
+        let command = format!(
+            "env PATH={}:$PATH {} {}",
+            shell_quote(&bin.to_string_lossy()),
+            shell_quote(agent),
+            shell_quote(mode)
+        );
+        self.tmux([
+            "split-window",
+            "-h",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session,
+            &command,
+        ])
+    }
+
+    fn wait_for_debug_agents<F>(&self, session: &str, predicate: F) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
+        let path = format!("/debug/agents?session={session}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            last = get_body(self.port, &path);
+            if predicate(&last) {
+                return last;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!("debug agents predicate not satisfied for {session}; last response:\n{last}");
     }
 
     fn post_agent_event(
@@ -1352,11 +1517,6 @@ time.sleep(300)
                 .await
                 .expect("connect focus-agent ws client");
             let _ = ws.next().await.expect("read ws hello").expect("ws hello");
-            let _ = ws
-                .next()
-                .await
-                .expect("read ws initial state")
-                .expect("ws initial state");
             let command = serde_json::json!({
                 "type": "focus-agent-pane",
                 "session": session,
@@ -1684,11 +1844,6 @@ time.sleep(300)
                 .await
                 .expect("connect reorder ws client");
             let _ = ws.next().await.expect("read ws hello").expect("ws hello");
-            let _ = ws
-                .next()
-                .await
-                .expect("read ws initial state")
-                .expect("ws initial state");
             let command = serde_json::json!({
                 "type": "reorder-session",
                 "name": name,
@@ -1733,17 +1888,35 @@ time.sleep(300)
                 .await
                 .expect("connect session-order ws client");
             let _ = ws.next().await.expect("read ws hello").expect("ws hello");
-            let state = ws
-                .next()
+            let command = serde_json::json!({
+                "type": "fetch-query",
+                "key": "sessions",
+            });
+            ws.send(Message::text(command.to_string()))
                 .await
-                .expect("read ws initial state")
-                .expect("ws initial state");
-            let state = String::from_utf8(state.as_payload().to_vec()).expect("state text");
+                .expect("send sessions fetch-query");
+            let response = loop {
+                let response = ws
+                    .next()
+                    .await
+                    .expect("read sessions query result")
+                    .expect("sessions query result");
+                let response =
+                    String::from_utf8(response.as_payload().to_vec()).expect("sessions query text");
+                let json = serde_json::from_str::<serde_json::Value>(&response)
+                    .expect("parse websocket json");
+                if json.get("type").and_then(serde_json::Value::as_str) == Some("query-result")
+                    && json.get("key").and_then(serde_json::Value::as_str) == Some("sessions")
+                {
+                    break json;
+                }
+            };
             ws.close().await.expect("close session-order ws client");
-            let json = serde_json::from_str::<serde_json::Value>(&state).expect("parse state json");
-            json.get("sessions")
+            response
+                .get("data")
+                .and_then(|state| state.get("sessions"))
                 .and_then(serde_json::Value::as_array)
-                .expect("state sessions array")
+                .expect("sessions query data sessions array")
                 .iter()
                 .filter_map(|session| session.get("name")?.as_str().map(str::to_string))
                 .collect()

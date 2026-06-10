@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::protocol::{AgentPaneDiagnostic, AgentStatus};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuxSessionInfo {
     pub name: String,
@@ -30,6 +32,7 @@ pub struct AgentPane {
     pub agent: String,
     pub pane_id: String,
     pub active: bool,
+    pub status: AgentStatus,
     pub thread_id: Option<String>,
     pub thread_name: Option<String>,
 }
@@ -89,6 +92,10 @@ pub trait MuxProvider: Send + Sync {
         Vec::new()
     }
 
+    fn list_sidebar_target_windows(&self) -> Vec<ActiveWindow> {
+        self.list_active_windows()
+    }
+
     fn get_current_window_id(&self) -> Option<String> {
         None
     }
@@ -106,6 +113,10 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn list_agent_panes(&self, _session_name: &str) -> Vec<AgentPane> {
+        Vec::new()
+    }
+
+    fn list_agent_pane_diagnostics(&self, _session_name: &str) -> Vec<AgentPaneDiagnostic> {
         Vec::new()
     }
 

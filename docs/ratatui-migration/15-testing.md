@@ -101,19 +101,20 @@ fn truncate_left_handles_unicode() {
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
-async fn handles_state_then_focus_messages() {
+async fn handles_typed_query_then_focus_messages() {
     let (server, server_url) = mock_ws_server().await;
     let mut app = App::new(server_url);
 
-    server.send(ServerMessage::State(ServerState {
-        sessions: vec![mock_session("alpha"), mock_session("beta")],
-        focused_session: Some("alpha".into()),
-        // ...
-    })).await;
+    server.send(ServerMessage::QueryResult {
+        key: ServerQueryKey::Sessions,
+        data: ServerQueryData::Sessions {
+            sessions: vec![mock_session("alpha"), mock_session("beta")],
+        },
+        ts: now_ms(),
+    }).await;
 
-    app.tick_until_state_received().await;
+    app.tick_until_query_received(ServerQueryKey::Sessions).await;
     assert_eq!(app.sessions.len(), 2);
-    assert_eq!(app.focused_session.as_deref(), Some("alpha"));
 
     // Simulate Tab key
     app.handle_key(key('\t'));

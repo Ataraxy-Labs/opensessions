@@ -7,10 +7,10 @@ fi
 OPENSESSIONS_DIR="${OPENSESSIONS_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 
 RUST_BIN=""
-if [ -x "$OPENSESSIONS_DIR/bin/opensessions-sidebar" ]; then
-    RUST_BIN="$OPENSESSIONS_DIR/bin/opensessions-sidebar"
-elif [ -x "$OPENSESSIONS_DIR/target/release/opensessions-sidebar" ]; then
+if [ -x "$OPENSESSIONS_DIR/target/release/opensessions-sidebar" ]; then
     RUST_BIN="$OPENSESSIONS_DIR/target/release/opensessions-sidebar"
+elif [ -x "$OPENSESSIONS_DIR/bin/opensessions-sidebar" ]; then
+    RUST_BIN="$OPENSESSIONS_DIR/bin/opensessions-sidebar"
 elif [ -x "$OPENSESSIONS_DIR/target/debug/opensessions-sidebar" ]; then
     RUST_BIN="$OPENSESSIONS_DIR/target/debug/opensessions-sidebar"
 fi

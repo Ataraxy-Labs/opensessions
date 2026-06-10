@@ -44,6 +44,11 @@ The TypeScript server/runtime remains the behavioral oracle while the Rust imple
 
 ## Remaining Work
 
+- [x] Move sidebar session projection into `packages/runtime-rs` so server and sidebar share one pure display-order model without a server dependency on sidebar UI core.
+- [x] Add local crate architecture rules and a TUI-side server-state query seam so future agents keep server truth, shared runtime policy, and local UI state separate.
+- [x] Split TanStack-inspired query semantics into framework-agnostic `packages/query-core-rs` plus the terminal adapter `packages/ratatui-query-rs`.
+- [x] Define typed TUI query options and fine-grained query payloads for sessions, agents, focus, sidebar layout, and settings.
+- [x] Remove the legacy `ServerMessage::State` and `server-snapshot` wire frames; shared broadcasts now use `Invalidate(keys)` and clients refetch typed query results.
 - Expand the Ratatui renderer beyond the current read-only parity surface into remaining interactive components and widgets.
 - Finish advanced HTTP/sidebar parity around fixed-width repair hooks, warmup completion, and full agent pane focus/kill resolution/highlighting.
 - Port the full sidebar lifecycle and Fixed Sidebar Width model while preserving `docs/explanation/sidebar-behavior.md`.
