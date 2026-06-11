@@ -2016,14 +2016,9 @@ async fn run_tmux_state_poll_loop(
                 let agent_observation_changed = source.observe_tmux_agent_state();
                 let next_state = source.snapshot_state();
                 let next_hashes = query_hashes_from_state(&next_state);
-                let mut changed_keys = [
-                    (ServerQueryKey::Focus, 2_usize),
-                    (ServerQueryKey::SidebarLayout, 3_usize),
-                ]
+                let mut changed_keys = [ServerQueryKey::Focus, ServerQueryKey::SidebarLayout]
                     .into_iter()
-                    .filter_map(|(key, index)| {
-                        (last_hashes.get(index) != next_hashes.get(index)).then_some(key)
-                    })
+                    .filter(|key| last_hashes.get(key) != next_hashes.get(key))
                     .collect::<Vec<_>>();
                 if agent_observation_changed {
                     changed_keys.push(ServerQueryKey::Agents);
@@ -2047,8 +2042,8 @@ async fn run_tmux_state_poll_loop(
     }
 }
 
-fn query_hashes_from_state(state: &ServerState) -> Vec<u64> {
-    all_query_keys()
+fn query_hashes_from_state(state: &ServerState) -> HashMap<ServerQueryKey, u64> {
+    ALL_QUERY_KEYS
         .into_iter()
         .map(|key| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -2056,7 +2051,7 @@ fn query_hashes_from_state(state: &ServerState) -> Vec<u64> {
             serde_json::to_string(&data)
                 .expect("query hash serialization must succeed")
                 .hash(&mut hasher);
-            hasher.finish()
+            (key, hasher.finish())
         })
         .collect()
 }
@@ -2465,14 +2460,16 @@ fn ui_focus_json(client_tty: String, focus: ClientUiFocus) -> String {
         .expect("ui-focus must serialize")
 }
 
+const ALL_QUERY_KEYS: [ServerQueryKey; 5] = [
+    ServerQueryKey::Sessions,
+    ServerQueryKey::Agents,
+    ServerQueryKey::Focus,
+    ServerQueryKey::SidebarLayout,
+    ServerQueryKey::Settings,
+];
+
 fn all_query_keys() -> Vec<ServerQueryKey> {
-    vec![
-        ServerQueryKey::Sessions,
-        ServerQueryKey::Agents,
-        ServerQueryKey::Focus,
-        ServerQueryKey::SidebarLayout,
-        ServerQueryKey::Settings,
-    ]
+    ALL_QUERY_KEYS.to_vec()
 }
 
 fn invalidate_queries_json(keys: Vec<ServerQueryKey>) -> String {

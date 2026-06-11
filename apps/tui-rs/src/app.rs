@@ -8,10 +8,10 @@ use crate::generated::protocol::{
     ClientUiPanel, ServerMessage, ServerQueryData, ServerQueryKey, ServerState, SessionAgentsData,
     SessionData, SessionFilterMode,
 };
-use crate::renderer::{AgentPaneTarget, HitTarget, agent_focus_target};
+use crate::renderer::HitTarget;
 use crate::server_query::{QueryResult, ServerStateQuery};
-pub use crate::session_display::DisplaySessionEntry;
-use crate::session_display::{
+pub use opensessions_runtime::session_projection::DisplaySessionEntry;
+use opensessions_runtime::session_projection::{
     SessionProjectionOptions, display_sessions as projection_display_sessions, filtered_sessions,
     project_sessions, reordered_session_names as projection_reordered_session_names,
     reordered_worktree_group_names as projection_reordered_worktree_group_names,
@@ -34,6 +34,25 @@ pub enum LaunchTarget {
     LazydiffTmux { session_name: Option<String> },
     /// Open lazydiff in a new terminal window.
     LazydiffTerminal { session_name: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPaneTarget {
+    pub session: String,
+    pub agent: String,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+    pub pane_id: Option<String>,
+}
+
+pub(crate) fn agent_focus_target(session: &SessionData, agent: &AgentEvent) -> AgentPaneTarget {
+    AgentPaneTarget {
+        session: session.name.clone(),
+        agent: agent.agent.clone(),
+        thread_id: agent.thread_id.clone(),
+        thread_name: agent.thread_name.clone(),
+        pane_id: agent.pane_id.clone(),
+    }
 }
 
 impl LaunchTarget {
@@ -978,7 +997,9 @@ impl App {
     }
 
     pub fn open_width_slider(&mut self) {
-        let draft_width = self.sidebar_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+        let draft_width = self
+            .sidebar_width
+            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
         self.modal = Modal::WidthSlider { draft_width };
     }
 

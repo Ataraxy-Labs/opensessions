@@ -8,11 +8,11 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, DisplaySessionEntry, Modal};
+use crate::app::{AgentPaneTarget, App, DisplaySessionEntry, Modal, agent_focus_target};
 use crate::generated::protocol::{
     AgentEvent, AgentPanelScope, AgentStatus, MetadataTone, SessionData,
 };
-use crate::session_display::worktree_group_key;
+use opensessions_runtime::session_projection::{GroupSummary, worktree_group_key};
 
 const MAX_AGENT_PROMPT_LINES: usize = 3;
 
@@ -30,15 +30,6 @@ pub enum HitTarget {
     Agent(usize),
     AgentPane(AgentPaneTarget),
     AgentScopeToggle,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentPaneTarget {
-    pub session: String,
-    pub agent: String,
-    pub thread_id: Option<String>,
-    pub thread_name: Option<String>,
-    pub pane_id: Option<String>,
 }
 
 /// Compute a per-row hit map for the current frame. Each entry corresponds to
@@ -436,7 +427,7 @@ enum SessionListRow<'a> {
         label: &'a str,
         count: usize,
         collapsed: bool,
-        summary: &'a crate::session_display::GroupSummary,
+        summary: &'a GroupSummary,
     },
     SessionName {
         entry_idx: usize,
@@ -469,7 +460,7 @@ struct GroupRow<'a> {
     label: &'a str,
     count: usize,
     collapsed: bool,
-    summary: &'a crate::session_display::GroupSummary,
+    summary: &'a GroupSummary,
 }
 
 impl<'a> SessionListRow<'a> {
@@ -632,11 +623,7 @@ fn build_group_row(app: &App, palette: &Palette, group: GroupRow<'_>, width: usi
     } else {
         palette.lavender
     };
-    let marker = if focused {
-        "›"
-    } else {
-        " "
-    };
+    let marker = if focused { "›" } else { " " };
     row.push(format!("{marker} "), marker_color);
     row.push(if collapsed { "▸ " } else { "▾ " }, marker_color);
     row.push(
@@ -706,7 +693,7 @@ fn push_loader_rows(
 fn push_group_summary(
     line: &mut StyledLine,
     palette: &Palette,
-    summary: &crate::session_display::GroupSummary,
+    summary: &GroupSummary,
     width: usize,
     spinner_ts: u64,
 ) {
@@ -931,16 +918,6 @@ fn session_agent_badges(
         });
     }
     badges
-}
-
-pub fn agent_focus_target(session: &SessionData, agent: &AgentEvent) -> AgentPaneTarget {
-    AgentPaneTarget {
-        session: session.name.clone(),
-        agent: agent.agent.clone(),
-        thread_id: agent.thread_id.clone(),
-        thread_name: agent.thread_name.clone(),
-        pane_id: agent.pane_id.clone(),
-    }
 }
 
 fn agent_visual_kind(agent: &AgentEvent) -> AgentVisualKind {

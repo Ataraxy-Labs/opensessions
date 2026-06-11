@@ -86,7 +86,7 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     lab.wait_for_capture_pane(&worktree_source, |text| {
         row_with(text, "os-demo-preview").is_some_and(|row| row.contains("›"))
     });
-    lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Enter"]);
+    lab.send_sidebar_key(&worktree_source, "Enter");
     lab.wait_for_client_session("os-demo-preview");
     lab.wait_for_capture_pane(&worktree_dest, |text| {
         row_with(text, "os-demo-preview").is_some_and(|row| row.contains("▌"))

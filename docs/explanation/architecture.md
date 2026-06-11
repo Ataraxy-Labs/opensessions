@@ -18,12 +18,12 @@ If no healthy server is listening, `integrations/tmux-plugin/scripts/server-comm
 1. loads config from `~/.config/opensessions/config.json`
 2. registers the built-in tmux provider
 3. resolves the primary mux provider
-4. starts built-in scanner loops for Amp, Claude Code, Codex, OpenCode, Pi, and Droid
+4. starts the tmux state observer and, when enabled deliberately, built-in scanner loops for Amp, Claude Code, Codex, OpenCode, Pi, and Droid
 5. starts the WebSocket and HTTP control server
 
 ## State Assembly
 
-The server computes a single `ServerState` payload for every connected sidebar client.
+The server owns authoritative runtime state and serves typed query read models to connected sidebar clients.
 
 That state is assembled from several sources:
 
@@ -34,7 +34,7 @@ That state is assembled from several sources:
 - detected listening ports from descendant processes in tmux sessions
 - tracked agent instances and unseen state from `AgentTracker`
 
-The result is one live view of the current tmux universe.
+The result is one live view of the current tmux universe. Internally, the aggregate state is split into typed query results such as `Sessions`, `Agents`, `Focus`, `SidebarLayout`, and `Settings` so clients can refetch only the read models invalidated by a change.
 
 ## Authority, Observations, And Projections
 
@@ -46,7 +46,7 @@ A projection is a read-only view derived from deeper state. For example, the raw
 
 ## Agent Tracking Model
 
-Watchers and external integrations do not know about the TUI. They only emit `AgentEvent`s into the server, either through built-in Rust scanners or `POST /api/agent-event`.
+Watchers and external integrations do not know about the TUI. They emit `AgentEvent`s into the server through `POST /api/agent-event`; the built-in JSONL scanner code is present but currently disabled while tmux-pane observation is hardened.
 
 The `AgentTracker` is where those raw events become UI-friendly state:
 
@@ -77,7 +77,7 @@ The tmux provider is the more feature-complete reference implementation.
 Notable design choices:
 
 - tmux global hooks notify the server about focus changes, session creation, window changes, and resize events
-- hidden sidebars are moved into a dedicated stash session named `_os_stash` instead of being destroyed
+- hidden sidebars are closed; legacy or reserved stash panes in `_os_stash` are filtered out of normal sidebar management
 - the TUI refocuses the main pane after capability detection to avoid escape-sequence leakage into the main pane
 - typed tmux command helpers live in the Rust tmux provider and tmux scripting modules
 - the tmux integration scripts live under `integrations/tmux-plugin`, while the sidebar launcher itself lives with the TUI app in `apps/tui/scripts/start.sh`

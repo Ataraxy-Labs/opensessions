@@ -7,4 +7,3 @@ pub mod renderer;
 pub mod runtime_config;
 pub mod runtime_context;
 pub mod server_query;
-mod session_display;
