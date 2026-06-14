@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -48,10 +50,13 @@ pub fn builtin_provider_specs(home: &Path) -> Vec<ProviderWatchSpec> {
         },
         ProviderWatchSpec {
             provider: "claude-code".to_string(),
-            roots: vec![WatchRoot {
-                path: home.join(".claude/projects"),
-                kind: WatchKind::RecursiveDirectory,
-            }],
+            roots: claude_code_projects_dirs(home)
+                .into_iter()
+                .map(|path| WatchRoot {
+                    path,
+                    kind: WatchKind::RecursiveDirectory,
+                })
+                .collect(),
             debounce: Duration::from_millis(150),
             fallback_poll: Some(Duration::from_secs(2)),
         },
@@ -89,6 +94,65 @@ pub fn builtin_provider_specs(home: &Path) -> Vec<ProviderWatchSpec> {
             fallback_poll: Some(Duration::from_secs(2)),
         },
     ]
+}
+
+pub fn claude_code_projects_dirs(home: &Path) -> Vec<PathBuf> {
+    claude_code_projects_dirs_with_config_dir(home, std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+fn claude_code_projects_dirs_with_config_dir(
+    home: &Path,
+    config_dir: Option<OsString>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    push_unique(&mut dirs, home.join(".claude/projects"));
+
+    if let Some(config_dir) = config_dir.filter(|value| !value.is_empty()) {
+        push_unique(
+            &mut dirs,
+            expand_home_path(home, PathBuf::from(config_dir)).join("projects"),
+        );
+    }
+
+    if let Ok(entries) = fs::read_dir(home) {
+        let mut sibling_projects_dirs = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                if !name.starts_with(".claude") {
+                    return None;
+                }
+                let projects_dir = entry.path().join("projects");
+                projects_dir.is_dir().then_some(projects_dir)
+            })
+            .collect::<Vec<_>>();
+        sibling_projects_dirs.sort();
+        for projects_dir in sibling_projects_dirs {
+            push_unique(&mut dirs, projects_dir);
+        }
+    }
+
+    dirs
+}
+
+fn expand_home_path(home: &Path, path: PathBuf) -> PathBuf {
+    let Some(path_text) = path.to_str() else {
+        return path;
+    };
+    if path_text == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = path_text.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 pub fn coalesce_watch_roots(input: Vec<(&str, PathBuf, WatchKind)>) -> Vec<CoalescedWatchRoot> {
@@ -136,4 +200,85 @@ fn push_provider(providers: &mut Vec<String>, provider: &str) {
 
 fn path_len(path: &Path) -> usize {
     path.components().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn claude_code_projects_dirs_include_env_config_dir() {
+        let home = unique_test_home("claude-env");
+
+        let dirs = claude_code_projects_dirs_with_config_dir(
+            &home,
+            Some(OsString::from("~/.claude-personal")),
+        );
+
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-personal/projects"),
+            ]
+        );
+
+        fs::remove_dir_all(&home).expect("clean test home");
+    }
+
+    #[test]
+    fn claude_code_projects_dirs_scan_existing_sibling_config_dirs() {
+        let home = unique_test_home("claude-siblings");
+        fs::create_dir_all(home.join(".claude/projects")).expect("create default projects dir");
+        fs::create_dir_all(home.join(".claude-personal/projects"))
+            .expect("create personal projects dir");
+        fs::create_dir_all(home.join(".claude-work/no-projects"))
+            .expect("create non-project claude dir");
+        fs::create_dir_all(home.join(".not-claude/projects")).expect("create unrelated dir");
+
+        let dirs = claude_code_projects_dirs_with_config_dir(&home, None);
+
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-personal/projects"),
+            ]
+        );
+
+        fs::remove_dir_all(&home).expect("clean test home");
+    }
+
+    #[test]
+    fn claude_code_projects_dirs_deduplicate_env_and_scan_matches() {
+        let home = unique_test_home("claude-dedupe");
+        fs::create_dir_all(home.join(".claude-personal/projects"))
+            .expect("create personal projects dir");
+
+        let dirs = claude_code_projects_dirs_with_config_dir(
+            &home,
+            Some(OsString::from(home.join(".claude-personal"))),
+        );
+
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-personal/projects"),
+            ]
+        );
+
+        fs::remove_dir_all(&home).expect("clean test home");
+    }
+
+    fn unique_test_home(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time is after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("opensessions-{name}-{suffix}"));
+        fs::create_dir_all(&path).expect("create test home");
+        path
+    }
 }
