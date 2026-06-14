@@ -38,6 +38,7 @@ use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
+use opensessions_runtime::watch_plan::claude_code_projects_dirs;
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
@@ -1905,42 +1906,43 @@ fn scan_amp_threads(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSn
 }
 
 fn scan_claude_code_projects(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
-    let projects_dir = home.join(".claude/projects");
-    let Ok(projects) = fs::read_dir(projects_dir) else {
-        return;
-    };
-
-    for project in projects.flatten() {
-        let project_path = project.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-        let encoded = project.file_name().to_string_lossy().to_string();
-        let project_dir = decode_claude_project_dir(&encoded, |path| Path::new(path).is_dir());
-        let Ok(files) = fs::read_dir(project_path) else {
+    for projects_dir in claude_code_projects_dirs(home) {
+        let Ok(projects) = fs::read_dir(projects_dir) else {
             continue;
         };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+
+        for project in projects.flatten() {
+            let project_path = project.path();
+            if !project_path.is_dir() {
                 continue;
             }
-            let Some(mtime_ms) = file_mtime_ms(&path) else {
+            let encoded = project.file_name().to_string_lossy().to_string();
+            let project_dir = decode_claude_project_dir(&encoded, |path| Path::new(path).is_dir());
+            let Ok(files) = fs::read_dir(project_path) else {
                 continue;
             };
-            if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
-                continue;
-            }
-            let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            let Ok(raw) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if let Some(snapshot) =
-                claude_code_snapshot_from_jsonl(thread_id, &project_dir, &raw, mtime_ms, now_ms)
-            {
-                snapshots.push(snapshot);
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(mtime_ms) = file_mtime_ms(&path) else {
+                    continue;
+                };
+                if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
+                    continue;
+                }
+                let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let Ok(raw) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                if let Some(snapshot) =
+                    claude_code_snapshot_from_jsonl(thread_id, &project_dir, &raw, mtime_ms, now_ms)
+                {
+                    snapshots.push(snapshot);
+                }
             }
         }
     }
