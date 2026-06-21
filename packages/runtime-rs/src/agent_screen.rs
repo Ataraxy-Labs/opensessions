@@ -62,7 +62,7 @@ struct Rule {
     visible_working: bool,
     #[serde(default)]
     skip_state_update: bool,
-    #[serde(flatten)]
+    #[serde(default)]
     gate: Gate,
 }
 
@@ -73,7 +73,7 @@ struct Gate {
     all: Vec<Gate>,
     #[serde(default)]
     any: Vec<Gate>,
-    #[serde(default, rename = "not")]
+    #[serde(default)]
     not_gate: Vec<Gate>,
     #[serde(default)]
     contains: Vec<String>,
@@ -84,7 +84,6 @@ struct Gate {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 enum RuleState {
     Idle,
     Working,
@@ -229,7 +228,7 @@ fn manifest_for_agent(agent: &str) -> Option<&'static LoadedManifest> {
 }
 
 fn load_manifest(agent: &'static str, raw: &'static str) -> LoadedManifest {
-    let manifest = toml::from_str::<Manifest>(raw)
+    let manifest = ron::from_str::<Manifest>(raw)
         .unwrap_or_else(|err| panic!("bundled {agent} detection manifest is invalid: {err}"));
     let rules = manifest
         .rules
@@ -573,26 +572,26 @@ fn aliases_for_agent(agent: &str) -> &'static [&'static str] {
 }
 
 const MANIFEST_SOURCES: &[(&str, &str)] = &[
-    ("amp", include_str!("agent_manifests/amp.toml")),
-    ("agy", include_str!("agent_manifests/antigravity.toml")),
-    ("claude", include_str!("agent_manifests/claude.toml")),
-    ("cline", include_str!("agent_manifests/cline.toml")),
-    ("codex", include_str!("agent_manifests/codex.toml")),
-    ("cursor", include_str!("agent_manifests/cursor.toml")),
-    ("devin", include_str!("agent_manifests/devin.toml")),
-    ("droid", include_str!("agent_manifests/droid.toml")),
-    ("gemini", include_str!("agent_manifests/gemini.toml")),
-    ("grok", include_str!("agent_manifests/grok.toml")),
-    ("hermes", include_str!("agent_manifests/hermes.toml")),
-    ("kilo", include_str!("agent_manifests/kilo.toml")),
-    ("kimi", include_str!("agent_manifests/kimi.toml")),
-    ("kiro", include_str!("agent_manifests/kiro.toml")),
-    ("opencode", include_str!("agent_manifests/opencode.toml")),
-    ("pi", include_str!("agent_manifests/pi.toml")),
-    ("qodercli", include_str!("agent_manifests/qodercli.toml")),
+    ("amp", include_str!("agent_manifests/amp.ron")),
+    ("agy", include_str!("agent_manifests/antigravity.ron")),
+    ("claude", include_str!("agent_manifests/claude.ron")),
+    ("cline", include_str!("agent_manifests/cline.ron")),
+    ("codex", include_str!("agent_manifests/codex.ron")),
+    ("cursor", include_str!("agent_manifests/cursor.ron")),
+    ("devin", include_str!("agent_manifests/devin.ron")),
+    ("droid", include_str!("agent_manifests/droid.ron")),
+    ("gemini", include_str!("agent_manifests/gemini.ron")),
+    ("grok", include_str!("agent_manifests/grok.ron")),
+    ("hermes", include_str!("agent_manifests/hermes.ron")),
+    ("kilo", include_str!("agent_manifests/kilo.ron")),
+    ("kimi", include_str!("agent_manifests/kimi.ron")),
+    ("kiro", include_str!("agent_manifests/kiro.ron")),
+    ("opencode", include_str!("agent_manifests/opencode.ron")),
+    ("pi", include_str!("agent_manifests/pi.ron")),
+    ("qodercli", include_str!("agent_manifests/qodercli.ron")),
     (
         "copilot",
-        include_str!("agent_manifests/github-copilot.toml"),
+        include_str!("agent_manifests/github-copilot.ron"),
     ),
 ];
 

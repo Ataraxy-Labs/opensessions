@@ -1,3 +1,4 @@
+pub mod agent_detection;
 pub mod agent_parsers;
 pub mod agent_screen;
 pub mod agent_watchers;

@@ -1,0 +1,83 @@
+(
+    id: r#"qodercli"#,
+    aliases: [r#"qoderclicn"#, r#"qoder"#, r#"qodercn"#],
+    rules: [
+(
+            id: r#"confirmation_or_input_blocker"#,
+            state: Some(Blocked),
+            priority: 300,
+            region: r#"whole_recent"#,
+            visible_blocker: true,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"waiting for user confirmation"#],
+                        any: [
+                            (
+                                contains: [r#"yes"#],
+                            ),
+                            (
+                                contains: [r#"no"#],
+                            ),
+                            (
+                                contains: [r#"allow"#],
+                            ),
+                            (
+                                contains: [r#"reject"#],
+                            ),
+                        ],
+                    ),
+                    (
+                        contains: [r#"awaiting approval"#],
+                        any: [
+                            (
+                                contains: [r#"allow"#],
+                            ),
+                            (
+                                contains: [r#"reject"#],
+                            ),
+                        ],
+                    ),
+                    (
+                        contains: [r#"permission required"#],
+                    ),
+                    (
+                        contains: [r#"allow once or always?"#],
+                    ),
+                    (
+                        contains: [r#"asking user"#],
+                    ),
+                    (
+                        contains: [r#"enter your response"#],
+                    ),
+                    (
+                        contains: [r#"review your answers:"#],
+                    ),
+                    (
+                        contains: [r#"shell awaiting input"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"cancel_hint_working"#,
+            state: Some(Working),
+            priority: 100,
+            region: r#"whole_recent"#,
+            visible_working: true,
+            gate: (
+                contains: [r#"(esc to cancel,"#],
+            ),
+        ),
+(
+            id: r#"spinner_working"#,
+            state: Some(Working),
+            priority: 90,
+            region: r#"whole_recent"#,
+            visible_working: true,
+            gate: (
+                line_regex: [r#"^\s*[\u2800-\u28FF]\s+.*\p{Alphabetic}"#],
+            ),
+        ),
+    ],
+)

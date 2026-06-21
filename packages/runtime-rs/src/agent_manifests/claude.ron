@@ -1,0 +1,272 @@
+(
+    id: r#"claude"#,
+    aliases: [r#"claude-code"#],
+    rules: [
+(
+            id: r#"osc_title_working"#,
+            state: Some(Working),
+            priority: 1100,
+            region: r#"osc_title"#,
+            visible_working: true,
+            gate: (
+                regex: [r#"^[\x{2800}-\x{28FF}] "#],
+            ),
+        ),
+(
+            id: r#"transcript_viewer"#,
+            state: Some(Unknown),
+            priority: 1000,
+            region: r#"bottom_non_empty_lines(3)"#,
+            skip_state_update: true,
+            gate: (
+                contains: [r#"showing detailed transcript"#],
+                any: [
+                    (
+                        contains: [r#"ctrl+o"#, r#"to toggle"#],
+                    ),
+                    (
+                        contains: [r#"ctrl+e"#, r#"show all"#],
+                    ),
+                    (
+                        contains: [r#"ctrl+e"#, r#"collapse"#],
+                    ),
+                    (
+                        contains: [r#"↑↓ scroll"#],
+                    ),
+                    (
+                        contains: [r#"? for shortcuts"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"live_blocked_form"#,
+            state: Some(Blocked),
+            priority: 980,
+            region: r#"after_last_horizontal_rule"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"enter to select"#, r#"esc to cancel"#],
+                any: [
+                    (
+                        contains: [r#"tab/arrow keys to navigate"#],
+                    ),
+                    (
+                        contains: [r#"arrow keys to navigate"#],
+                    ),
+                    (
+                        contains: [r#"arrows to navigate"#],
+                    ),
+                    (
+                        contains: [r#"↑/↓ to navigate"#],
+                    ),
+                    (
+                        contains: [r#"↑↓ to navigate"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"dynamic_workflow_prompt"#,
+            state: Some(Blocked),
+            priority: 980,
+            region: r#"whole_recent"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"run a dynamic workflow?"#, r#"esc to cancel"#],
+            ),
+        ),
+(
+            id: r#"live_prompt_box"#,
+            state: Some(Idle),
+            priority: 950,
+            region: r#"prompt_box_body"#,
+            visible_idle: true,
+            gate: (
+                line_regex: [r#"^\s*❯"#],
+                not_gate: [
+                    (
+                        contains: [r#"enter to select"#],
+                    ),
+                    (
+                        contains: [r#"esc to cancel"#],
+                    ),
+                    (
+                        contains: [r#"tab/arrow keys"#],
+                    ),
+                    (
+                        contains: [r#"arrow keys to navigate"#],
+                    ),
+                    (
+                        contains: [r#"↑/↓ to navigate"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"model_picker_menu"#,
+            state: Some(Unknown),
+            priority: 900,
+            region: r#"whole_recent"#,
+            skip_state_update: true,
+            gate: (
+                contains: [r#"select model"#, r#"enter to set as default"#, r#"esc to cancel"#],
+                not_gate: [
+                    (
+                        contains: [r#"do you want to proceed?"#],
+                    ),
+                    (
+                        contains: [r#"enter to select"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"bash_permission_prompt"#,
+            state: Some(Blocked),
+            priority: 850,
+            region: r#"whole_recent"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"do you want to proceed?"#],
+                all: [
+                    (
+                        any: [
+                            (
+                                line_regex: [r#"(?i)^\s*❯?\s*yes\b"#],
+                            ),
+                            (
+                                line_regex: [r#"(?i)^\s*1\.\s*yes\b"#],
+                            ),
+                            (
+                                line_regex: [r#"(?i)^\s*2\.\s*no\b"#],
+                            ),
+                        ],
+                    ),
+                ],
+                any: [
+                    (
+                        contains: [r#"bash command"#],
+                    ),
+                    (
+                        contains: [r#"bash("#],
+                    ),
+                    (
+                        contains: [r#"contains expansion"#],
+                    ),
+                    (
+                        contains: [r#"tab to amend"#],
+                    ),
+                    (
+                        contains: [r#"ctrl+e to explain"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"generic_permission_prompt"#,
+            state: Some(Blocked),
+            priority: 840,
+            region: r#"after_last_horizontal_rule"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"do you want to proceed?"#, r#"esc to cancel"#],
+                all: [
+                    (
+                        any: [
+                            (
+                                line_regex: [r#"(?i)^\s*❯?\s*1\.\s*yes\b"#],
+                            ),
+                            (
+                                line_regex: [r#"(?i)^\s*2\.\s*yes\b"#],
+                            ),
+                            (
+                                line_regex: [r#"(?i)^\s*2\.\s*no\b"#],
+                            ),
+                            (
+                                line_regex: [r#"(?i)^\s*3\.\s*no\b"#],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"legacy_no_prompt_blocker"#,
+            state: Some(Blocked),
+            priority: 300,
+            region: r#"whole_recent"#,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"do you want to"#],
+                        any: [
+                            (
+                                contains: [r#"yes"#],
+                            ),
+                            (
+                                contains: [r#"❯"#],
+                            ),
+                        ],
+                    ),
+                    (
+                        contains: [r#"would you like to"#],
+                        any: [
+                            (
+                                contains: [r#"yes"#],
+                            ),
+                            (
+                                contains: [r#"❯"#],
+                            ),
+                        ],
+                    ),
+                    (
+                        contains: [r#"waiting for permission"#],
+                    ),
+                    (
+                        contains: [r#"do you want to allow this connection?"#],
+                    ),
+                    (
+                        contains: [r#"tab to amend"#],
+                    ),
+                    (
+                        contains: [r#"ctrl+e to explain"#],
+                    ),
+                    (
+                        contains: [r#"do you want to proceed?"#, r#"esc to cancel"#],
+                    ),
+                    (
+                        contains: [r#"review your answers"#],
+                    ),
+                    (
+                        contains: [r#"skip interview and plan immediately"#],
+                    ),
+                ],
+                not_gate: [
+                    (
+                        regex: [r#"(?m)^\s*❯\s*$"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"osc_title_idle"#,
+            state: Some(Idle),
+            priority: 250,
+            region: r#"osc_title"#,
+            visible_idle: true,
+            gate: (
+                regex: [r#"^\x{2733} "#],
+            ),
+        ),
+(
+            id: r#"osc_progress_idle"#,
+            state: Some(Idle),
+            priority: 250,
+            region: r#"osc_progress"#,
+            gate: (
+                regex: [r#"^4;0"#],
+            ),
+        ),
+    ],
+)

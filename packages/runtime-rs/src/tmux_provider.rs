@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::agent_screen::detect_agent_screen_status_with_osc;
+use crate::agent_detection::{PaneObservation, detect_agent_pane};
 use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
 };
-use crate::protocol::AgentPaneDiagnostic;
+use crate::protocol::{AgentPaneDiagnostic, AgentStatus};
 use crate::tmux_scripting::{
     current_sidebar_pane_width_repair_hook_command,
     current_window_sidebar_width_repair_hook_command, delayed_http_hook_command,
@@ -686,19 +686,22 @@ impl MuxProvider for TmuxProvider {
             .list_panes(PaneScope::Session(session_name))
             .into_iter()
             .filter(|pane| pane.title != "opensessions-sidebar")
-            .filter_map(|pane| agent_from_pane(&pane).map(|agent| (pane, agent)))
-            .map(|(pane, agent)| AgentPane {
-                status: detect_agent_screen_status_with_osc(
-                    &agent,
-                    &self.client.capture_visible_pane_text(&pane.id),
-                    &pane.title,
-                    "",
-                ),
-                thread_name: thread_name_from_pane(&pane, &agent),
-                agent,
-                pane_id: pane.id,
-                active: pane.active,
-                thread_id: None,
+            .filter_map(|pane| {
+                let screen = self.client.capture_visible_pane_text(&pane.id);
+                let detection = detect_agent_pane(&PaneObservation {
+                    command: pane.command.clone(),
+                    title: pane.title.clone(),
+                    visible_text: screen,
+                });
+                let agent = detection.agent?;
+                Some(AgentPane {
+                    status: detection.status.unwrap_or(AgentStatus::Idle),
+                    thread_name: detection.thread_name,
+                    agent,
+                    pane_id: pane.id,
+                    active: pane.active,
+                    thread_id: None,
+                })
             })
             .collect()
     }
@@ -710,14 +713,12 @@ impl MuxProvider for TmuxProvider {
             .filter(|pane| pane.title != "opensessions-sidebar")
             .map(|pane| {
                 let screen = self.client.capture_visible_pane_text(&pane.id);
-                let mapping = agent_mapping_from_pane(&pane);
-                let parsed_status = mapping.agent.as_deref().map(|agent| {
-                    detect_agent_screen_status_with_osc(agent, &screen, &pane.title, "")
+                let detection = detect_agent_pane(&PaneObservation {
+                    command: pane.command.clone(),
+                    title: pane.title.clone(),
+                    visible_text: screen,
                 });
-                let thread_name = mapping
-                    .agent
-                    .as_deref()
-                    .and_then(|agent| thread_name_from_pane(&pane, agent));
+                let screen = detection.screen.as_ref();
                 AgentPaneDiagnostic {
                     session: pane.session_name,
                     pane_id: pane.id,
@@ -725,11 +726,20 @@ impl MuxProvider for TmuxProvider {
                     active: pane.active,
                     command: pane.command,
                     title: pane.title,
-                    mapped_agent: mapping.agent,
-                    mapping_reason: mapping.reason,
-                    parsed_status,
-                    thread_name,
-                    visible_tail: visible_tail_lines(&screen, 8),
+                    detection_source: detection
+                        .agent
+                        .as_ref()
+                        .map(|_| "manifest-screen".to_string()),
+                    mapped_agent: detection.agent,
+                    mapping_reason: detection.mapping_reason,
+                    parsed_status: detection.status,
+                    matched_rule: screen.and_then(|screen| screen.matched_rule.clone()),
+                    visible_idle: screen.is_some_and(|screen| screen.visible_idle),
+                    visible_blocker: screen.is_some_and(|screen| screen.visible_blocker),
+                    visible_working: screen.is_some_and(|screen| screen.visible_working),
+                    skip_state_update: screen.is_some_and(|screen| screen.skip_state_update),
+                    thread_name: detection.thread_name,
+                    visible_tail: detection.visible_tail,
                 }
             })
             .collect()
@@ -925,135 +935,6 @@ fn pane_format() -> &'static str {
     "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
 }
 
-fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
-    agent_mapping_from_pane(pane).agent
-}
-
-struct AgentPaneMapping {
-    agent: Option<String>,
-    reason: String,
-}
-
-fn agent_mapping_from_pane(pane: &PaneInfo) -> AgentPaneMapping {
-    let command = pane.command.to_ascii_lowercase();
-    if command == "pi" {
-        return AgentPaneMapping {
-            agent: Some("pi".to_string()),
-            reason: "exact command pi".to_string(),
-        };
-    }
-    for (agent, aliases) in AGENT_ALIASES {
-        if let Some(alias) = aliases.iter().copied().find(|alias| command == *alias) {
-            return AgentPaneMapping {
-                agent: Some((*agent).to_string()),
-                reason: format!("exact command {alias}"),
-            };
-        }
-    }
-
-    let title = pane.title.to_ascii_lowercase();
-    if title == "pi" || title.starts_with("pi ") || title.starts_with('π') {
-        return AgentPaneMapping {
-            agent: Some("pi".to_string()),
-            reason: "anchored title pi".to_string(),
-        };
-    }
-    for (agent, aliases) in AGENT_ALIASES {
-        if let Some(alias) = aliases
-            .iter()
-            .copied()
-            .find(|alias| title_starts_with_agent(&title, alias))
-        {
-            return AgentPaneMapping {
-                agent: Some((*agent).to_string()),
-                reason: format!("anchored title {alias}"),
-            };
-        }
-    }
-
-    AgentPaneMapping {
-        agent: None,
-        reason: format!(
-            "unmapped: command {:?}, title {:?} did not match exact command or anchored title aliases",
-            pane.command, pane.title
-        ),
-    }
-}
-
-fn title_starts_with_agent(title: &str, alias: &str) -> bool {
-    title == alias
-        || title
-            .strip_prefix(alias)
-            .is_some_and(|rest| matches!(rest.chars().next(), Some(' ') | Some('-') | Some(':')))
-}
-
-// Keep exact process aliases as the primary pane identity. Title fallback is
-// intentionally anchored because titles are UI text and can contain unrelated
-// prose. Screen parsing derives live status only after pane identity is known.
-const AGENT_ALIASES: &[(&str, &[&str])] = &[
-    ("amp", &["amp", "amp-local"]),
-    ("claude-code", &["claude", "claude-code", "claude.exe"]),
-    ("codex", &["codex"]),
-    ("gemini", &["gemini"]),
-    ("cursor", &["cursor", "cursor-agent"]),
-    ("devin", &["devin", "devin-cli"]),
-    ("antigravity", &["agy", "antigravity", "antigravity-cli"]),
-    ("cline", &["cline"]),
-    ("opencode", &["opencode", "open-code"]),
-    ("github-copilot", &["copilot", "github-copilot", "ghcs"]),
-    ("kilo", &["kilo", "kilo-code"]),
-    ("kimi", &["kimi", "kimi-code"]),
-    ("kiro", &["kiro", "kiro-cli"]),
-    ("droid", &["droid"]),
-    ("grok", &["grok", "grok-build"]),
-    ("hermes", &["hermes", "hermes-agent"]),
-    ("qodercli", &["qodercli", "qoderclicn", "qoder", "qodercn"]),
-];
-
-fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
-    let title = pane.title.trim();
-    if agent == "amp"
-        && let Some((thread_name, _)) = title.split_once(" - amp - ")
-    {
-        let thread_name = thread_name.trim();
-        if !thread_name.is_empty() && !is_amp_live_status_title(thread_name) {
-            return Some(thread_name.to_string());
-        }
-    }
-    if agent == "amp"
-        && let Some(rest) = title.strip_prefix("amp - ")
-        && let Some((thread_name, _)) = rest.split_once(" - ")
-    {
-        let thread_name = thread_name.trim();
-        if !thread_name.is_empty() && !is_amp_live_status_title(thread_name) {
-            return Some(thread_name.to_string());
-        }
-    }
-    None
-}
-
-fn is_amp_live_status_title(title: &str) -> bool {
-    let trimmed = title.trim_start();
-    let Some(first) = trimmed.chars().next() else {
-        return false;
-    };
-    matches!(first, '\u{2800}'..='\u{28ff}')
-}
-
-fn visible_tail_lines(screen: &str, max_lines: usize) -> Vec<String> {
-    let mut lines = screen
-        .lines()
-        .rev()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .take(max_lines)
-        .collect::<Vec<_>>();
-    lines.reverse();
-    lines
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1212,51 +1093,5 @@ mod tests {
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
         );
-    }
-
-    #[test]
-    fn agent_from_pane_prefers_exact_command_identity() {
-        let pane = pane_with_command_and_title("amp", "not an amp title");
-
-        assert_eq!(agent_from_pane(&pane).as_deref(), Some("amp"));
-    }
-
-    #[test]
-    fn agent_from_pane_recognizes_claude_exe_command() {
-        let pane = pane_with_command_and_title("claude.exe", "✳ Claude Code");
-
-        assert_eq!(agent_from_pane(&pane).as_deref(), Some("claude-code"));
-    }
-
-    #[test]
-    fn agent_from_pane_uses_anchored_title_fallback_only() {
-        assert_eq!(
-            agent_from_pane(&pane_with_command_and_title("zsh", "amp - project")).as_deref(),
-            Some("amp")
-        );
-        assert_eq!(
-            agent_from_pane(&pane_with_command_and_title("zsh", "my-vampire-notes")),
-            None
-        );
-    }
-
-    fn pane_with_command_and_title(command: &str, title: &str) -> PaneInfo {
-        PaneInfo {
-            id: "%1".to_string(),
-            session_name: "work".to_string(),
-            window_id: "@1".to_string(),
-            window_index: 0,
-            index: 0,
-            active: false,
-            tty: "/dev/ttys001".to_string(),
-            pid: 1,
-            cwd: "/tmp".to_string(),
-            command: command.to_string(),
-            title: title.to_string(),
-            width: 80,
-            height: 24,
-            left: 0,
-            right: 79,
-        }
     }
 }

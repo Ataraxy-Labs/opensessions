@@ -1,0 +1,41 @@
+(
+    id: r#"cline"#,
+    rules: [
+(
+            id: r#"tool_permission"#,
+            state: Some(Blocked),
+            priority: 300,
+            region: r#"whole_recent"#,
+            visible_blocker: true,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"let cline use this tool"#],
+                    ),
+                    (
+                        contains: [r#"[act mode]"#, r#"execute command?"#, r#"yes"#],
+                    ),
+                    (
+                        contains: [r#"[act mode]"#, r#"use this tool?"#, r#"yes"#],
+                    ),
+                    (
+                        contains: [r#"[plan mode]"#, r#"execute command?"#, r#"yes"#],
+                    ),
+                    (
+                        contains: [r#"[plan mode]"#, r#"use this tool?"#, r#"yes"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"default_cline_working"#,
+            state: Some(Working),
+            priority: -10,
+            region: r#"whole_recent"#,
+            visible_working: true,
+            gate: (
+                regex: [r#"(?s).+"#],
+            ),
+        ),
+    ],
+)

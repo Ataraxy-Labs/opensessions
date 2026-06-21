@@ -1,0 +1,115 @@
+(
+    id: r#"devin"#,
+    aliases: [r#"devin-cli"#, r#"devin cli"#],
+    rules: [
+(
+            id: r#"workspace_trust_prompt"#,
+            state: Some(Blocked),
+            priority: 300,
+            region: r#"bottom_non_empty_lines(8)"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"do you trust the authors of this directory?"#, r#"with untrusted content."#, r#"yes, trust "#],
+            ),
+        ),
+(
+            id: r#"permission_prompt"#,
+            state: Some(Blocked),
+            priority: 290,
+            region: r#"bottom_non_empty_lines(8)"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"approve once"#, r#"select"#, r#"confirm"#, r#"esc cancel"#],
+            ),
+        ),
+(
+            id: r#"running_tools_footer"#,
+            state: Some(Working),
+            priority: 200,
+            region: r#"bottom_non_empty_lines(8)"#,
+            visible_working: true,
+            gate: (
+                contains: [r#"running tools"#, r#"esc to interrupt"#],
+                not_gate: [
+                    (
+                        contains: [r#"approve once"#, r#"esc cancel"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"guide_while_working"#,
+            state: Some(Working),
+            priority: 190,
+            region: r#"bottom_non_empty_lines(6)"#,
+            visible_working: true,
+            gate: (
+                contains: [r#"guide devin while it works"#],
+                not_gate: [
+                    (
+                        contains: [r#"approve once"#, r#"esc cancel"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"tool_reading_timeout"#,
+            state: Some(Working),
+            priority: 180,
+            region: r#"bottom_non_empty_lines(8)"#,
+            visible_working: true,
+            gate: (
+                contains: [r#"reading shell "#, r#"timeout:"#],
+                not_gate: [
+                    (
+                        contains: [r#"approve once"#, r#"esc cancel"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"welcome_prompt_footer"#,
+            state: Some(Idle),
+            priority: 120,
+            region: r#"bottom_non_empty_lines(8)"#,
+            visible_idle: true,
+            gate: (
+                contains: [r#"ask devin to build"#, r#"features, fix bugs"#, r#"your code"#],
+                line_regex: [r#"^\s*❭ Ask Devin to build"#],
+                not_gate: [
+                    (
+                        contains: [r#"approve once"#, r#"esc cancel"#],
+                    ),
+                    (
+                        contains: [r#"running tools"#, r#"esc to interrupt"#],
+                    ),
+                    (
+                        contains: [r#"guide devin while it works"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"live_prompt_footer"#,
+            state: Some(Idle),
+            priority: 100,
+            region: r#"bottom_non_empty_lines(6)"#,
+            visible_idle: true,
+            gate: (
+                contains: [r#"context:"#],
+                line_regex: [r#"^\s*❭"#],
+                not_gate: [
+                    (
+                        contains: [r#"approve once"#, r#"esc cancel"#],
+                    ),
+                    (
+                        contains: [r#"running tools"#, r#"esc to interrupt"#],
+                    ),
+                    (
+                        contains: [r#"guide devin while it works"#],
+                    ),
+                ],
+            ),
+        ),
+    ],
+)

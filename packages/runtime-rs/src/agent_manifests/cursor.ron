@@ -1,0 +1,94 @@
+(
+    id: r#"cursor"#,
+    aliases: [r#"cursor-agent"#],
+    rules: [
+(
+            id: r#"write_file_approval"#,
+            state: Some(Blocked),
+            priority: 320,
+            region: r#"bottom_non_empty_lines(8)"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"write to this file?"#, r#"proceed (y)"#],
+                any: [
+                    (
+                        contains: [r#"reject & propose changes"#],
+                    ),
+                    (
+                        contains: [r#"esc or n or p"#],
+                    ),
+                    (
+                        contains: [r#"add write("#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"approval_prompt"#,
+            state: Some(Blocked),
+            priority: 300,
+            region: r#"whole_recent"#,
+            visible_blocker: true,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"waiting for approval"#, r#"run this command?"#],
+                        any: [
+                            (
+                                contains: [r#"run (once) (y)"#],
+                            ),
+                            (
+                                contains: [r#"skip (esc or n)"#],
+                            ),
+                        ],
+                    ),
+                    (
+                        contains: [r#"(y) (enter)"#],
+                    ),
+                    (
+                        line_regex: [r#"(?i)^\s*allow .*\(y\)"#],
+                    ),
+                    (
+                        contains: [r#"keep (n)"#],
+                    ),
+                    (
+                        contains: [r#"skip (esc or n)"#],
+                    ),
+                    (
+                        line_regex: [r#"(?i)^\s*(run |.*\(y\).*(allow|run \(once\)|→ run))"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"stop_hint_working"#,
+            state: Some(Working),
+            priority: 100,
+            region: r#"bottom_non_empty_lines(6)"#,
+            visible_working: true,
+            gate: (
+                contains: [r#"ctrl+c to stop"#],
+            ),
+        ),
+(
+            id: r#"background_task_status_working"#,
+            state: Some(Working),
+            priority: 95,
+            region: r#"bottom_non_empty_lines(5)"#,
+            visible_working: true,
+            gate: (
+                line_regex: [r#"(?i)\b[1-9][0-9]*\s+background\s+tasks?\b"#],
+            ),
+        ),
+(
+            id: r#"spinner_working"#,
+            state: Some(Working),
+            priority: 90,
+            region: r#"bottom_non_empty_lines(8)"#,
+            visible_working: true,
+            gate: (
+                line_regex: [r#"^\s*(⬡|⬢|[\u2800-\u28FF]+)\s+\p{Alphabetic}+\w*ing\b"#],
+            ),
+        ),
+    ],
+)

@@ -1,0 +1,16 @@
+(
+    id: r#"pi"#,
+    aliases: [r#"herdr:pi"#],
+    rules: [
+(
+            id: r#"working_literal"#,
+            state: Some(Working),
+            priority: 100,
+            region: r#"whole_recent"#,
+            visible_working: true,
+            gate: (
+                contains: [r#"Working..."#],
+            ),
+        ),
+    ],
+)

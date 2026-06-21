@@ -1,0 +1,122 @@
+(
+    id: r#"codex"#,
+    rules: [
+(
+            id: r#"osc_title_blocked"#,
+            state: Some(Blocked),
+            priority: 1100,
+            region: r#"osc_title"#,
+            visible_blocker: true,
+            gate: (
+                contains: [r#"Action Required"#],
+            ),
+        ),
+(
+            id: r#"osc_title_working"#,
+            state: Some(Working),
+            priority: 1050,
+            region: r#"osc_title"#,
+            visible_working: true,
+            gate: (
+                regex: [r#"^[\x{2800}-\x{28FF}] "#],
+            ),
+        ),
+(
+            id: r#"transcript_viewer"#,
+            state: Some(Unknown),
+            priority: 1000,
+            region: r#"after_last_prompt_marker"#,
+            skip_state_update: true,
+            gate: (
+                contains: [r#"↑/↓ to scroll"#, r#"pgup/pgdn to"#, r#"home/end to jump"#, r#"q to quit"#],
+                any: [
+                    (
+                        contains: [r#"esc to edit prev"#],
+                    ),
+                    (
+                        contains: [r#"esc/← to edit prev"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"live_strong_blocker"#,
+            state: Some(Blocked),
+            priority: 900,
+            region: r#"after_last_prompt_marker"#,
+            visible_blocker: true,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"press enter to confirm or esc to cancel"#],
+                    ),
+                    (
+                        contains: [r#"enter to submit answer"#],
+                    ),
+                    (
+                        contains: [r#"enter to submit all"#],
+                    ),
+                    (
+                        contains: [r#"allow command?"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"weak_blocker"#,
+            state: Some(Blocked),
+            priority: 600,
+            region: r#"whole_recent"#,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"[y/n]"#],
+                    ),
+                    (
+                        contains: [r#"yes (y)"#],
+                    ),
+                    (
+                        contains: [r#"do you want to"#],
+                        any: [
+                            (
+                                contains: [r#"yes"#],
+                            ),
+                            (
+                                contains: [r#"❯"#],
+                            ),
+                        ],
+                    ),
+                    (
+                        contains: [r#"would you like to"#],
+                        any: [
+                            (
+                                contains: [r#"yes"#],
+                            ),
+                            (
+                                contains: [r#"❯"#],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"osc_title_idle"#,
+            state: Some(Idle),
+            priority: 100,
+            region: r#"osc_title"#,
+            visible_idle: true,
+            gate: (
+                regex: [r#"\S"#],
+                not_gate: [
+                    (
+                        regex: [r#"^[\x{2800}-\x{28FF}]"#],
+                    ),
+                    (
+                        contains: [r#"Action Required"#],
+                    ),
+                ],
+            ),
+        ),
+    ],
+)

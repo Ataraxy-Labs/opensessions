@@ -1,0 +1,79 @@
+(
+    id: r#"opencode"#,
+    aliases: [r#"open-code"#, r#"herdr:opencode"#],
+    rules: [
+(
+            id: r#"permission_required"#,
+            state: Some(Blocked),
+            priority: 300,
+            region: r#"whole_recent"#,
+            visible_blocker: true,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"△ Permission required"#],
+                    ),
+                    (
+                        contains: [r#"esc dismiss"#],
+                        all: [
+                            (
+                                any: [
+                                    (
+                                        contains: [r#"↑↓ select"#],
+                                    ),
+                                    (
+                                        contains: [r#"⇆ tab"#],
+                                    ),
+                                ],
+                            ),
+                        ],
+                        any: [
+                            (
+                                contains: [r#"enter confirm"#],
+                            ),
+                            (
+                                contains: [r#"enter submit"#],
+                            ),
+                            (
+                                contains: [r#"enter toggle"#],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"interrupt_hint_working"#,
+            state: Some(Working),
+            priority: 110,
+            region: r#"whole_recent"#,
+            visible_working: true,
+            gate: (
+                any: [
+                    (
+                        contains: [r#"esc to interrupt"#],
+                    ),
+                    (
+                        contains: [r#"ctrl+c to interrupt"#],
+                    ),
+                    (
+                        contains: [r#"press esc to interrupt"#],
+                    ),
+                    (
+                        line_regex: [r#"(?i).*opencode.*esc (again to )?interrupt"#],
+                    ),
+                ],
+            ),
+        ),
+(
+            id: r#"progress_bar_working"#,
+            state: Some(Working),
+            priority: 100,
+            region: r#"whole_recent"#,
+            visible_working: true,
+            gate: (
+                regex: [r#"(■|⬝){4,}"#],
+            ),
+        ),
+    ],
+)
