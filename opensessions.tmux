@@ -25,10 +25,13 @@ SCRIPT_DIR="$SCRIPTS_DIR"
 
 # TPM installs from GitHub source, so fetch the matching release binaries instead
 # of asking users to build Rust locally. Local/dev checkouts can set
-# OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1 and use target/{debug,release}.
+# OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1 or use target/{debug,release} builds.
 PACKAGE_VERSION="$(grep -o '"version": *"[^"]*"' "$CURRENT_DIR/package.json" 2>/dev/null | head -1 | cut -d'"' -f4)"
 BIN_VERSION="$(cat "$CURRENT_DIR/bin/.opensessions-version" 2>/dev/null || true)"
-if [ ! -x "$CURRENT_DIR/bin/opensessions-sidebar" ] || [ ! -x "$CURRENT_DIR/bin/opensessions-server" ] || [ ! -x "$CURRENT_DIR/bin/lazydiff" ] || [ "$BIN_VERSION" != "$PACKAGE_VERSION" ]; then
+if [ "${OPENSESSIONS_SKIP_BINARY_DOWNLOAD:-}" != "1" ] \
+  && ! { [ -x "$CURRENT_DIR/target/release/opensessions-sidebar" ] && [ -x "$CURRENT_DIR/target/release/opensessions-server" ]; } \
+  && ! { [ -x "$CURRENT_DIR/target/debug/opensessions-sidebar" ] && [ -x "$CURRENT_DIR/target/debug/opensessions-server" ]; } \
+  && { [ ! -x "$CURRENT_DIR/bin/opensessions-sidebar" ] || [ ! -x "$CURRENT_DIR/bin/opensessions-server" ] || [ ! -x "$CURRENT_DIR/bin/lazydiff" ] || [ "$BIN_VERSION" != "$PACKAGE_VERSION" ]; }; then
   sh "$SCRIPTS_DIR/install-binaries.sh" "$CURRENT_DIR" >/tmp/opensessions-install.log 2>&1 || true
 fi
 

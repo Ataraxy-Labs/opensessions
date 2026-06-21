@@ -70,13 +70,13 @@ fn tmux_sidebar_keyboard_focus_and_worktree_flow() {
     lab.wait_for_capture_pane(&worktree_source, |text| {
         row_with(text, "os-demo-worktrees").is_some_and(|row| row.trim_start().starts_with("›"))
     });
-    lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Enter"]);
+    lab.send_sidebar_key(&worktree_source, "Enter");
     lab.wait_for_capture_pane(&worktree_source, |text| {
         text.contains("▸ os-demo-worktrees")
     });
-    lab.tmux_ok(["send-keys", "-t", worktree_source.as_str(), "Enter"]);
+    lab.send_sidebar_key(&worktree_source, "Enter");
     lab.wait_for_capture_pane(&worktree_source, |text| {
-        text.contains("▾ os-demo-worktrees")
+        text.contains("▾ os-demo-worktrees") && text.contains("os-demo-preview")
     });
     let expanded_worktree = lab.capture_pane(&worktree_source);
     assert_worktree_group_columns(&expanded_worktree);
@@ -381,7 +381,7 @@ fn tmux_agent_debug_endpoint_explains_multiple_amp_panes() {
     let debug = lab.wait_for_debug_agents("opensessions", |debug| {
         debug.matches("\"mappedAgent\": \"amp\"").count() >= 2
             && debug.contains("\"parsedStatus\": \"idle\"")
-            && debug.contains("\"parsedStatus\": \"tool-running\"")
+            && debug.contains("\"parsedStatus\": \"running\"")
             && debug.contains("\"projectedCurrentPanelCount\": 2")
     });
     assert!(
@@ -392,6 +392,46 @@ fn tmux_agent_debug_endpoint_explains_multiple_amp_panes() {
 
     let sidebar = lab.sidebar_pane("opensessions");
     lab.wait_for_capture_pane(&sidebar, |text| text.contains("agents 2"));
+}
+
+#[test]
+fn tmux_agent_debug_endpoint_uses_herdr_manifest_detection_for_fake_agent_panes() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-herdr-agent-manifests");
+    lab.install_fake_agent_bins();
+
+    let panes = [
+        lab.spawn_fake_agent_pane("opensessions", "amp", "waiting"),
+        lab.spawn_fake_agent_pane("opensessions", "amp", "tools"),
+        lab.spawn_fake_agent_pane("opensessions", "claude", "claude-waiting"),
+        lab.spawn_fake_agent_window("opensessions", "codex", "codex-waiting"),
+        lab.spawn_fake_agent_window("opensessions", "opencode", "opencode-running"),
+        lab.spawn_fake_agent_window("opensessions", "pi", "pi-running"),
+        lab.spawn_fake_agent_window("opensessions", "droid", "droid-waiting"),
+    ];
+
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", panes[0].as_str()]);
+    post_refresh(lab.port);
+
+    let debug = lab.wait_for_debug_agents("opensessions", |debug| {
+        debug.contains("\"mappedAgent\": \"amp\"")
+            && debug.contains("\"mappedAgent\": \"claude-code\"")
+            && debug.contains("\"mappedAgent\": \"codex\"")
+            && debug.contains("\"mappedAgent\": \"opencode\"")
+            && debug.contains("\"mappedAgent\": \"pi\"")
+            && debug.contains("\"mappedAgent\": \"droid\"")
+            && debug.matches("\"parsedStatus\": \"waiting\"").count() >= 3
+            && debug.matches("\"parsedStatus\": \"running\"").count() >= 3
+            && debug.contains("\"projectedCurrentPanelCount\": 7")
+    });
+
+    for pane in panes {
+        assert!(
+            debug.contains(&format!("\"paneId\": \"{pane}\"")),
+            "debug endpoint must name pane {pane}; got:\n{debug}"
+        );
+    }
 }
 
 #[test]
@@ -1384,8 +1424,9 @@ time.sleep(300)
     fn install_fake_agent_bins(&self) {
         let bin = self.root.join("bin");
         fs::create_dir_all(&bin).expect("create fake agent bin dir");
-        self.write_fake_agent_script("amp");
-        self.write_fake_agent_script("claude");
+        for agent in ["amp", "claude", "codex", "opencode", "pi", "droid"] {
+            self.write_fake_agent_script(agent);
+        }
     }
 
     fn write_fake_agent_script(&self, name: &str) {
@@ -1393,10 +1434,20 @@ time.sleep(300)
         let script = format!(
             r#"#!/bin/sh
 mode="${{1:-idle}}"
-printf '\033]2;{name} - fake-%s - %s\033\\' "$mode" "$PWD"
+case "$mode" in
+  claude-running)
+    printf '\033]2;⠋ Pouncing\033\\'
+    ;;
+  codex-running)
+    printf '\033]2;⠋ Thinking\033\\'
+    ;;
+  *)
+    printf '\033]2;{name} - fake-%s - %s\033\\' "$mode" "$PWD"
+    ;;
+esac
 case "$mode" in
   tools)
-    printf '  ✓ Search fake task\n  ≈ Running tools...         Esc to cancel\n'
+    printf 'Esc to cancel\n'
     ;;
   waiting)
     printf 'Run this command?\n▸● Approve [Alt+1]\n ○ Allow All for This Session [Alt+2]\n ○ Deny with feedback [Alt+4]\nWaiting for approval...\n'
@@ -1406,6 +1457,27 @@ case "$mode" in
     ;;
   claude-waiting)
     printf 'Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\n'
+    ;;
+  codex-running)
+    printf '› Implement the feature\n'
+    ;;
+  codex-waiting)
+    printf 'Question 1/1 (1 unanswered)\nWhat should Codex do?\n› 1. Reduce complexity\n  2. Improve reliability\n\ntab to add notes | enter to submit answer | esc to interrupt\n'
+    ;;
+  opencode-running)
+    printf 'opencode: press esc to interrupt\n'
+    ;;
+  opencode-waiting)
+    printf '△ Permission required\n↑↓ select  enter confirm\n'
+    ;;
+  pi-running)
+    printf 'Working...\n'
+    ;;
+  droid-running)
+    printf '⠋ Reading files\nesc to stop\n'
+    ;;
+  droid-waiting)
+    printf 'enter to select\nesc to cancel\n↑↓ to navigate\n> yes, allow\n> no, cancel\n'
     ;;
   *)
     printf 'Hey! What would you like to work on?\n╭──────────────── deep² ─╮\n│                        │\n╰────────────────────────╯\n'
@@ -1443,6 +1515,28 @@ while :; do sleep 60; done
             "#{pane_id}",
             "-t",
             session,
+            &command,
+        ])
+    }
+
+    fn spawn_fake_agent_window(&self, session: &str, agent: &str, mode: &str) -> String {
+        let bin = self.root.join("bin");
+        let command = format!(
+            "env PATH={}:$PATH {} {}",
+            shell_quote(&bin.to_string_lossy()),
+            shell_quote(agent),
+            shell_quote(mode)
+        );
+        self.tmux([
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session,
+            "-n",
+            &format!("{agent}-{mode}"),
             &command,
         ])
     }

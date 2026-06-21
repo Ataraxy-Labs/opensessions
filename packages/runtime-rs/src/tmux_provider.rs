@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::agent_screen::detect_agent_screen_status;
+use crate::agent_screen::detect_agent_screen_status_with_osc;
 use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
 };
@@ -688,9 +688,11 @@ impl MuxProvider for TmuxProvider {
             .filter(|pane| pane.title != "opensessions-sidebar")
             .filter_map(|pane| agent_from_pane(&pane).map(|agent| (pane, agent)))
             .map(|(pane, agent)| AgentPane {
-                status: detect_agent_screen_status(
+                status: detect_agent_screen_status_with_osc(
                     &agent,
                     &self.client.capture_visible_pane_text(&pane.id),
+                    &pane.title,
+                    "",
                 ),
                 thread_name: thread_name_from_pane(&pane, &agent),
                 agent,
@@ -709,10 +711,9 @@ impl MuxProvider for TmuxProvider {
             .map(|pane| {
                 let screen = self.client.capture_visible_pane_text(&pane.id);
                 let mapping = agent_mapping_from_pane(&pane);
-                let parsed_status = mapping
-                    .agent
-                    .as_deref()
-                    .map(|agent| detect_agent_screen_status(agent, &screen));
+                let parsed_status = mapping.agent.as_deref().map(|agent| {
+                    detect_agent_screen_status_with_osc(agent, &screen, &pane.title, "")
+                });
                 let thread_name = mapping
                     .agent
                     .as_deref()
@@ -995,10 +996,12 @@ const AGENT_ALIASES: &[(&str, &[&str])] = &[
     ("codex", &["codex"]),
     ("gemini", &["gemini"]),
     ("cursor", &["cursor", "cursor-agent"]),
+    ("devin", &["devin", "devin-cli"]),
     ("antigravity", &["agy", "antigravity", "antigravity-cli"]),
     ("cline", &["cline"]),
     ("opencode", &["opencode", "open-code"]),
     ("github-copilot", &["copilot", "github-copilot", "ghcs"]),
+    ("kilo", &["kilo", "kilo-code"]),
     ("kimi", &["kimi", "kimi-code"]),
     ("kiro", &["kiro", "kiro-cli"]),
     ("droid", &["droid"]),

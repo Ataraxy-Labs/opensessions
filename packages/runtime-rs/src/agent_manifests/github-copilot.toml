@@ -1,0 +1,30 @@
+id = "copilot"
+version = "2026.06.10.1"
+min_engine_version = 1
+updated_at = "2026-06-10T00:00:00Z"
+aliases = ["github-copilot", "ghcs"]
+
+[[rules]]
+id = "selection_blocker"
+state = "blocked"
+priority = 300
+region = "whole_recent"
+visible_blocker = true
+contains = ["esc to cancel"]
+any = [
+  { contains = ["enter to select"] },
+  { contains = ["enter to confirm"] },
+  { contains = ["enter to submit"] },
+]
+
+[[rules]]
+id = "working_cancel_hint"
+state = "working"
+priority = 100
+region = "whole_recent"
+visible_working = true
+any = [
+  { contains = ["esc to cancel"] },
+  { contains = ["esc cancel"] },
+  { contains = ["esc again to cancel"] },
+]

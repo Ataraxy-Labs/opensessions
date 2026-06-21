@@ -8,5 +8,7 @@ name = "opensessions_runtime"
 path = "src/lib.rs"
 
 [dependencies]
+regex = "1"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+toml = "0.8"
