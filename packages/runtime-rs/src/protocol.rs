@@ -83,6 +83,7 @@ pub enum ServerQueryData {
     Settings {
         theme: Option<String>,
         session_filter: Option<SessionFilterMode>,
+        provider_filter: Option<String>,
         agent_panel_scope: AgentPanelScope,
     },
 }
@@ -90,6 +91,10 @@ pub enum ServerQueryData {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAgentsData {
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default = "default_provider_id")]
+    pub provider_id: String,
     pub session: String,
     pub unseen: bool,
     pub agent_state: Option<AgentEvent>,
@@ -124,6 +129,10 @@ pub struct ServerState {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionData {
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default = "default_provider_id")]
+    pub provider_id: String,
     pub name: String,
     pub created_at: u64,
     pub dir: String,
@@ -213,6 +222,10 @@ pub enum AgentLiveness {
 #[serde(rename_all = "camelCase")]
 pub struct AgentEvent {
     pub agent: String,
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default = "default_provider_id")]
+    pub provider_id: String,
     pub session: String,
     pub status: AgentStatus,
     pub ts: u64,
@@ -239,6 +252,10 @@ pub struct AgentEvent {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentPaneDiagnostic {
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default = "default_provider_id")]
+    pub provider_id: String,
     pub session: String,
     pub pane_id: String,
     pub window_id: String,
@@ -258,9 +275,21 @@ pub struct AgentPaneDiagnostic {
     pub visible_tail: Vec<String>,
 }
 
+fn default_node_id() -> String {
+    "local".to_string()
+}
+
+fn default_provider_id() -> String {
+    "tmux".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessionDiagnostic {
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default = "default_provider_id")]
+    pub provider_id: String,
     pub session: String,
     pub focused: bool,
     pub current: bool,
@@ -357,9 +386,30 @@ pub enum ClientCommand {
         key: ServerQueryKey,
     },
     SwitchSession {
+        #[serde(default = "default_node_id")]
+        node_id: String,
+        #[serde(default = "default_provider_id")]
+        provider_id: String,
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         client_tty: Option<String>,
+    },
+    RegisterSshNode {
+        node_id: String,
+        host: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        identity_file: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tmux_socket: Option<String>,
+    },
+    DeregisterSshNode {
+        node_id: String,
     },
     NewSession,
     HideSession {
@@ -398,6 +448,10 @@ pub enum ClientCommand {
     },
     SetAgentPanelScope {
         scope: AgentPanelScope,
+    },
+    SetProviderFilter {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     SetUiFocus {
         focus: ClientUiFocus,

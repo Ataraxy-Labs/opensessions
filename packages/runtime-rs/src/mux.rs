@@ -30,6 +30,8 @@ pub struct SidebarPane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPane {
     pub agent: String,
+    pub node_id: String,
+    pub provider_id: String,
     pub pane_id: String,
     pub active: bool,
     pub status: AgentStatus,
@@ -56,9 +58,17 @@ pub trait MuxProvider: Send + Sync {
         "v1"
     }
 
+    fn node_id(&self) -> &str {
+        "local"
+    }
+
     fn name(&self) -> &str;
     fn list_sessions(&self) -> Vec<MuxSessionInfo>;
     fn switch_session(&self, name: &str, client_tty: Option<&str>);
+    fn attach_session_command(&self, _name: &str) -> Option<String> {
+        None
+    }
+    fn detach_client_and_run(&self, _client_tty: Option<&str>, _command: &str) {}
     fn get_current_session(&self) -> Option<String>;
     fn get_session_dir(&self, name: &str) -> String;
     fn get_session_pane_pids(&self, _name: &str) -> Vec<u32> {
@@ -105,6 +115,10 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn get_client_focus(&self, _client_tty: Option<&str>) -> Option<ClientFocus> {
+        None
+    }
+
+    fn get_client_size(&self, _client_tty: Option<&str>) -> Option<(u32, u32)> {
         None
     }
 

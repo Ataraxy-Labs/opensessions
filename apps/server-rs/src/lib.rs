@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use convex::{ConvexClient, FunctionResult, Value as ConvexValue};
 use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
     AgentWatcherSnapshot, amp_snapshot_from_thread_json, claude_code_snapshot_from_jsonl,
@@ -19,7 +20,8 @@ use opensessions_runtime::agent_watchers::{
     pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::config::{
-    OpensessionsConfig, load_config_from_home, save_config_to_home,
+    OpensessionsConfig, SshNodeConfig, config_path_from_home, load_config_from_home,
+    save_config_to_home,
 };
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
@@ -37,13 +39,14 @@ use opensessions_runtime::protocol::{
 use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_state};
 use opensessions_runtime::session_order::SessionOrder;
 use opensessions_runtime::session_projection::{
-    SessionProjectionOptions, display_session_names, reordered_session_names,
+    SessionProjectionOptions, display_session_names, display_sessions, reordered_session_names,
     reordered_worktree_group_names,
 };
 use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
 use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput};
+use serde::Deserialize;
 use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -382,6 +385,60 @@ struct QueryJsonCache {
     results_by_key: HashMap<ServerQueryKey, CachedQueryJson>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CloudGraphCache {
+    sessions: Vec<opensessions_runtime::protocol::SessionData>,
+    ui_state: Option<CloudWorkspaceUiState>,
+    command_intents: Vec<CloudCommandIntent>,
+    handled_command_intents: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudWorkspaceUiState {
+    #[serde(default)]
+    sidebar_visible: Option<bool>,
+    #[serde(default)]
+    focused_session: Option<String>,
+    #[serde(default)]
+    provider_filter: Option<String>,
+    #[serde(default)]
+    session_filter: Option<String>,
+    #[serde(default)]
+    agent_panel_scope: Option<String>,
+    #[serde(default)]
+    visible_session_order: Vec<String>,
+    #[serde(default)]
+    hidden_sessions: Vec<String>,
+    #[serde(default)]
+    collapsed_worktree_groups: Vec<String>,
+    #[serde(default)]
+    sidebar_width: Option<u32>,
+    #[serde(default)]
+    detail_panel_height: Option<u32>,
+    #[serde(default)]
+    updated_by_node: Option<String>,
+    #[serde(default)]
+    ts: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudCommandIntent {
+    id: String,
+    action: String,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    ts: u64,
+}
+
 pub struct ReadOnlyMuxStateSource {
     providers: Vec<Arc<dyn MuxProvider>>,
     port_command_runner: Arc<dyn PortCommandRunner>,
@@ -389,6 +446,7 @@ pub struct ReadOnlyMuxStateSource {
     git_command_runner: Arc<dyn GitCommandRunner>,
     git_info_cache: Mutex<HashMap<String, CachedGitInfo>>,
     query_json_cache: Mutex<QueryJsonCache>,
+    cloud_graph_cache: Mutex<CloudGraphCache>,
     // The sidebar coordinator owns the single source of truth for the current
     // width (`SidebarCoordinator::state().width`), so there is no separate
     // mirror field to drift out of sync.
@@ -399,8 +457,10 @@ pub struct ReadOnlyMuxStateSource {
     focused_pane_by_session: Mutex<HashMap<String, String>>,
     focused_client_tty: Mutex<Option<String>>,
     ui_focus_by_client_tty: Mutex<HashMap<String, ClientUiFocus>>,
+    workspace_ui_updated_at: Mutex<u64>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
+    provider_filter: Mutex<Option<String>>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
@@ -412,9 +472,15 @@ pub struct ReadOnlyMuxStateSource {
 pub fn default_state_source_from_env(
     env: impl Fn(&str) -> Option<String>,
 ) -> Option<ReadOnlyMuxStateSource> {
-    if env("TMUX").is_some() {
-        let provider = Arc::new(TmuxProvider::new(Arc::new(StdCommandRunner::default())));
-        let mut source = ReadOnlyMuxStateSource::new(vec![provider]);
+    let has_explicit_tmux_provider = env("OPENSESSIONS_TMUX_SOCKETS")
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if env("TMUX").is_some() || has_explicit_tmux_provider {
+        let node_id = env("OPENSESSIONS_NODE_ID")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        let providers = tmux_providers_from_env(&env, &node_id);
+        let mut source = ReadOnlyMuxStateSource::new(providers);
         let config = env("HOME")
             .map(PathBuf::from)
             .map(|home| load_config_from_home(&home));
@@ -430,6 +496,54 @@ pub fn default_state_source_from_env(
     None
 }
 
+fn tmux_providers_from_env(
+    env: &impl Fn(&str) -> Option<String>,
+    node_id: &str,
+) -> Vec<Arc<dyn MuxProvider>> {
+    let Some(raw) = env("OPENSESSIONS_TMUX_SOCKETS") else {
+        return vec![Arc::new(TmuxProvider::with_identity(
+            node_id,
+            "tmux",
+            Arc::new(StdCommandRunner::default()),
+        ))];
+    };
+    let providers = raw
+        .split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            let (name, socket) = entry.split_once('=').unwrap_or((entry, entry));
+            let name = name.trim();
+            let socket = socket.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let runner: Arc<dyn opensessions_runtime::tmux_provider::CommandRunner> =
+                if socket.is_empty() {
+                    Arc::new(StdCommandRunner::default())
+                } else {
+                    Arc::new(StdCommandRunner::with_prefix_args(
+                        "tmux",
+                        vec!["-L".to_string(), socket.to_string()],
+                    ))
+                };
+            Some(Arc::new(TmuxProvider::with_identity(node_id, name, runner))
+                as Arc<dyn MuxProvider>)
+        })
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        vec![Arc::new(TmuxProvider::with_identity(
+            node_id,
+            "tmux",
+            Arc::new(StdCommandRunner::default()),
+        ))]
+    } else {
+        providers
+    }
+}
+
 impl ReadOnlyMuxStateSource {
     pub fn new(providers: Vec<Arc<dyn MuxProvider>>) -> Self {
         Self {
@@ -439,6 +553,7 @@ impl ReadOnlyMuxStateSource {
             git_command_runner: Arc::new(SystemGitCommandRunner),
             git_info_cache: Mutex::new(HashMap::new()),
             query_json_cache: Mutex::new(QueryJsonCache::default()),
+            cloud_graph_cache: Mutex::new(CloudGraphCache::default()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
             detail_panel_height: Mutex::new(DEFAULT_DETAIL_PANEL_HEIGHT),
             agent_panel_scope: Mutex::new(AgentPanelScope::Current),
@@ -446,8 +561,10 @@ impl ReadOnlyMuxStateSource {
             focused_pane_by_session: Mutex::new(HashMap::new()),
             focused_client_tty: Mutex::new(None),
             ui_focus_by_client_tty: Mutex::new(HashMap::new()),
+            workspace_ui_updated_at: Mutex::new(0),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
+            provider_filter: Mutex::new(None),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
@@ -551,6 +668,8 @@ impl ReadOnlyMuxStateSource {
                         }
                         PanePresenceInput {
                             agent: pane.agent,
+                            node_id: pane.node_id,
+                            provider_id: pane.provider_id,
                             pane_id: pane.pane_id,
                             active: pane.active,
                             status: pane.status,
@@ -608,6 +727,262 @@ impl ReadOnlyMuxStateSource {
 
     fn observe_tmux_agent_state(&self) -> bool {
         self.sync_agent_pane_presence() || self.mark_focused_agent_panes_seen()
+    }
+
+    fn local_node_ids(&self) -> HashSet<String> {
+        self.providers
+            .iter()
+            .map(|provider| provider.node_id().to_string())
+            .collect()
+    }
+
+    fn local_node_id(&self) -> String {
+        self.providers
+            .first()
+            .map(|provider| provider.node_id().to_string())
+            .unwrap_or_else(|| "local".to_string())
+    }
+
+    fn workspace_actor_id(&self) -> String {
+        std::env::var("OPENSESSIONS_SERVER_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|server_key| format!("{}:{server_key}", self.local_node_id()))
+            .unwrap_or_else(|| self.local_node_id())
+    }
+
+    fn workspace_ui_state(&self, state: &ServerState) -> CloudWorkspaceUiState {
+        let sidebar_state = self.sidebar_coordinator.lock().unwrap().state();
+        let session_order = self.session_order.lock().unwrap();
+        let hidden_sessions = session_order.hidden_sessions();
+        CloudWorkspaceUiState {
+            sidebar_visible: Some(sidebar_state.visible),
+            focused_session: self.focused_session.lock().unwrap().clone(),
+            provider_filter: self.provider_filter.lock().unwrap().clone(),
+            session_filter: self
+                .session_filter
+                .lock()
+                .unwrap()
+                .map(|filter| serde_json::to_value(filter).unwrap_or(Value::Null))
+                .and_then(|value| value.as_str().map(str::to_string)),
+            agent_panel_scope: Some(
+                serde_json::to_value(*self.agent_panel_scope.lock().unwrap())
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "current".to_string()),
+            ),
+            visible_session_order: state
+                .sessions
+                .iter()
+                .filter(|session| !hidden_sessions.contains(&session.name))
+                .map(|session| session.name.clone())
+                .collect(),
+            hidden_sessions,
+            collapsed_worktree_groups: self
+                .collapsed_worktree_groups
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect(),
+            sidebar_width: Some(sidebar_state.width),
+            detail_panel_height: Some(state.detail_panel_height),
+            updated_by_node: Some(self.workspace_actor_id()),
+            ts: *self.workspace_ui_updated_at.lock().unwrap(),
+        }
+    }
+
+    fn mark_workspace_ui_updated(&self) {
+        *self.workspace_ui_updated_at.lock().unwrap() = (self.now_ms)();
+    }
+
+    fn update_cloud_graph_sessions(
+        &self,
+        sessions: Vec<opensessions_runtime::protocol::SessionData>,
+    ) -> bool {
+        let mut cache = self.cloud_graph_cache.lock().unwrap();
+        if cache.sessions == sessions {
+            return false;
+        }
+        cache.sessions = sessions;
+        true
+    }
+
+    fn update_cloud_workspace_cache(
+        &self,
+        ui_state: Option<CloudWorkspaceUiState>,
+        command_intents: Vec<CloudCommandIntent>,
+    ) -> bool {
+        let mut cache = self.cloud_graph_cache.lock().unwrap();
+        if cache.ui_state == ui_state && cache.command_intents == command_intents {
+            return false;
+        }
+        cache.ui_state = ui_state;
+        cache.command_intents = command_intents;
+        true
+    }
+
+    fn apply_cloud_command_intents(
+        &self,
+        intents: &[CloudCommandIntent],
+    ) -> Vec<(String, &'static str, String)> {
+        let local_node_ids = self.local_node_ids();
+        let mut results = Vec::new();
+        for intent in intents {
+            if !intent
+                .node_id
+                .as_deref()
+                .is_some_and(|node_id| local_node_ids.contains(node_id))
+            {
+                continue;
+            }
+            {
+                let mut cache = self.cloud_graph_cache.lock().unwrap();
+                if !cache.handled_command_intents.insert(intent.id.clone()) {
+                    continue;
+                }
+            }
+            match intent.action.as_str() {
+                "switchSession" => {
+                    let Some(node_id) = intent.node_id.as_deref() else {
+                        results.push((intent.id.clone(), "failed", "missing nodeId".to_string()));
+                        continue;
+                    };
+                    let Some(provider_id) = intent.provider_id.as_deref() else {
+                        results.push((intent.id.clone(), "failed", "missing providerId".to_string()));
+                        continue;
+                    };
+                    let Some(session) = intent.session.as_deref() else {
+                        results.push((intent.id.clone(), "failed", "missing session".to_string()));
+                        continue;
+                    };
+                    let client_tty = intent.payload.get("clientTty").and_then(Value::as_str);
+                    let return_command = self
+                        .providers
+                        .iter()
+                        .find(|provider| provider.node_id() == node_id && provider.name() == provider_id)
+                        .and_then(|provider| provider.attach_session_command(session));
+                    terminate_managed_ssh_bridges(return_command.as_deref());
+                    self.switch_session_on_provider(node_id, provider_id, session, client_tty);
+                    results.push((intent.id.clone(), "completed", "switched".to_string()));
+                }
+                other => results.push((
+                    intent.id.clone(),
+                    "failed",
+                    format!("unsupported action {other}"),
+                )),
+            }
+        }
+        results
+    }
+
+    fn apply_cloud_ui_state(&self, ui_state: &CloudWorkspaceUiState) -> Vec<ServerQueryKey> {
+        let local_ui_revision = *self.workspace_ui_updated_at.lock().unwrap();
+        if ui_state.ts < local_ui_revision {
+            return Vec::new();
+        }
+        if ui_state.ts > local_ui_revision {
+            *self.workspace_ui_updated_at.lock().unwrap() = ui_state.ts;
+        }
+        let mut changed = Vec::new();
+        if let Some(provider_filter) = &ui_state.provider_filter
+            && self.provider_filter.lock().unwrap().as_ref() != Some(provider_filter)
+        {
+            *self.provider_filter.lock().unwrap() = Some(provider_filter.clone());
+            changed.extend([ServerQueryKey::Settings, ServerQueryKey::Sessions]);
+        } else if ui_state.provider_filter.is_none()
+            && self.provider_filter.lock().unwrap().is_some()
+        {
+            *self.provider_filter.lock().unwrap() = None;
+            changed.extend([ServerQueryKey::Settings, ServerQueryKey::Sessions]);
+        }
+        if let Some(session_filter) = &ui_state.session_filter
+            && let Ok(filter) =
+                serde_json::from_value::<SessionFilterMode>(Value::String(session_filter.clone()))
+            && *self.session_filter.lock().unwrap() != Some(filter)
+        {
+            *self.session_filter.lock().unwrap() = Some(filter);
+            changed.extend([ServerQueryKey::Settings, ServerQueryKey::Sessions]);
+        }
+        if let Some(scope) = &ui_state.agent_panel_scope
+            && let Some(scope) = parse_agent_panel_scope(scope)
+            && *self.agent_panel_scope.lock().unwrap() != scope
+        {
+            *self.agent_panel_scope.lock().unwrap() = scope;
+            changed.push(ServerQueryKey::Settings);
+        }
+        if let Some(width) = ui_state.sidebar_width {
+            let width = clamp_sidebar_width(width.min(u16::MAX as u32) as u16);
+            let width_changed = {
+                let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+                if coordinator.state().width != u32::from(width) {
+                    coordinator.set_width(u32::from(width));
+                    true
+                } else {
+                    false
+                }
+            };
+            if width_changed {
+                changed.push(ServerQueryKey::SidebarLayout);
+            }
+            for provider in &self.providers {
+                provider.set_sidebar_width_hint(width);
+            }
+            self.enforce_sidebar_width(width);
+        }
+        if let Some(height) = ui_state.detail_panel_height {
+            let height = clamp_detail_panel_height(height.min(u16::MAX as u32) as u16);
+            if *self.detail_panel_height.lock().unwrap() != height {
+                *self.detail_panel_height.lock().unwrap() = height;
+                changed.push(ServerQueryKey::SidebarLayout);
+            }
+        }
+        {
+            let mut collapsed = self.collapsed_worktree_groups.lock().unwrap();
+            let incoming = ui_state
+                .collapsed_worktree_groups
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
+            if *collapsed != incoming {
+                *collapsed = incoming;
+                changed.push(ServerQueryKey::SidebarLayout);
+                changed.push(ServerQueryKey::Sessions);
+            }
+        }
+        if !ui_state.visible_session_order.is_empty() {
+            self.session_order
+                .lock()
+                .unwrap()
+                .set_visible_order(ui_state.visible_session_order.clone());
+            changed.push(ServerQueryKey::Sessions);
+        }
+        {
+            let mut order = self.session_order.lock().unwrap();
+            if order.hidden_sessions() != ui_state.hidden_sessions {
+                order.set_hidden(ui_state.hidden_sessions.clone());
+                changed.push(ServerQueryKey::Sessions);
+            }
+        }
+        if let Some(focused) = &ui_state.focused_session
+            && self.focused_session.lock().unwrap().as_ref() != Some(focused)
+        {
+            *self.focused_session.lock().unwrap() = Some(focused.clone());
+            changed.push(ServerQueryKey::Focus);
+        }
+        if let Some(visible) = ui_state.sidebar_visible {
+            let mut coordinator = self.sidebar_coordinator.lock().unwrap();
+            if visible && !coordinator.state().visible {
+                coordinator.mark_ready();
+                changed.push(ServerQueryKey::SidebarLayout);
+                drop(coordinator);
+                let _ = self.ensure_sidebar("");
+            } else if !visible && coordinator.state().visible {
+                coordinator.hide();
+                changed.push(ServerQueryKey::SidebarLayout);
+            }
+        }
+        changed
     }
 
     fn remember_focused_pane(&self, context: &HttpContext) -> FocusObservation {
@@ -698,7 +1073,7 @@ impl ReadOnlyMuxStateSource {
             "snapshot_state mode={} init={} width={}",
             sidebar_state.mode, sidebar_state.initializing, sidebar_state.width,
         ));
-        build_read_only_state(ReadOnlyStateInput {
+        let mut state = build_read_only_state(ReadOnlyStateInput {
             providers,
             visible_session_names,
             metadata_by_session,
@@ -726,7 +1101,12 @@ impl ReadOnlyMuxStateSource {
             initializing: sidebar_state.initializing,
             init_label: (!sidebar_state.init_label.is_empty()).then_some(sidebar_state.init_label),
             now_ms: (self.now_ms)(),
-        })
+        });
+        state
+            .sessions
+            .extend(self.cloud_graph_cache.lock().unwrap().sessions.clone());
+        apply_global_session_order(&mut state.sessions, &self.session_order.lock().unwrap());
+        state
     }
 
     fn query_result_json_for_key(&self, key: ServerQueryKey) -> String {
@@ -764,9 +1144,7 @@ impl ReadOnlyMuxStateSource {
             ServerQueryKey::Sessions => {
                 query_result_json_from_state(key, self.snapshot_state(), ts)
             }
-            ServerQueryKey::Agents => {
-                query_result_json_from_data(key, self.agents_query_data(), ts)
-            }
+            ServerQueryKey::Agents => query_result_json_from_state(key, self.snapshot_state(), ts),
             ServerQueryKey::Focus => query_result_json_from_data(
                 key,
                 ServerQueryData::Focus {
@@ -804,6 +1182,7 @@ impl ReadOnlyMuxStateSource {
                 ServerQueryData::Settings {
                     theme: self.theme.lock().unwrap().clone(),
                     session_filter: *self.session_filter.lock().unwrap(),
+                    provider_filter: self.provider_filter.lock().unwrap().clone(),
                     agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
                 },
                 ts,
@@ -815,23 +1194,6 @@ impl ReadOnlyMuxStateSource {
         let mut cache = self.query_json_cache.lock().unwrap();
         cache.generation = cache.generation.wrapping_add(1);
         cache.results_by_key.clear();
-    }
-
-    fn agents_query_data(&self) -> ServerQueryData {
-        let session_names = self.sorted_session_names();
-        let tracker = self.agent_tracker.lock().unwrap();
-        ServerQueryData::Agents {
-            sessions: session_names
-                .into_iter()
-                .map(|session| SessionAgentsData {
-                    unseen: tracker.is_unseen(&session),
-                    agent_state: tracker.get_state(&session),
-                    agents: tracker.get_agents(&session),
-                    event_timestamps: tracker.get_event_timestamps(&session),
-                    session,
-                })
-                .collect(),
-        }
     }
 
     fn debug_agent_diagnostics_json(&self, only_session: Option<&str>) -> String {
@@ -859,6 +1221,8 @@ impl ReadOnlyMuxStateSource {
                     .map(|_| tracker_agents.len())
                     .unwrap_or(0);
                 AgentSessionDiagnostic {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     focused: focused_session.as_deref() == Some(session.as_str()),
                     current: current_session.as_deref() == Some(session.as_str()),
                     tracker_agent_state: tracker.get_state(&session),
@@ -960,12 +1324,30 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "switch-session" => {
                 let name = command.get("name")?.as_str()?;
+                let node_id = command
+                    .get("nodeId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("local");
+                let provider_id = command
+                    .get("providerId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tmux");
                 let client_tty = command
                     .get("clientTty")
                     .and_then(Value::as_str)
                     .or_else(|| context.and_then(|context| context.client_tty.as_deref()));
-                provider.switch_session(name, client_tty);
+                self.switch_session_on_provider(node_id, provider_id, name, client_tty);
                 None
+            }
+            "register-ssh-node" => {
+                let node = ssh_node_config_from_value(command)?;
+                persist_ssh_node(&node).ok()?;
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
+            }
+            "deregister-ssh-node" => {
+                let node_id = command.get("nodeId")?.as_str()?;
+                remove_ssh_node(node_id).ok()?;
+                Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
             }
             "switch-index" => {
                 let index = command.get("index")?.as_u64()?.min(u32::MAX as u64) as u32;
@@ -987,10 +1369,12 @@ impl StateSource for ReadOnlyMuxStateSource {
             "hide-session" => {
                 let name = command.get("name")?.as_str()?;
                 self.session_order.lock().unwrap().hide(name);
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_all_queries_json())
             }
             "show-all-sessions" => {
                 self.session_order.lock().unwrap().show_all();
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_all_queries_json())
             }
             "reorder-session" => {
@@ -998,6 +1382,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let delta = command.get("delta")?.as_i64()? as i8;
                 if let Some(names) = self.sidebar_reordered_session_names(name, delta) {
                     self.session_order.lock().unwrap().set_visible_order(names);
+                    self.mark_workspace_ui_updated();
                 }
                 Some(self.invalidate_all_queries_json())
             }
@@ -1006,6 +1391,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let delta = command.get("delta")?.as_i64()? as i8;
                 if let Some(names) = self.sidebar_reordered_worktree_group_names(key, delta) {
                     self.session_order.lock().unwrap().set_visible_order(names);
+                    self.mark_workspace_ui_updated();
                 }
                 Some(self.invalidate_all_queries_json())
             }
@@ -1026,6 +1412,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     provider.set_sidebar_width_hint(width);
                 }
                 self.enforce_sidebar_width(width);
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "set-detail-panel-height" => {
@@ -1033,12 +1420,27 @@ impl StateSource for ReadOnlyMuxStateSource {
                 let height = clamp_detail_panel_height(height);
                 *self.detail_panel_height.lock().unwrap() = height;
                 self.persist_detail_panel_height(height);
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "set-agent-panel-scope" => {
                 let scope = parse_agent_panel_scope(command.get("scope")?.as_str()?)?;
                 *self.agent_panel_scope.lock().unwrap() = scope;
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
+            }
+            "set-provider-filter" => {
+                let provider = command
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .filter(|provider| !provider.is_empty())
+                    .map(str::to_string);
+                *self.provider_filter.lock().unwrap() = provider;
+                self.mark_workspace_ui_updated();
+                Some(self.invalidate_queries_json(vec![
+                    ServerQueryKey::Sessions,
+                    ServerQueryKey::Settings,
+                ]))
             }
             "set-ui-focus" => {
                 let client_tty = context
@@ -1070,6 +1472,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     _ => return None,
                 };
                 *self.session_filter.lock().unwrap() = Some(filter);
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
             }
             "toggle-worktree-group" => {
@@ -1079,6 +1482,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     collapsed.remove(command.get("key")?.as_str()?);
                 }
                 drop(collapsed);
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "focus-agent-pane" => {
@@ -1192,6 +1596,16 @@ impl StateSource for ReadOnlyMuxStateSource {
 
     fn handle_http_json(&self, path: &str, body: &Value) -> Option<String> {
         match path {
+            "/api/ssh-nodes/register" => {
+                let node = ssh_node_config_from_value(body)?;
+                persist_ssh_node(&node).ok()?;
+                return Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]));
+            }
+            "/api/ssh-nodes/deregister" => {
+                let node_id = body.get("nodeId")?.as_str()?;
+                remove_ssh_node(node_id).ok()?;
+                return Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]));
+            }
             "/set-status" => {
                 let session = body.get("session")?.as_str()?;
                 let tone = body
@@ -1312,6 +1726,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         match path {
             "/toggle" => {
                 self.toggle_sidebar(body);
+                self.mark_workspace_ui_updated();
                 Some(self.invalidate_queries_json(vec![ServerQueryKey::SidebarLayout]))
             }
             "/ensure-sidebar" => {
@@ -1396,6 +1811,8 @@ impl ReadOnlyMuxStateSource {
         let event_session = session.clone();
         self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
             agent,
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             session,
             status,
             ts,
@@ -1486,6 +1903,8 @@ impl ReadOnlyMuxStateSource {
         ));
         let event = AgentEvent {
             agent: snapshot.agent.to_string(),
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             session: session.clone(),
             status: snapshot.status,
             ts: snapshot.ts,
@@ -1870,13 +2289,92 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
-        let provider = self.providers.first()?;
         let target_index = index.checked_sub(1).map(|index| index as usize)?;
-        let name = self
-            .sidebar_display_session_names()
-            .and_then(|names| names.get(target_index).cloned())?;
-        provider.switch_session(&name, client_tty);
+        let state = self.snapshot_state();
+        let collapsed_groups = collapsed_worktree_group_set(&state);
+        let provider_filter = self.provider_filter.lock().unwrap().clone();
+        let session = display_sessions(
+            &state.sessions,
+            session_projection_options(&state, &collapsed_groups, provider_filter.as_deref()),
+        )
+        .get(target_index)
+        .copied()?;
+        self.switch_session_on_provider(
+            &session.node_id,
+            &session.provider_id,
+            &session.name,
+            client_tty,
+        );
         None
+    }
+
+    fn switch_session_on_provider(
+        &self,
+        node_id: &str,
+        provider_id: &str,
+        name: &str,
+        client_tty: Option<&str>,
+    ) {
+        let source_provider = client_tty
+            .and_then(|tty| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.get_client_focus(Some(tty)).is_some())
+            })
+            .or_else(|| self.providers.first());
+        let Some(source_provider) = source_provider else {
+            return;
+        };
+        let resolved_client_tty = client_tty
+            .filter(|tty| !tty.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.focused_client_tty.lock().unwrap().clone())
+            .or_else(|| {
+                source_provider
+                    .get_client_focus(None)
+                    .and_then(|focus| focus.client_tty)
+            });
+        let client_tty = resolved_client_tty.as_deref();
+        let Some(target_provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.node_id() == node_id && provider.name() == provider_id)
+        else {
+            let enqueued = enqueue_switch_intent_if_configured(
+                &self.workspace_actor_id(),
+                node_id,
+                provider_id,
+                name,
+                client_tty,
+                (self.now_ms)(),
+            );
+            let client_size = source_provider.get_client_size(client_tty);
+            if let Some(command) = registered_ssh_attach_command(node_id, provider_id, name, client_size) {
+                let wrapped = opensessions_managed_ssh_attach_command(node_id, &command, client_size);
+                source_provider.detach_client_and_run(client_tty, &wrapped);
+                return;
+            }
+            if enqueued {
+                return;
+            }
+            debug_log(format!(
+                "switch-session ignored unavailable provider node={node_id} provider={provider_id} session={name}",
+            ));
+            return;
+        };
+        if source_provider.node_id() == target_provider.node_id()
+            && source_provider.name() == target_provider.name()
+        {
+            target_provider.switch_session(name, client_tty);
+            return;
+        }
+        let Some(command) = target_provider.attach_session_command(name) else {
+            debug_log(format!(
+                "switch-session target provider cannot build attach command node={node_id} provider={provider_id} session={name}",
+            ));
+            return;
+        };
+        source_provider.detach_client_and_run(client_tty, &command);
     }
 
     fn session_before(&self, name: &str) -> Option<String> {
@@ -1896,18 +2394,20 @@ impl ReadOnlyMuxStateSource {
     fn sidebar_display_session_names(&self) -> Option<Vec<String>> {
         let state = self.snapshot_state();
         let collapsed_groups = collapsed_worktree_group_set(&state);
+        let provider_filter = self.provider_filter.lock().unwrap().clone();
         Some(display_session_names(
             &state.sessions,
-            session_projection_options(&state, &collapsed_groups),
+            session_projection_options(&state, &collapsed_groups, provider_filter.as_deref()),
         ))
     }
 
     fn sidebar_reordered_session_names(&self, name: &str, delta: i8) -> Option<Vec<String>> {
         let state = self.snapshot_state();
         let collapsed_groups = collapsed_worktree_group_set(&state);
+        let provider_filter = self.provider_filter.lock().unwrap().clone();
         reordered_session_names(
             &state.sessions,
-            session_projection_options(&state, &collapsed_groups),
+            session_projection_options(&state, &collapsed_groups, provider_filter.as_deref()),
             name,
             delta,
         )
@@ -1916,9 +2416,10 @@ impl ReadOnlyMuxStateSource {
     fn sidebar_reordered_worktree_group_names(&self, key: &str, delta: i8) -> Option<Vec<String>> {
         let state = self.snapshot_state();
         let collapsed_groups = collapsed_worktree_group_set(&state);
+        let provider_filter = self.provider_filter.lock().unwrap().clone();
         reordered_worktree_group_names(
             &state.sessions,
-            session_projection_options(&state, &collapsed_groups),
+            session_projection_options(&state, &collapsed_groups, provider_filter.as_deref()),
             key,
             delta,
         )
@@ -1927,7 +2428,6 @@ impl ReadOnlyMuxStateSource {
     fn visible_session_names(&self) -> Option<Vec<String>> {
         let names = self.sorted_session_names();
         let mut session_order = self.session_order.lock().unwrap();
-        session_order.sync(names.clone());
         if let Some(current_session) = self
             .providers
             .iter()
@@ -2014,15 +2514,18 @@ async fn run_tmux_state_poll_loop(
                 // panes, widths, init state, focus) flips the hash and the
                 // sidebar refetches its active typed queries.
                 let agent_observation_changed = source.observe_tmux_agent_state();
+                publish_opensessions_snapshot_if_configured(&source, &source.snapshot_state()).await;
+                let cloud_changed_keys = sync_opensessions_graph_if_configured(&source).await;
                 let next_state = source.snapshot_state();
                 let next_hashes = query_hashes_from_state(&next_state);
-                let mut changed_keys = [ServerQueryKey::Focus, ServerQueryKey::SidebarLayout]
+                let mut changed_keys = [ServerQueryKey::Sessions, ServerQueryKey::Focus, ServerQueryKey::SidebarLayout]
                     .into_iter()
                     .filter(|key| last_hashes.get(key) != next_hashes.get(key))
                     .collect::<Vec<_>>();
                 if agent_observation_changed {
                     changed_keys.push(ServerQueryKey::Agents);
                 }
+                changed_keys.extend(cloud_changed_keys);
                 if !changed_keys.is_empty() {
                     let mut deduped_keys = Vec::new();
                     for key in changed_keys {
@@ -2040,6 +2543,538 @@ async fn run_tmux_state_poll_loop(
             }
         }
     }
+}
+
+async fn publish_opensessions_snapshot_if_configured(
+    source: &ReadOnlyMuxStateSource,
+    state: &ServerState,
+) {
+    let Some(base_url) = std::env::var("OPENSESSIONS_CLOUD_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(api_key) = std::env::var("OPENSESSIONS_CLOUD_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let node_id = source
+        .providers
+        .first()
+        .map(|provider| provider.node_id().to_string())
+        .unwrap_or_else(|| "local".to_string());
+    let providers = source
+        .providers
+        .iter()
+        .map(|provider| {
+            serde_json::json!({
+                "providerId": provider.name(),
+                "kind": provider.name(),
+                "health": "connected",
+            })
+        })
+        .collect::<Vec<_>>();
+    let windows = source
+        .providers
+        .iter()
+        .flat_map(|provider| {
+            provider.list_active_windows().into_iter().map(|window| {
+                serde_json::json!({
+                    "nodeId": provider.node_id(),
+                    "providerId": provider.name(),
+                    "id": window.id,
+                    "sessionName": window.session_name,
+                    "active": window.active,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let panes = source
+        .providers
+        .iter()
+        .flat_map(|provider| {
+            let sidebar_panes = provider.list_sidebar_panes(None).into_iter().map(|pane| {
+                serde_json::json!({
+                    "kind": "sidebar",
+                    "nodeId": provider.node_id(),
+                    "providerId": provider.name(),
+                    "paneId": pane.pane_id,
+                    "sessionName": pane.session_name,
+                    "windowId": pane.window_id,
+                    "width": pane.width,
+                    "windowWidth": pane.window_width,
+                })
+            });
+            let agent_panes = state
+                .sessions
+                .iter()
+                .filter_map(move |session| {
+                    (session.node_id == provider.node_id()
+                        && session.provider_id == provider.name())
+                    .then_some(session.name.clone())
+                })
+                .flat_map(move |session_name| {
+                    provider
+                        .list_agent_panes(&session_name)
+                        .into_iter()
+                        .map(move |pane| {
+                            serde_json::json!({
+                                "kind": "agent",
+                                "nodeId": pane.node_id,
+                                "providerId": pane.provider_id,
+                                "paneId": pane.pane_id,
+                                "sessionName": session_name,
+                                "agent": pane.agent,
+                                "active": pane.active,
+                                "status": pane.status.to_string(),
+                                "threadId": pane.thread_id,
+                                "threadName": pane.thread_name,
+                            })
+                        })
+                });
+            sidebar_panes.chain(agent_panes).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let local_node_ids = source.local_node_ids();
+    let local_sessions = state
+        .sessions
+        .iter()
+        .filter(|session| local_node_ids.contains(&session.node_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let snapshot = serde_json::json!({
+        "nodeId": node_id,
+        "providers": providers,
+        "windows": windows,
+        "panes": panes,
+        "sessions": local_sessions,
+        "agents": local_sessions.iter().flat_map(|session| session.agents.clone()).collect::<Vec<_>>(),
+        "health": "connected",
+        "liveness": "alive",
+        "uiState": source.workspace_ui_state(state),
+        "commandIntents": [],
+        "ts": state.ts,
+    });
+    if let Err(err) = post_opensessions_snapshot(&base_url, &api_key, &snapshot).await {
+        debug_log(format!("opensessions-cloud publish failed: {err}"));
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpensessionsGraphSnapshot {
+    nodes: Vec<OpensessionsNodeSnapshot>,
+    #[serde(default)]
+    ui_state: Option<CloudWorkspaceUiState>,
+    #[serde(default)]
+    command_intents: Vec<CloudCommandIntent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpensessionsNodeSnapshot {
+    node_id: String,
+    #[serde(default)]
+    sessions: Vec<opensessions_runtime::protocol::SessionData>,
+}
+
+async fn sync_opensessions_graph_if_configured(
+    source: &ReadOnlyMuxStateSource,
+) -> Vec<ServerQueryKey> {
+    let Some(base_url) = std::env::var("OPENSESSIONS_CLOUD_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Some(api_key) = std::env::var("OPENSESSIONS_CLOUD_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let local_node_ids = source.local_node_ids();
+    let graph = match get_opensessions_graph(&base_url, &api_key).await {
+        Ok(graph) => graph,
+        Err(err) => {
+            debug_log(format!("opensessions-cloud graph fetch failed: {err}"));
+            return Vec::new();
+        }
+    };
+    let ui_state = graph.ui_state.clone();
+    let command_intents = graph.command_intents.clone();
+    let mut sessions = graph
+        .nodes
+        .into_iter()
+        .filter(|node| !local_node_ids.contains(&node.node_id))
+        .flat_map(|node| node.sessions)
+        .collect::<Vec<_>>();
+    sessions.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+            .then_with(|| a.provider_id.cmp(&b.provider_id))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut changed_keys = Vec::new();
+    if source.update_cloud_graph_sessions(sessions) {
+        changed_keys.extend([ServerQueryKey::Sessions, ServerQueryKey::Agents]);
+    }
+    if source.update_cloud_workspace_cache(ui_state.clone(), command_intents) {
+        changed_keys.extend([ServerQueryKey::Settings]);
+    }
+    for (intent_id, status, result) in source.apply_cloud_command_intents(&graph.command_intents) {
+        if let Err(err) = complete_command_intent(&base_url, &api_key, &intent_id, status, Some(&result)).await {
+            debug_log(format!(
+                "opensessions-cloud complete intent failed id={intent_id}: {err}"
+            ));
+        }
+    }
+    if let Some(ui_state) = &ui_state {
+        changed_keys.extend(source.apply_cloud_ui_state(ui_state));
+    }
+    changed_keys
+}
+
+async fn get_opensessions_graph(
+    base_url: &str,
+    api_key: &str,
+) -> Result<OpensessionsGraphSnapshot, String> {
+    if let Some(convex_url) = convex_url_from_cloud_url(base_url) {
+        return get_opensessions_graph_from_convex(convex_url, api_key).await;
+    }
+    let body = get_json_from_sem_cloud(base_url, api_key, "/v1/opensessions/graph").await?;
+    serde_json::from_slice(&body).map_err(|err| err.to_string())
+}
+
+async fn post_opensessions_snapshot(
+    base_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(convex_url) = convex_url_from_cloud_url(base_url) {
+        return post_opensessions_snapshot_to_convex(convex_url, api_key, body).await;
+    }
+    post_json_to_sem_cloud(base_url, api_key, body).await
+}
+
+async fn post_command_intent(
+    base_url: &str,
+    api_key: &str,
+    intent: &serde_json::Value,
+) -> Result<(), String> {
+    if let Some(convex_url) = convex_url_from_cloud_url(base_url) {
+        return post_command_intent_to_convex(convex_url, api_key, intent).await;
+    }
+    post_json_to_sem_cloud_path(base_url, api_key, "/v1/opensessions/command-intent", intent).await
+}
+
+async fn complete_command_intent(
+    base_url: &str,
+    api_key: &str,
+    intent_id: &str,
+    status: &str,
+    result: Option<&str>,
+) -> Result<(), String> {
+    if let Some(convex_url) = convex_url_from_cloud_url(base_url) {
+        return complete_command_intent_to_convex(convex_url, api_key, intent_id, status, result)
+            .await;
+    }
+    post_json_to_sem_cloud_path(
+        base_url,
+        api_key,
+        "/v1/opensessions/command-intent/complete",
+        &serde_json::json!({
+            "intentId": intent_id,
+            "status": status,
+            "result": result,
+        }),
+    )
+    .await
+}
+
+fn convex_url_from_cloud_url(base_url: &str) -> Option<&str> {
+    base_url
+        .strip_prefix("convex:")
+        .or_else(|| base_url.strip_prefix("convex+"))
+}
+
+async fn post_opensessions_snapshot_to_convex(
+    deployment_url: &str,
+    api_key: &str,
+    snapshot: &serde_json::Value,
+) -> Result<(), String> {
+    let mut client = ConvexClient::new(deployment_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    let snapshot = ConvexValue::try_from(snapshot.clone()).map_err(|err| err.to_string())?;
+    let result = client
+        .mutation(
+            "opensessions:publishSnapshot",
+            BTreeMap::from([
+                ("apiKey".to_string(), api_key.to_string().into()),
+                ("snapshot".to_string(), snapshot),
+            ]),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    match result {
+        FunctionResult::Value(_) => Ok(()),
+        FunctionResult::ErrorMessage(message) => Err(message),
+        FunctionResult::ConvexError(err) => Err(format!("{err:?}")),
+    }
+}
+
+async fn post_command_intent_to_convex(
+    deployment_url: &str,
+    api_key: &str,
+    intent: &serde_json::Value,
+) -> Result<(), String> {
+    let mut client = ConvexClient::new(deployment_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    let intent = ConvexValue::try_from(intent.clone()).map_err(|err| err.to_string())?;
+    let result = client
+        .mutation(
+            "opensessions:enqueueCommandIntent",
+            BTreeMap::from([
+                ("apiKey".to_string(), api_key.to_string().into()),
+                ("intent".to_string(), intent),
+            ]),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    match result {
+        FunctionResult::Value(_) => Ok(()),
+        FunctionResult::ErrorMessage(message) => Err(message),
+        FunctionResult::ConvexError(err) => Err(format!("{err:?}")),
+    }
+}
+
+async fn complete_command_intent_to_convex(
+    deployment_url: &str,
+    api_key: &str,
+    intent_id: &str,
+    status: &str,
+    result_message: Option<&str>,
+) -> Result<(), String> {
+    let mut client = ConvexClient::new(deployment_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut args = BTreeMap::from([
+        ("apiKey".to_string(), api_key.to_string().into()),
+        ("intentId".to_string(), intent_id.to_string().into()),
+        ("status".to_string(), status.to_string().into()),
+    ]);
+    if let Some(result_message) = result_message {
+        args.insert("result".to_string(), result_message.to_string().into());
+    }
+    let result = client
+        .mutation("opensessions:completeCommandIntent", args)
+        .await
+        .map_err(|err| err.to_string())?;
+    match result {
+        FunctionResult::Value(_) => Ok(()),
+        FunctionResult::ErrorMessage(message) => Err(message),
+        FunctionResult::ConvexError(err) => Err(format!("{err:?}")),
+    }
+}
+
+async fn get_opensessions_graph_from_convex(
+    deployment_url: &str,
+    api_key: &str,
+) -> Result<OpensessionsGraphSnapshot, String> {
+    let mut client = ConvexClient::new(deployment_url)
+        .await
+        .map_err(|err| err.to_string())?;
+    let result = client
+        .query(
+            "opensessions:getGraph",
+            BTreeMap::from([("apiKey".to_string(), api_key.to_string().into())]),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    match result {
+        FunctionResult::Value(value) => {
+            let mut json = value.export();
+            normalize_integral_json_numbers(&mut json);
+            serde_json::from_value(json).map_err(|err| err.to_string())
+        }
+        FunctionResult::ErrorMessage(message) => Err(message),
+        FunctionResult::ConvexError(err) => Err(format!("{err:?}")),
+    }
+}
+
+fn normalize_integral_json_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_integral_json_numbers(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                normalize_integral_json_numbers(value);
+            }
+        }
+        serde_json::Value::Number(number) => {
+            let Some(float) = number.as_f64() else {
+                return;
+            };
+            if !float.is_finite() || float.fract() != 0.0 {
+                return;
+            }
+            if float >= 0.0 && float <= u64::MAX as f64 {
+                *value = serde_json::Value::Number(serde_json::Number::from(float as u64));
+            } else if float >= i64::MIN as f64 && float <= i64::MAX as f64 {
+                *value = serde_json::Value::Number(serde_json::Number::from(float as i64));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_global_session_order(
+    sessions: &mut Vec<opensessions_runtime::protocol::SessionData>,
+    session_order: &SessionOrder,
+) {
+    let hidden = session_order.hidden_sessions();
+    sessions.retain(|session| !hidden.contains(&session.name));
+    let visible_order = session_order.visible_order();
+    sessions.sort_by(|a, b| {
+        let a_position = visible_order
+            .iter()
+            .position(|name| name == &a.name)
+            .unwrap_or(usize::MAX);
+        let b_position = visible_order
+            .iter()
+            .position(|name| name == &b.name)
+            .unwrap_or(usize::MAX);
+        a_position
+            .cmp(&b_position)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+            .then_with(|| a.provider_id.cmp(&b.provider_id))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+async fn post_json_to_sem_cloud(
+    base_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    post_json_to_sem_cloud_path(base_url, api_key, "/v1/opensessions/snapshot", body).await
+}
+
+async fn post_json_to_sem_cloud_path(
+    base_url: &str,
+    api_key: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<(), String> {
+    let target = http_target(base_url, path)?;
+    let mut stream = TcpStream::connect((target.host.as_str(), target.port))
+        .await
+        .map_err(|err| err.to_string())?;
+    let body = serde_json::to_string(body).map_err(|err| err.to_string())?;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        target.path,
+        target.host,
+        api_key,
+        body.len(),
+        body,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|err| err.to_string())?;
+    let response = String::from_utf8_lossy(&response);
+    if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {
+        Ok(())
+    } else {
+        Err(response
+            .lines()
+            .next()
+            .unwrap_or("empty response")
+            .to_string())
+    }
+}
+
+async fn get_json_from_sem_cloud(
+    base_url: &str,
+    api_key: &str,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let target = http_target(base_url, path)?;
+    let mut stream = TcpStream::connect((target.host.as_str(), target.port))
+        .await
+        .map_err(|err| err.to_string())?;
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        target.path, target.host, api_key,
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|err| err.to_string())?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .ok_or_else(|| "malformed http response".to_string())?;
+    let status_line = String::from_utf8_lossy(&response[..header_end])
+        .lines()
+        .next()
+        .unwrap_or("empty response")
+        .to_string();
+    if status_line.starts_with("HTTP/1.1 2") || status_line.starts_with("HTTP/1.0 2") {
+        Ok(response[header_end..].to_vec())
+    } else {
+        Err(status_line)
+    }
+}
+
+struct HttpTarget {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn http_target(base_url: &str, path: &str) -> Result<HttpTarget, String> {
+    let rest = base_url
+        .strip_prefix("http://")
+        .ok_or_else(|| "only http:// OPENSESSIONS_CLOUD_URL is supported".to_string())?;
+    let (authority, base_path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            port.parse::<u16>()
+                .map(|port| (host.to_string(), port))
+                .map_err(|err| err.to_string())
+        })
+        .unwrap_or_else(|| Ok((authority.to_string(), 80)))?;
+    let base_path = base_path.trim_end_matches('/');
+    let path = if base_path.is_empty() {
+        path.to_string()
+    } else {
+        format!("/{base_path}{path}")
+    };
+    Ok(HttpTarget { host, port, path })
 }
 
 fn query_hashes_from_state(state: &ServerState) -> HashMap<ServerQueryKey, u64> {
@@ -2578,6 +3613,8 @@ fn query_data_from_state(key: ServerQueryKey, state: ServerState) -> ServerQuery
                 .sessions
                 .into_iter()
                 .map(|session| SessionAgentsData {
+                    node_id: session.node_id,
+                    provider_id: session.provider_id,
                     session: session.name,
                     unseen: session.unseen,
                     agent_state: session.agent_state,
@@ -2600,6 +3637,7 @@ fn query_data_from_state(key: ServerQueryKey, state: ServerState) -> ServerQuery
         ServerQueryKey::Settings => ServerQueryData::Settings {
             theme: state.theme,
             session_filter: state.session_filter,
+            provider_filter: None,
             agent_panel_scope: state.agent_panel_scope,
         },
     }
@@ -3280,10 +4318,12 @@ fn collapsed_worktree_group_set(state: &ServerState) -> HashSet<String> {
 fn session_projection_options<'a>(
     state: &ServerState,
     collapsed_groups: &'a HashSet<String>,
+    provider_filter: Option<&'a str>,
 ) -> SessionProjectionOptions<'a> {
     SessionProjectionOptions {
         filter: state.session_filter.unwrap_or_default(),
         collapsed_groups,
+        provider_filter,
     }
 }
 
@@ -3459,6 +4499,289 @@ fn switch_session_target(command: &Value) -> Option<String> {
         .then(|| command.get("name")?.as_str().map(str::to_string))?
 }
 
+fn ssh_node_config_from_value(value: &Value) -> Option<SshNodeConfig> {
+    let node_id = value.get("nodeId")?.as_str()?.trim().to_string();
+    let host = value.get("host")?.as_str()?.trim().to_string();
+    if node_id.is_empty() || host.is_empty() {
+        return None;
+    }
+    Some(SshNodeConfig {
+        node_id,
+        host,
+        user: value
+            .get("user")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        identity_file: value
+            .get("identityFile")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        port: value
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok()),
+        provider_id: value
+            .get("providerId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        tmux_socket: value
+            .get("tmuxSocket")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn persist_ssh_node(node: &SshNodeConfig) -> std::io::Result<()> {
+    update_ssh_nodes_config(|nodes| {
+        nodes.retain(|candidate| candidate.node_id != node.node_id);
+        nodes.push(node.clone());
+    })
+}
+
+fn remove_ssh_node(node_id: &str) -> std::io::Result<()> {
+    update_ssh_nodes_config(|nodes| nodes.retain(|candidate| candidate.node_id != node_id))
+}
+
+fn update_ssh_nodes_config(update: impl FnOnce(&mut Vec<SshNodeConfig>)) -> std::io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is unset"))?;
+    let path = config_path_from_home(&home);
+    let mut config = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| serde_json::from_value::<OpensessionsConfig>(value).ok())
+        .unwrap_or_default();
+    update(&mut config.ssh_nodes);
+    config.ssh_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&config).map_err(std::io::Error::other)?
+        ),
+    )
+}
+
+fn registered_ssh_attach_command(
+    node_id: &str,
+    provider_id: &str,
+    session_name: &str,
+    client_size: Option<(u32, u32)>,
+) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let config = load_config_from_home(&home);
+    let node = config.ssh_nodes.into_iter().find(|node| node.node_id == node_id)?;
+    let configured_provider = node.provider_id.as_deref().unwrap_or("default");
+    if configured_provider != provider_id && provider_id != "default" {
+        return None;
+    }
+    Some(ssh_attach_command(&node, session_name, client_size))
+}
+
+fn ssh_attach_command(
+    node: &SshNodeConfig,
+    session_name: &str,
+    client_size: Option<(u32, u32)>,
+) -> String {
+    let mut words = vec!["ssh".to_string()];
+    if let Some(identity_file) = &node.identity_file {
+        words.extend(["-i".to_string(), shell_quote(identity_file)]);
+    }
+    if let Some(port) = node.port {
+        words.extend(["-p".to_string(), port.to_string()]);
+    }
+    words.push("-tt".to_string());
+    let destination = match &node.user {
+        Some(user) => format!("{user}@{}", node.host),
+        None => node.host.clone(),
+    };
+    words.push(shell_quote(&destination));
+    let mut tmux = vec!["tmux".to_string()];
+    if let Some(socket) = &node.tmux_socket {
+        tmux.extend(["-L".to_string(), shell_quote(socket)]);
+    }
+    tmux.extend([
+        "attach-session".to_string(),
+        "-t".to_string(),
+        shell_quote(session_name),
+    ]);
+    let (cols, rows) = client_size.unwrap_or((80, 24));
+    let remote_command = format!(
+        "stty cols {cols} rows {rows} 2>/dev/null; TERM=xterm-256color exec {}",
+        tmux.join(" "),
+    );
+    words.push(shell_quote(&remote_command));
+    words.join(" ")
+}
+
+fn opensessions_managed_ssh_attach_command(
+    node_id: &str,
+    attach_command: &str,
+    client_size: Option<(u32, u32)>,
+) -> String {
+    if let Some(bridge) = opensessions_bridge_command_path() {
+        let mut words = vec![
+            shell_quote(&bridge),
+            "--node-id".to_string(),
+            shell_quote(node_id),
+            "--attach-command".to_string(),
+            shell_quote(attach_command),
+        ];
+        if let Some((cols, rows)) = client_size {
+            words.extend([
+                "--cols".to_string(),
+                cols.to_string(),
+                "--rows".to_string(),
+                rows.to_string(),
+            ]);
+        }
+        return words.join(" ");
+    }
+    let managed_script = std::env::var("OPENSESSIONS_SSH_ATTACH_WRAPPER")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match managed_script {
+        Some(script) => {
+            let size_env = client_size
+                .map(|(cols, rows)| {
+                    format!(
+                        "OPENSESSIONS_ATTACH_COLS={} OPENSESSIONS_ATTACH_ROWS={} ",
+                        cols, rows
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "{}{} {} {}",
+                size_env,
+                shell_quote(&script),
+                shell_quote(node_id),
+                shell_quote(attach_command),
+            )
+        }
+        None => attach_command.to_string(),
+    }
+}
+
+fn opensessions_bridge_command_path() -> Option<String> {
+    if let Some(path) = std::env::var("OPENSESSIONS_SSH_BRIDGE")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Some(path);
+    }
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join("opensessions-bridge");
+    candidate.exists().then(|| candidate.to_string_lossy().into_owned())
+}
+
+fn terminate_managed_ssh_bridges(return_command: Option<&str>) {
+    let state_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("opensessions-ssh-bridges");
+    let Ok(entries) = fs::read_dir(state_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("pid") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(pid) = raw.trim().parse::<u32>() else {
+            continue;
+        };
+        if let Some(return_command) = return_command {
+            let _ = fs::write(path.with_extension("pid.return"), return_command);
+        }
+        let _ = process::Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+fn enqueue_switch_intent_if_configured(
+    actor_id: &str,
+    node_id: &str,
+    provider_id: &str,
+    session_name: &str,
+    client_tty: Option<&str>,
+    ts: u64,
+) -> bool {
+    let Some(base_url) = std::env::var("OPENSESSIONS_CLOUD_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(api_key) = std::env::var("OPENSESSIONS_CLOUD_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let intent = serde_json::json!({
+        "id": format!("{actor_id}:{node_id}:{provider_id}:{session_name}:{ts}"),
+        "action": "switchSession",
+        "nodeId": node_id,
+        "providerId": provider_id,
+        "session": session_name,
+        "payload": {
+            "requestedBy": actor_id,
+            "clientTty": client_tty,
+        },
+        "ts": ts,
+    });
+    tokio::spawn(async move {
+        if let Err(err) = post_command_intent(&base_url, &api_key, &intent).await {
+            debug_log(format!("opensessions-cloud enqueue intent failed: {err}"));
+        }
+    });
+    true
+}
+
+#[cfg(test)]
+fn remote_attach_command_from_spec(
+    raw: &str,
+    node_id: &str,
+    provider_id: &str,
+    session_name: &str,
+) -> Option<String> {
+    raw.split(',').find_map(|entry| {
+        let (entry_node_id, template) = entry.split_once('=')?;
+        (entry_node_id.trim() == node_id).then(|| {
+            template
+                .trim()
+                .replace("{node}", &shell_quote(node_id))
+                .replace("{provider}", &shell_quote(provider_id))
+                .replace("{session}", &shell_quote(session_name))
+        })
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | ':' | '@'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn fetch_query_reply(state_source: &dyn StateSource, command: &Value) -> Option<String> {
     if command.get("type").and_then(Value::as_str)? != "fetch-query" {
         return None;
@@ -3478,7 +4801,7 @@ fn parse_command(message: &Message) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opensessions_runtime::mux::MuxSessionInfo;
+    use opensessions_runtime::mux::{ClientFocus, MuxSessionInfo};
     use opensessions_runtime::protocol::{AgentStatus, LocalLink, SessionData};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -3527,6 +4850,87 @@ mod tests {
         fn cleanup_hooks(&self) {}
     }
 
+    #[derive(Default)]
+    struct JumpProvider {
+        node_id: &'static str,
+        name: &'static str,
+        current_session: Option<&'static str>,
+        attach_command: Option<&'static str>,
+        detach_calls: Mutex<Vec<(Option<String>, String)>>,
+        switch_calls: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl MuxProvider for JumpProvider {
+        fn node_id(&self) -> &str {
+            self.node_id
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+            self.current_session
+                .map(|name| {
+                    vec![MuxSessionInfo {
+                        name: name.to_string(),
+                        created_at: 1,
+                        dir: "/repo".to_string(),
+                        windows: 1,
+                    }]
+                })
+                .unwrap_or_default()
+        }
+
+        fn switch_session(&self, name: &str, client_tty: Option<&str>) {
+            self.switch_calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), client_tty.map(str::to_string)));
+        }
+
+        fn attach_session_command(&self, _name: &str) -> Option<String> {
+            self.attach_command.map(str::to_string)
+        }
+
+        fn detach_client_and_run(&self, client_tty: Option<&str>, command: &str) {
+            self.detach_calls
+                .lock()
+                .unwrap()
+                .push((client_tty.map(str::to_string), command.to_string()));
+        }
+
+        fn get_current_session(&self) -> Option<String> {
+            self.current_session.map(str::to_string)
+        }
+
+        fn get_session_dir(&self, _name: &str) -> String {
+            "/repo".to_string()
+        }
+
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+
+        fn get_client_tty(&self) -> String {
+            "/dev/ttys001".to_string()
+        }
+
+        fn get_client_focus(&self, client_tty: Option<&str>) -> Option<ClientFocus> {
+            (self.name == "default").then(|| ClientFocus {
+                client_tty: Some(client_tty.unwrap_or("/dev/ttys001").to_string()),
+                session_name: "local".to_string(),
+                window_id: "@1".to_string(),
+                pane_id: "%1".to_string(),
+            })
+        }
+
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+        fn cleanup_hooks(&self) {}
+    }
+
     struct EmptyPortCommandRunner;
 
     impl PortCommandRunner for EmptyPortCommandRunner {
@@ -3550,6 +4954,8 @@ mod tests {
     fn state() -> ServerState {
         ServerState {
             sessions: vec![SessionData {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 name: "work".to_string(),
                 created_at: 1,
                 dir: "/repo".to_string(),
@@ -3567,6 +4973,8 @@ mod tests {
                 uptime: "0m".to_string(),
                 agent_state: Some(AgentEvent {
                     agent: "amp".to_string(),
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     session: "work".to_string(),
                     status: AgentStatus::Running,
                     ts: 10,
@@ -3601,10 +5009,12 @@ mod tests {
             ServerQueryData::Settings {
                 theme,
                 session_filter,
+                provider_filter,
                 agent_panel_scope,
             } => {
                 assert_eq!(theme.as_deref(), Some("dark"));
                 assert_eq!(session_filter, Some(SessionFilterMode::Running));
+                assert_eq!(provider_filter, None);
                 assert_eq!(agent_panel_scope, AgentPanelScope::All);
             }
             other => panic!("expected settings query data, got {other:?}"),
@@ -3619,6 +5029,262 @@ mod tests {
             }
             other => panic!("expected agents query data, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_session_order_is_independent_of_local_node_append_order() {
+        let mut order = SessionOrder::new(None);
+        order.set_visible_order(vec!["local-a".to_string(), "local-b".to_string()]);
+
+        let mut local_then_remote = vec![
+            test_session_data("macbook", "default", "local-a", 30),
+            test_session_data("macbook", "default", "local-b", 40),
+            test_session_data("ovh", "default", "remote-old", 10),
+            test_session_data("ovh", "default", "remote-new", 20),
+        ];
+        let mut remote_then_local = vec![
+            test_session_data("ovh", "default", "remote-old", 10),
+            test_session_data("ovh", "default", "remote-new", 20),
+            test_session_data("macbook", "default", "local-a", 30),
+            test_session_data("macbook", "default", "local-b", 40),
+        ];
+
+        apply_global_session_order(&mut local_then_remote, &order);
+        apply_global_session_order(&mut remote_then_local, &order);
+
+        let local_then_remote_names = local_then_remote
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>();
+        let remote_then_local_names = remote_then_local
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(local_then_remote_names, remote_then_local_names);
+        assert_eq!(
+            local_then_remote_names,
+            vec!["local-a", "local-b", "remote-old", "remote-new"]
+        );
+    }
+
+    #[test]
+    fn tmux_providers_from_env_names_multiple_local_sockets() {
+        let providers = tmux_providers_from_env(
+            &|key| match key {
+                "OPENSESSIONS_TMUX_SOCKETS" => Some("default=default,test=os-test-b".to_string()),
+                _ => None,
+            },
+            "macbook",
+        );
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].node_id(), "macbook");
+        assert_eq!(providers[0].name(), "default");
+        assert_eq!(providers[1].node_id(), "macbook");
+        assert_eq!(providers[1].name(), "test");
+    }
+
+    fn test_session_data(
+        node_id: &str,
+        provider_id: &str,
+        name: &str,
+        created_at: u64,
+    ) -> SessionData {
+        SessionData {
+            node_id: node_id.to_string(),
+            provider_id: provider_id.to_string(),
+            name: name.to_string(),
+            created_at,
+            dir: "/repo".to_string(),
+            branch: String::new(),
+            dirty: false,
+            changed_files: 0,
+            insertions: 0,
+            deletions: 0,
+            is_worktree: false,
+            unseen: false,
+            panes: 1,
+            ports: Vec::new(),
+            local_links: Vec::new(),
+            windows: 1,
+            uptime: "0m".to_string(),
+            agent_state: None,
+            agents: Vec::new(),
+            event_timestamps: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn default_state_source_uses_explicit_tmux_sockets_without_tmux_env() {
+        let source = default_state_source_from_env(|key| match key {
+            "OPENSESSIONS_NODE_ID" => Some("ovh-palani".to_string()),
+            "OPENSESSIONS_TMUX_SOCKETS" => Some("default=default".to_string()),
+            _ => None,
+        })
+        .expect("state source");
+
+        assert_eq!(source.local_node_id(), "ovh-palani");
+        assert_eq!(
+            source.local_node_ids(),
+            HashSet::from(["ovh-palani".to_string()])
+        );
+    }
+
+    #[test]
+    fn http_target_appends_opensessions_path_to_cloud_base_url() {
+        let target =
+            http_target("http://127.0.0.1:8080/api", "/v1/opensessions/snapshot").expect("target");
+
+        assert_eq!(target.host, "127.0.0.1");
+        assert_eq!(target.port, 8080);
+        assert_eq!(target.path, "/api/v1/opensessions/snapshot");
+    }
+
+    #[test]
+    fn convex_url_from_cloud_url_accepts_convex_prefix() {
+        assert_eq!(
+            convex_url_from_cloud_url("convex:https://example.convex.cloud"),
+            Some("https://example.convex.cloud")
+        );
+        assert_eq!(
+            convex_url_from_cloud_url("convex+https://example.convex.cloud"),
+            Some("https://example.convex.cloud")
+        );
+        assert_eq!(convex_url_from_cloud_url("http://127.0.0.1:8080"), None);
+    }
+
+    #[test]
+    fn normalize_integral_json_numbers_converts_convex_float_exports() {
+        let mut value = serde_json::json!({
+            "ts": 1782063957253.0,
+            "nested": [{ "createdAt": 42.0, "ratio": 1.5 }]
+        });
+
+        normalize_integral_json_numbers(&mut value);
+
+        assert_eq!(value["ts"].as_u64(), Some(1782063957253));
+        assert_eq!(value["nested"][0]["createdAt"].as_u64(), Some(42));
+        assert_eq!(value["nested"][0]["ratio"].as_f64(), Some(1.5));
+    }
+
+    #[test]
+    fn remote_attach_command_uses_matching_node_template() {
+        let command = remote_attach_command_from_spec(
+            "other=tmux attach -t {session},ovh-palani=ssh -t ubuntu@host tmux attach-session -t {session}",
+            "ovh-palani",
+            "default",
+            "plane preview",
+        )
+        .expect("remote attach command");
+
+        assert_eq!(
+            command,
+            "ssh -t ubuntu@host tmux attach-session -t 'plane preview'"
+        );
+    }
+
+    #[test]
+    fn registered_ssh_node_attach_command_uses_safe_tmux_attach() {
+        let command = ssh_attach_command(
+            &SshNodeConfig {
+                node_id: "ovh-palani".to_string(),
+                host: "148.113.49.189".to_string(),
+                user: Some("ubuntu".to_string()),
+                identity_file: Some("/Users/me/.ssh/ovh-palani".to_string()),
+                port: Some(2222),
+                provider_id: Some("default".to_string()),
+                tmux_socket: None,
+            },
+            "plane preview",
+            Some((186, 51)),
+        );
+
+        assert!(command.starts_with(
+            "ssh -i /Users/me/.ssh/ovh-palani -p 2222 -tt ubuntu@148.113.49.189 '",
+        ));
+        assert!(command.contains(
+            "stty cols 186 rows 51",
+        ));
+        assert!(command.contains("TERM=xterm-256color exec tmux attach-session -t"));
+        assert!(command.contains("plane preview"));
+    }
+
+    #[test]
+    fn switch_session_on_another_provider_detaches_client_into_target_attach() {
+        let source_provider = Arc::new(JumpProvider {
+            node_id: "macbook",
+            name: "default",
+            current_session: Some("local"),
+            ..JumpProvider::default()
+        });
+        let target_provider = Arc::new(JumpProvider {
+            node_id: "macbook",
+            name: "extra",
+            current_session: Some("extra-local"),
+            attach_command: Some("tmux -L opensessions-live-extra attach-session -t extra-local"),
+            ..JumpProvider::default()
+        });
+        let source = ReadOnlyMuxStateSource::new(vec![
+            source_provider.clone() as Arc<dyn MuxProvider>,
+            target_provider.clone() as Arc<dyn MuxProvider>,
+        ]);
+
+        let command = serde_json::json!({
+            "type": "switch-session",
+            "nodeId": "macbook",
+            "providerId": "extra",
+            "name": "extra-local",
+            "clientTty": "/dev/ttys009",
+        });
+        let _ = source.handle_client_command(&command);
+
+        assert_eq!(target_provider.switch_calls.lock().unwrap().as_slice(), []);
+        assert_eq!(
+            source_provider.detach_calls.lock().unwrap().as_slice(),
+            [(
+                Some("/dev/ttys009".to_string()),
+                "tmux -L opensessions-live-extra attach-session -t extra-local".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn switch_session_resolves_current_client_tty_before_detach() {
+        let source_provider = Arc::new(JumpProvider {
+            node_id: "macbook",
+            name: "default",
+            current_session: Some("local"),
+            ..JumpProvider::default()
+        });
+        let target_provider = Arc::new(JumpProvider {
+            node_id: "macbook",
+            name: "extra",
+            current_session: Some("extra-local"),
+            attach_command: Some("tmux -L opensessions-live-extra attach-session -t extra-local"),
+            ..JumpProvider::default()
+        });
+        let source = ReadOnlyMuxStateSource::new(vec![
+            source_provider.clone() as Arc<dyn MuxProvider>,
+            target_provider.clone() as Arc<dyn MuxProvider>,
+        ]);
+
+        let command = serde_json::json!({
+            "type": "switch-session",
+            "nodeId": "macbook",
+            "providerId": "extra",
+            "name": "extra-local",
+        });
+        let _ = source.handle_client_command(&command);
+
+        assert_eq!(
+            source_provider.detach_calls.lock().unwrap().as_slice(),
+            [(
+                Some("/dev/ttys001".to_string()),
+                "tmux -L opensessions-live-extra attach-session -t extra-local".to_string(),
+            )]
+        );
     }
 
     #[test]

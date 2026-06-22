@@ -41,6 +41,7 @@ impl DisplaySessionEntry<'_> {
 pub struct SessionProjectionOptions<'a> {
     pub filter: SessionFilterMode,
     pub collapsed_groups: &'a HashSet<String>,
+    pub provider_filter: Option<&'a str>,
 }
 
 pub fn filtered_sessions<'a>(
@@ -50,6 +51,17 @@ pub fn filtered_sessions<'a>(
     sessions
         .iter()
         .filter(move |session| session_matches_filter(session, mode))
+}
+
+fn provider_filtered_sessions<'a>(
+    sessions: impl Iterator<Item = &'a SessionData>,
+    provider_filter: Option<&'a str>,
+) -> Vec<&'a SessionData> {
+    sessions
+        .filter(|session| {
+            provider_filter.is_none_or(|provider| session.provider_id.as_str() == provider)
+        })
+        .collect()
 }
 
 pub fn session_display_entries<'a>(
@@ -106,17 +118,20 @@ pub fn session_display_entries<'a>(
 
 pub fn project_sessions<'a>(
     sessions: &'a [SessionData],
-    options: SessionProjectionOptions<'_>,
+    options: SessionProjectionOptions<'a>,
 ) -> Vec<DisplaySessionEntry<'a>> {
     session_display_entries(
-        filtered_sessions(sessions, options.filter).collect(),
+        provider_filtered_sessions(
+            filtered_sessions(sessions, options.filter),
+            options.provider_filter,
+        ),
         options.collapsed_groups,
     )
 }
 
 pub fn display_sessions<'a>(
     sessions: &'a [SessionData],
-    options: SessionProjectionOptions<'_>,
+    options: SessionProjectionOptions<'a>,
 ) -> Vec<&'a SessionData> {
     project_sessions(sessions, options)
         .into_iter()
@@ -127,9 +142,9 @@ pub fn display_sessions<'a>(
         .collect()
 }
 
-pub fn display_session_names(
-    sessions: &[SessionData],
-    options: SessionProjectionOptions<'_>,
+pub fn display_session_names<'a>(
+    sessions: &'a [SessionData],
+    options: SessionProjectionOptions<'a>,
 ) -> Vec<String> {
     display_sessions(sessions, options)
         .into_iter()
@@ -137,9 +152,9 @@ pub fn display_session_names(
         .collect()
 }
 
-pub fn reordered_session_names(
-    sessions: &[SessionData],
-    options: SessionProjectionOptions<'_>,
+pub fn reordered_session_names<'a>(
+    sessions: &'a [SessionData],
+    options: SessionProjectionOptions<'a>,
     name: &str,
     delta: i8,
 ) -> Option<Vec<String>> {
@@ -208,9 +223,9 @@ pub fn reordered_session_names(
     Some(names)
 }
 
-pub fn reordered_worktree_group_names(
-    sessions: &[SessionData],
-    options: SessionProjectionOptions<'_>,
+pub fn reordered_worktree_group_names<'a>(
+    sessions: &'a [SessionData],
+    options: SessionProjectionOptions<'a>,
     key: &str,
     delta: i8,
 ) -> Option<Vec<String>> {
@@ -330,9 +345,9 @@ fn grouped_worktree_keys(sessions: &[&SessionData]) -> HashSet<String> {
         .collect()
 }
 
-fn session_order_blocks(
-    sessions: &[SessionData],
-    options: SessionProjectionOptions<'_>,
+fn session_order_blocks<'a>(
+    sessions: &'a [SessionData],
+    options: SessionProjectionOptions<'a>,
 ) -> Vec<SessionOrderBlock> {
     let mut blocks = Vec::new();
     for entry in project_sessions(sessions, options) {
@@ -370,6 +385,8 @@ mod tests {
 
     fn session(name: &str, dir: &str, is_worktree: bool) -> SessionData {
         SessionData {
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             name: name.to_string(),
             created_at: 0,
             dir: dir.to_string(),
@@ -395,6 +412,8 @@ mod tests {
     fn agent(status: AgentStatus) -> AgentEvent {
         AgentEvent {
             agent: "amp".to_string(),
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             session: String::new(),
             status,
             ts: 0,
@@ -411,6 +430,7 @@ mod tests {
         SessionProjectionOptions {
             filter: SessionFilterMode::All,
             collapsed_groups,
+            provider_filter: None,
         }
     }
 
@@ -458,6 +478,7 @@ mod tests {
                 SessionProjectionOptions {
                     filter: SessionFilterMode::Running,
                     collapsed_groups: &collapsed,
+                    provider_filter: None,
                 },
             ),
             vec!["aggregate".to_string(), "instance".to_string()],

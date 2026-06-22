@@ -38,6 +38,8 @@ pub enum LaunchTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPaneTarget {
+    pub node_id: String,
+    pub provider_id: String,
     pub session: String,
     pub agent: String,
     pub thread_id: Option<String>,
@@ -47,6 +49,8 @@ pub struct AgentPaneTarget {
 
 pub(crate) fn agent_focus_target(session: &SessionData, agent: &AgentEvent) -> AgentPaneTarget {
     AgentPaneTarget {
+        node_id: session.node_id.clone(),
+        provider_id: session.provider_id.clone(),
         session: session.name.clone(),
         agent: agent.agent.clone(),
         thread_id: agent.thread_id.clone(),
@@ -127,6 +131,7 @@ pub struct App {
     /// unaffected (`spinner()` falls back to `ts` when this is 0).
     pub spinner_now: u64,
     pub session_filter: SessionFilterMode,
+    pub provider_filter: Option<String>,
     pub panel_focus: PanelFocus,
     pub agent_panel_scope: AgentPanelScope,
     pub focused_agent_idx: usize,
@@ -176,6 +181,7 @@ impl App {
             ts: 0,
             spinner_now: 0,
             session_filter: SessionFilterMode::All,
+            provider_filter: None,
             panel_focus: PanelFocus::Sessions,
             agent_panel_scope: AgentPanelScope::Current,
             focused_agent_idx: 0,
@@ -231,6 +237,7 @@ impl App {
             ts: state.ts,
             spinner_now: 0,
             session_filter: state.session_filter.unwrap_or_default(),
+            provider_filter: None,
             panel_focus: PanelFocus::Sessions,
             agent_panel_scope: state.agent_panel_scope,
             focused_agent_idx: 0,
@@ -441,11 +448,17 @@ impl App {
             ServerQueryData::Settings {
                 theme,
                 session_filter,
+                provider_filter,
                 agent_panel_scope,
             } => {
                 self.server_state_query.observe_query_success(key, ts);
                 self.ts = ts;
-                self.apply_settings_query(theme, session_filter, agent_panel_scope);
+                self.apply_settings_query(
+                    theme,
+                    session_filter,
+                    provider_filter,
+                    agent_panel_scope,
+                );
             }
         }
     }
@@ -481,11 +494,11 @@ impl App {
 
     fn apply_agents_query(&mut self, sessions: Vec<SessionAgentsData>) {
         for agents in sessions {
-            if let Some(session) = self
-                .sessions
-                .iter_mut()
-                .find(|session| session.name == agents.session)
-            {
+            if let Some(session) = self.sessions.iter_mut().find(|session| {
+                session.node_id == agents.node_id
+                    && session.provider_id == agents.provider_id
+                    && session.name == agents.session
+            }) {
                 session.unseen = agents.unseen;
                 session.agent_state = agents.agent_state;
                 session.agents = agents.agents;
@@ -518,16 +531,22 @@ impl App {
         &mut self,
         theme: Option<String>,
         session_filter: Option<SessionFilterMode>,
+        provider_filter: Option<String>,
         agent_panel_scope: AgentPanelScope,
     ) {
         self.theme = theme;
         self.session_filter = session_filter.unwrap_or_default();
+        self.provider_filter = provider_filter;
         self.apply_server_agent_panel_scope(agent_panel_scope);
         self.clamp_session_scroll_offset(0);
     }
 
     pub fn filtered_sessions(&self) -> impl Iterator<Item = &SessionData> {
-        filtered_sessions(&self.sessions, self.session_filter)
+        filtered_sessions(&self.sessions, self.session_filter).filter(|session| {
+            self.provider_filter
+                .as_deref()
+                .is_none_or(|provider| session.provider_id == provider)
+        })
     }
 
     pub fn display_session_entries(&self) -> Vec<DisplaySessionEntry<'_>> {
@@ -560,6 +579,7 @@ impl App {
         SessionProjectionOptions {
             filter: self.session_filter,
             collapsed_groups: &self.collapsed_worktree_groups,
+            provider_filter: self.provider_filter.as_deref(),
         }
     }
 
@@ -723,6 +743,7 @@ impl App {
             't' => self.open_theme_picker(),
             'w' => self.open_width_slider(),
             'f' => self.cycle_filter(),
+            'S' => self.cycle_provider_filter(),
             'a' => self.toggle_agent_panel_scope(),
             _ => {}
         }
@@ -921,6 +942,7 @@ impl App {
                     session_name: Some(name),
                 });
             }
+            HitTarget::ProviderFilter(provider) => self.set_provider_filter_request(provider),
             HitTarget::Agent(idx) => self.activate_agent_target(idx),
             HitTarget::AgentPane(target) => self.activate_agent_pane_target(target),
             HitTarget::AgentScopeToggle => self.toggle_agent_panel_scope(),
@@ -1152,6 +1174,8 @@ impl App {
 
     fn queue_focus_agent_pane(&mut self, target: AgentPaneTarget) {
         self.commands.push(ClientCommand::SwitchSession {
+            node_id: target.node_id.clone(),
+            provider_id: target.provider_id.clone(),
             name: target.session.clone(),
             client_tty: None,
         });
@@ -1235,7 +1259,15 @@ impl App {
             self.rehome_focus_to_local_session();
         }
         self.publish_client_ui_focus();
+        let (node_id, provider_id) = self
+            .sessions
+            .iter()
+            .find(|session| session.name == name)
+            .map(|session| (session.node_id.clone(), session.provider_id.clone()))
+            .unwrap_or_else(|| ("local".to_string(), "tmux".to_string()));
         self.commands.push(ClientCommand::SwitchSession {
+            node_id,
+            provider_id,
             name,
             client_tty: None,
         });
@@ -1355,6 +1387,40 @@ impl App {
         self.clamp_session_scroll_offset(0);
         self.commands.push(ClientCommand::SetFilter {
             filter: self.session_filter,
+        });
+    }
+
+    fn cycle_provider_filter(&mut self) {
+        let mut providers = Vec::<String>::new();
+        for session in &self.sessions {
+            if !providers.contains(&session.provider_id) {
+                providers.push(session.provider_id.clone());
+            }
+        }
+        if providers.is_empty() {
+            self.provider_filter = None;
+            return;
+        }
+        self.provider_filter = match self.provider_filter.as_deref() {
+            None => providers.first().cloned(),
+            Some(current) => providers
+                .iter()
+                .position(|provider| provider == current)
+                .and_then(|idx| providers.get(idx + 1).cloned()),
+        };
+        self.commands.push(ClientCommand::SetProviderFilter {
+            provider: self.provider_filter.clone(),
+        });
+        self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
+        self.clamp_session_scroll_offset(0);
+    }
+
+    pub fn set_provider_filter_request(&mut self, provider: Option<String>) {
+        self.provider_filter = provider;
+        self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
+        self.clamp_session_scroll_offset(0);
+        self.commands.push(ClientCommand::SetProviderFilter {
+            provider: self.provider_filter.clone(),
         });
     }
 
@@ -1506,6 +1572,8 @@ mod tests {
 
     fn session(name: &str, dir: &str, is_worktree: bool) -> SessionData {
         SessionData {
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             name: name.to_string(),
             created_at: 0,
             dir: dir.to_string(),
@@ -1528,9 +1596,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_filter_cycles_visible_sessions_locally() {
+        let mut first = session("local-a", "/tmp/a", false);
+        first.provider_id = "default".to_string();
+        let mut second = session("local-b", "/tmp/b", false);
+        second.provider_id = "secondary".to_string();
+        let mut state = empty_state(10);
+        state.sessions = vec![first, second];
+        let mut app = App::from_state(state);
+
+        assert_eq!(
+            app.display_sessions()
+                .into_iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-a", "local-b"],
+        );
+
+        app.handle_key_char('S');
+        assert_eq!(app.provider_filter.as_deref(), Some("default"));
+        assert_eq!(app.display_sessions()[0].name, "local-a");
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetProviderFilter {
+                provider: Some("default".to_string())
+            }]
+        );
+
+        app.handle_key_char('S');
+        assert_eq!(app.provider_filter.as_deref(), Some("secondary"));
+        assert_eq!(app.display_sessions()[0].name, "local-b");
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetProviderFilter {
+                provider: Some("secondary".to_string())
+            }]
+        );
+
+        app.handle_key_char('S');
+        assert_eq!(app.provider_filter, None);
+        assert_eq!(app.display_sessions().len(), 2);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetProviderFilter { provider: None }]
+        );
+    }
+
+    #[test]
+    fn provider_filter_hit_target_sends_server_setting_command() {
+        let mut first = session("local-a", "/tmp/a", false);
+        first.provider_id = "default".to_string();
+        let mut second = session("local-b", "/tmp/b", false);
+        second.provider_id = "secondary".to_string();
+        let mut state = empty_state(10);
+        state.sessions = vec![first, second];
+        let mut app = App::from_state(state);
+
+        app.activate_hit_target(HitTarget::ProviderFilter(Some("secondary".to_string())));
+
+        assert_eq!(app.provider_filter.as_deref(), Some("secondary"));
+        assert_eq!(app.display_sessions()[0].name, "local-b");
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetProviderFilter {
+                provider: Some("secondary".to_string())
+            }]
+        );
+    }
+
     fn agent_without_pane(agent: &str, status: AgentStatus) -> AgentEvent {
         AgentEvent {
             agent: agent.to_string(),
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             session: String::new(),
             status,
             ts: 0,
@@ -1563,6 +1702,7 @@ mod tests {
             data: ServerQueryData::Settings {
                 theme: state.theme,
                 session_filter: state.session_filter,
+                provider_filter: None,
                 agent_panel_scope: state.agent_panel_scope,
             },
             ts: state.ts,
@@ -1723,6 +1863,7 @@ mod tests {
             data: ServerQueryData::Settings {
                 theme: Some("dark".to_string()),
                 session_filter: Some(SessionFilterMode::Running),
+                provider_filter: Some("secondary".to_string()),
                 agent_panel_scope: AgentPanelScope::All,
             },
             ts: 50,
@@ -1742,6 +1883,8 @@ mod tests {
             key: ServerQueryKey::Agents,
             data: ServerQueryData::Agents {
                 sessions: vec![SessionAgentsData {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     session: "work".to_string(),
                     unseen: true,
                     agent_state: Some(agent_without_pane("amp", AgentStatus::Running)),
@@ -1754,6 +1897,7 @@ mod tests {
 
         assert_eq!(app.theme.as_deref(), Some("dark"));
         assert_eq!(app.session_filter, SessionFilterMode::Running);
+        assert_eq!(app.provider_filter.as_deref(), Some("secondary"));
         assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
         assert_eq!(app.sidebar_width, 52);
         assert_eq!(app.detail_panel_height, 16);

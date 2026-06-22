@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -704,6 +704,73 @@ fn tmux_sidebar_state_is_isolated_per_tmux_socket() {
 }
 
 #[test]
+fn tmux_sidebar_syncs_global_workspace_across_two_servers() {
+    let _guard = e2e_serial_guard();
+    let cloud = MockOpensessionsCloud::start();
+    let key = "e2e-global-workspace".to_string();
+    let lab_a = started_lab_with_env(
+        "opensessions-e2e-global-a",
+        vec![
+            ("OPENSESSIONS_NODE_ID", "node-a".to_string()),
+            ("OPENSESSIONS_TMUX_SOCKETS", "node-a={socket}".to_string()),
+            ("OPENSESSIONS_CLOUD_URL", cloud.url()),
+            ("OPENSESSIONS_CLOUD_API_KEY", key.clone()),
+        ],
+    );
+    let lab_b = started_lab_with_env(
+        "opensessions-e2e-global-b",
+        vec![
+            ("OPENSESSIONS_NODE_ID", "node-b".to_string()),
+            ("OPENSESSIONS_TMUX_SOCKETS", "node-b={socket}".to_string()),
+            ("OPENSESSIONS_CLOUD_URL", cloud.url()),
+            ("OPENSESSIONS_CLOUD_API_KEY", key),
+        ],
+    );
+
+    lab_a.tmux_ok([
+        "new-session",
+        "-d",
+        "-s",
+        "local-only",
+        "-c",
+        lab_a.root.join("opensessions").to_str().unwrap(),
+        "sh",
+    ]);
+    lab_b.tmux_ok([
+        "new-session",
+        "-d",
+        "-s",
+        "remote-only",
+        "-c",
+        lab_b.root.join("opensessions").to_str().unwrap(),
+        "sh",
+    ]);
+    post_refresh(lab_a.port);
+    post_refresh(lab_b.port);
+
+    lab_a.wait_for_session_order(|names| {
+        names.contains(&"local-only".to_string()) && names.contains(&"remote-only".to_string())
+    });
+    lab_b.wait_for_session_order(|names| {
+        names.contains(&"local-only".to_string()) && names.contains(&"remote-only".to_string())
+    });
+
+    lab_a.send_ws_command(serde_json::json!({
+        "type": "set-provider-filter",
+        "provider": "node-b",
+    }));
+    lab_b.wait_for_provider_filter(Some("node-b"));
+
+    lab_b.send_ws_command(serde_json::json!({
+        "type": "switch-session",
+        "nodeId": "node-a",
+        "providerId": "node-a",
+        "name": "local-only",
+    }));
+    lab_a.wait_for_current_session("local-only");
+}
+
+#[test]
 fn tmux_sidebar_q_in_main_pane_does_not_quit_opensessions() {
     let _guard = e2e_serial_guard();
     let mut lab = started_lab("opensessions-e2e-q-main-pane");
@@ -956,6 +1023,10 @@ fn tmux_sidebar_switch_latency_during_width_repair_probe() {
 }
 
 fn started_lab(prefix: &str) -> Lab {
+    started_lab_with_env(prefix, Vec::new())
+}
+
+fn started_lab_with_env(prefix: &str, env: Vec<(&str, String)>) -> Lab {
     Command::new("tmux")
         .arg("-V")
         .output()
@@ -970,6 +1041,10 @@ fn started_lab(prefix: &str) -> Lab {
         .expect("git is required for product E2E tests");
 
     let mut lab = Lab::new(prefix);
+    for (key, value) in env {
+        let value = value.replace("{socket}", &lab.socket);
+        lab = lab.with_server_env(key, value);
+    }
     lab.setup_repos();
     lab.setup_tmux();
     lab.start_server();
@@ -1107,10 +1182,151 @@ fn free_port() -> u16 {
         .port()
 }
 
+#[derive(Default)]
+struct MockCloudState {
+    nodes: serde_json::Map<String, serde_json::Value>,
+    ui_state: Option<serde_json::Value>,
+    command_intents: Vec<serde_json::Value>,
+}
+
+struct MockOpensessionsCloud {
+    port: u16,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl MockOpensessionsCloud {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock cloud");
+        let port = listener.local_addr().expect("mock cloud addr").port();
+        let state = Arc::new(Mutex::new(MockCloudState::default()));
+        let thread_state = state.clone();
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                handle_mock_cloud_connection(stream, &thread_state);
+            }
+        });
+        Self {
+            port,
+            _thread: thread,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+fn handle_mock_cloud_connection(mut stream: TcpStream, state: &Arc<Mutex<MockCloudState>>) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let Ok(read) = stream.read(&mut buffer) else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|idx| idx + 4)
+        .unwrap_or(request.len());
+    let head = String::from_utf8_lossy(&request[..header_end]).to_string();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length:")
+                .or_else(|| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    while request.len().saturating_sub(header_end) < content_length {
+        let Ok(read) = stream.read(&mut buffer) else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+        request.extend_from_slice(&buffer[..read]);
+    }
+    let body = String::from_utf8_lossy(&request[header_end..header_end + content_length]);
+    let first = head.lines().next().unwrap_or_default();
+    if first.starts_with("POST /v1/opensessions/snapshot ") {
+        if let Ok(snapshot) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(node_id) = snapshot.get("nodeId").and_then(serde_json::Value::as_str)
+        {
+            let mut state = state.lock().unwrap();
+            if let Some(ui_state) = snapshot.get("uiState").cloned() {
+                let incoming_ts = ui_state
+                    .get("ts")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let current_ts = state
+                    .ui_state
+                    .as_ref()
+                    .and_then(|value| value.get("ts"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if incoming_ts >= current_ts {
+                    state.ui_state = Some(ui_state);
+                }
+            }
+            if let Some(intents) = snapshot
+                .get("commandIntents")
+                .and_then(serde_json::Value::as_array)
+            {
+                state.command_intents.extend(intents.iter().cloned());
+            }
+            state.nodes.insert(node_id.to_string(), snapshot);
+        }
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
+        return;
+    }
+    if first.starts_with("POST /v1/opensessions/command-intent ") {
+        if let Ok(intent) = serde_json::from_str::<serde_json::Value>(&body) {
+            state.lock().unwrap().command_intents.push(intent);
+        }
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
+        return;
+    }
+    if first.starts_with("POST /v1/opensessions/command-intent/complete ") {
+        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(intent_id) = body.get("intentId").and_then(serde_json::Value::as_str)
+        {
+            state.lock().unwrap().command_intents.retain(|intent| {
+                intent.get("id").and_then(serde_json::Value::as_str) != Some(intent_id)
+            });
+        }
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}");
+        return;
+    }
+    if first.starts_with("GET /v1/opensessions/graph ") {
+        let state = state.lock().unwrap();
+        let nodes = state.nodes.values().cloned().collect::<Vec<_>>();
+        let body = serde_json::json!({
+            "nodes": nodes,
+            "uiState": state.ui_state,
+            "commandIntents": state.command_intents,
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        return;
+    }
+    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+}
+
 struct Lab {
     socket: String,
     root: PathBuf,
     port: u16,
+    server_env: Vec<(String, String)>,
     server: Option<Child>,
     clients: Vec<Child>,
 }
@@ -1133,9 +1349,15 @@ impl Lab {
             socket: unique,
             root,
             port: free_port(),
+            server_env: Vec::new(),
             server: None,
             clients: Vec::new(),
         }
+    }
+
+    fn with_server_env(mut self, key: &str, value: impl Into<String>) -> Self {
+        self.server_env.push((key.to_string(), value.into()));
+        self
     }
 
     fn setup_repos(&self) {
@@ -1276,6 +1498,7 @@ time.sleep(300)
                 "OPENSESSIONS_PID_FILE",
                 self.root.join("server.pid").to_str().unwrap(),
             )
+            .envs(self.server_env.iter().map(|(key, value)| (key, value)))
             .stdout(File::create(self.root.join("server.stdout.log")).expect("server stdout log"))
             .stderr(File::create(self.root.join("server.stderr.log")).expect("server stderr log"))
             .spawn()
@@ -1626,6 +1849,26 @@ while :; do sleep 60; done
         });
     }
 
+    fn send_ws_command(&self, command: serde_json::Value) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
+                .await
+                .expect("connect command ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            ws.send(Message::text(command.to_string()))
+                .await
+                .expect("send ws command");
+            ws.close().await.expect("close command ws client");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+    }
+
     fn wait_for_text(&self, session: &str, text: &str) {
         self.wait_for_capture(session, |capture| capture.contains(text));
     }
@@ -1970,6 +2213,38 @@ while :; do sleep 60; done
         );
     }
 
+    fn wait_for_provider_filter(&self, expected: Option<&str>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = None;
+        while Instant::now() < deadline {
+            last = self.provider_filter();
+            if last.as_deref() == expected {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for provider filter {expected:?}; last={last:?}\nlogs:\n{}",
+            self.logs()
+        );
+    }
+
+    fn wait_for_current_session(&self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = None;
+        while Instant::now() < deadline {
+            last = self.current_session();
+            if last.as_deref() == Some(expected) {
+                return;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "timed out waiting for current session {expected}; last={last:?}\nlogs:\n{}",
+            self.logs()
+        );
+    }
+
     fn session_names(&self) -> Vec<String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -2014,6 +2289,94 @@ while :; do sleep 60; done
                 .iter()
                 .filter_map(|session| session.get("name")?.as_str().map(str::to_string))
                 .collect()
+        })
+    }
+
+    fn provider_filter(&self) -> Option<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
+                .await
+                .expect("connect settings ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            let command = serde_json::json!({
+                "type": "fetch-query",
+                "key": "settings",
+            });
+            ws.send(Message::text(command.to_string()))
+                .await
+                .expect("send settings fetch-query");
+            let response = loop {
+                let response = ws
+                    .next()
+                    .await
+                    .expect("read settings query result")
+                    .expect("settings query result");
+                let response =
+                    String::from_utf8(response.as_payload().to_vec()).expect("settings query text");
+                let json = serde_json::from_str::<serde_json::Value>(&response)
+                    .expect("parse websocket json");
+                if json.get("type").and_then(serde_json::Value::as_str) == Some("query-result")
+                    && json.get("key").and_then(serde_json::Value::as_str) == Some("settings")
+                {
+                    break json;
+                }
+            };
+            ws.close().await.expect("close settings ws client");
+            response
+                .get("data")
+                .and_then(|state| state.get("providerFilter"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+    }
+
+    fn current_session(&self) -> Option<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
+                .await
+                .expect("connect focus ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            let command = serde_json::json!({
+                "type": "fetch-query",
+                "key": "focus",
+            });
+            ws.send(Message::text(command.to_string()))
+                .await
+                .expect("send focus fetch-query");
+            let response = loop {
+                let response = ws
+                    .next()
+                    .await
+                    .expect("read focus query result")
+                    .expect("focus query result");
+                let response =
+                    String::from_utf8(response.as_payload().to_vec()).expect("focus query text");
+                let json = serde_json::from_str::<serde_json::Value>(&response)
+                    .expect("parse websocket json");
+                if json.get("type").and_then(serde_json::Value::as_str) == Some("query-result")
+                    && json.get("key").and_then(serde_json::Value::as_str) == Some("focus")
+                {
+                    break json;
+                }
+            };
+            ws.close().await.expect("close focus ws client");
+            response
+                .get("data")
+                .and_then(|state| state.get("currentSession"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
         })
     }
 

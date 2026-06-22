@@ -9,6 +9,8 @@ const SYNTHETIC_PANE_MARKER: &str = ":pane:";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanePresenceInput {
     pub agent: String,
+    pub node_id: String,
+    pub provider_id: String,
     pub pane_id: String,
     pub active: bool,
     pub status: AgentStatus,
@@ -619,6 +621,8 @@ impl AgentTracker {
 
             let synthetic_event = AgentEvent {
                 agent: pane.agent,
+                node_id: pane.node_id,
+                provider_id: pane.provider_id,
                 session: session.to_string(),
                 status: pane.status,
                 ts: now_ms(),
@@ -971,6 +975,8 @@ mod tests {
     ) -> AgentEvent {
         AgentEvent {
             agent: agent.to_string(),
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             session: session.to_string(),
             status: AgentStatus::Running,
             ts: 1,
@@ -1005,6 +1011,8 @@ mod tests {
         tracker.apply_pane_presence(
             "work",
             vec![PanePresenceInput {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 agent: "amp".to_string(),
                 pane_id: "%7".to_string(),
                 active: false,
@@ -1031,6 +1039,8 @@ mod tests {
         tracker.apply_pane_presence(
             "work",
             vec![PanePresenceInput {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 agent: "amp".to_string(),
                 pane_id: "%9".to_string(),
                 active: false,
@@ -1057,6 +1067,8 @@ mod tests {
             "work",
             vec![
                 PanePresenceInput {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     agent: "amp".to_string(),
                     pane_id: "%7".to_string(),
                     active: false,
@@ -1065,6 +1077,8 @@ mod tests {
                     thread_name: Some("Roadmap".to_string()),
                 },
                 PanePresenceInput {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     agent: "amp".to_string(),
                     pane_id: "%8".to_string(),
                     active: true,
@@ -1098,6 +1112,8 @@ mod tests {
         tracker.apply_pane_presence(
             "work",
             vec![PanePresenceInput {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 agent: "amp".to_string(),
                 pane_id: "%7".to_string(),
                 active: true,
@@ -1114,6 +1130,8 @@ mod tests {
         tracker.apply_pane_presence(
             "work",
             vec![PanePresenceInput {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 agent: "amp".to_string(),
                 pane_id: "%7".to_string(),
                 active: true,
@@ -1137,6 +1155,8 @@ mod tests {
             "work",
             vec![
                 PanePresenceInput {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     agent: "amp".to_string(),
                     pane_id: "%1".to_string(),
                     active: false,
@@ -1145,6 +1165,8 @@ mod tests {
                     thread_name: Some("Background task".to_string()),
                 },
                 PanePresenceInput {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     agent: "amp".to_string(),
                     pane_id: "%2".to_string(),
                     active: true,
@@ -1277,6 +1299,8 @@ mod tests {
             "work",
             vec![
                 PanePresenceInput {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     agent: "amp".to_string(),
                     pane_id: "%7".to_string(),
                     active: false,
@@ -1285,6 +1309,8 @@ mod tests {
                     thread_name: Some("Seen - amp - focused".to_string()),
                 },
                 PanePresenceInput {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     agent: "amp".to_string(),
                     pane_id: "%8".to_string(),
                     active: false,
@@ -1350,6 +1376,8 @@ mod tests {
         tracker.apply_pane_presence(
             "work",
             vec![PanePresenceInput {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 agent: "amp".to_string(),
                 pane_id: "%7".to_string(),
                 active: false,
@@ -1382,6 +1410,8 @@ mod tests {
         tracker.apply_pane_presence(
             "work",
             vec![PanePresenceInput {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 agent: "amp".to_string(),
                 pane_id: "%7".to_string(),
                 active: false,

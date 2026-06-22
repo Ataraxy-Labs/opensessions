@@ -27,6 +27,7 @@ pub enum HitTarget {
     Session(String),
     Group(String),
     DiffCount(String),
+    ProviderFilter(Option<String>),
     Agent(usize),
     AgentPane(AgentPaneTarget),
     AgentScopeToggle,
@@ -63,7 +64,10 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
         .map(|value| value as usize)
         .unwrap_or(width);
     let layout = sidebar_layout(app, width as u16, height as u16);
-    let mut lines = vec![header(app, &palette, width), StyledLine::blank()];
+    let mut lines = vec![
+        header(app, &palette, width),
+        server_pills(app, &palette, width),
+    ];
     let detail_separator_row = layout.detail_separator.y as usize;
     let session_scrollbar = render_sessions(app, &palette, &mut lines, detail_separator_row, width);
 
@@ -344,6 +348,68 @@ fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
             };
             line.push(part, color);
         }
+    }
+    line.end(CellStyle::fg(palette.white))
+}
+
+fn server_pills(app: &App, palette: &Palette, width: usize) -> StyledLine {
+    let mut providers = Vec::<(&str, usize, usize)>::new();
+    for session in &app.sessions {
+        let key = session.provider_id.as_str();
+        if let Some((_, sessions, agents)) = providers
+            .iter_mut()
+            .find(|(provider, _, _)| *provider == key)
+        {
+            *sessions += 1;
+            *agents += session
+                .agents
+                .iter()
+                .filter(|agent| agent.status != AgentStatus::Idle)
+                .count();
+        } else {
+            providers.push((
+                key,
+                1,
+                session
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.status != AgentStatus::Idle)
+                    .count(),
+            ));
+        }
+    }
+
+    let mut line = StyledLine::blank();
+    if app.provider_filter.is_none() {
+        line.push_hit(" [all]", palette.blue, HitTarget::ProviderFilter(None));
+    } else {
+        line.push_hit(" all", palette.overlay0, HitTarget::ProviderFilter(None));
+    }
+    for (provider, sessions, agents) in providers {
+        if line.width() >= width.saturating_sub(1) {
+            break;
+        }
+        line.push("  ", palette.white);
+        let label = if agents > 0 {
+            format!("{provider} ●{agents}")
+        } else {
+            format!("{provider} {sessions}")
+        };
+        let label = if app.provider_filter.as_deref() == Some(provider) {
+            format!("[{label}]")
+        } else {
+            label
+        };
+        let truncated = truncate_to_width(&label, width.saturating_sub(line.width()));
+        line.push_hit(
+            truncated,
+            if agents > 0 {
+                palette.teal
+            } else {
+                palette.overlay0
+            },
+            HitTarget::ProviderFilter(Some(provider.to_string())),
+        );
     }
     line.end(CellStyle::fg(palette.white))
 }
@@ -2041,6 +2107,32 @@ fn separator(palette: &Palette, width: usize) -> StyledLine {
     line
 }
 
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let ellipsis = "…";
+    if max_width <= ellipsis.width() {
+        return ellipsis.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    let limit = max_width - ellipsis.width();
+    for ch in text.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > limit {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    out.push_str(ellipsis);
+    out
+}
+
 /// 10-frame braille spinner used for agents in `Running` / `ToolRunning`
 /// state. Frame cadence is 120ms — the same period as the render tick in
 /// `apps/tui-rs/src/main.rs`,
@@ -2815,6 +2907,8 @@ mod tests {
     fn agent(agent: &str, status: AgentStatus, thread_name: Option<&str>) -> AgentEvent {
         AgentEvent {
             agent: agent.to_string(),
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             session: String::new(),
             status,
             ts: 0,
@@ -2829,6 +2923,8 @@ mod tests {
 
     fn session(name: &str, dir: &str, branch: &str) -> SessionData {
         SessionData {
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             name: name.to_string(),
             created_at: 0,
             dir: dir.to_string(),
@@ -2896,6 +2992,8 @@ mod tests {
     fn app_with_diff_stats() -> App {
         App::from_state(ServerState {
             sessions: vec![SessionData {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 name: "opensessions".to_string(),
                 created_at: 0,
                 dir: "/tmp/opensessions".to_string(),
@@ -3004,6 +3102,8 @@ mod tests {
         assert_eq!(
             compute_hit_target(&app, badge_x as u16, row, width, height),
             Some(HitTarget::AgentPane(AgentPaneTarget {
+                node_id: "local".to_string(),
+                provider_id: "tmux".to_string(),
                 session: "opensessions".to_string(),
                 agent: "amp".to_string(),
                 thread_id: Some("thread-1".to_string()),
@@ -3023,6 +3123,8 @@ mod tests {
         let mut app = app_from_sessions(vec![current]);
 
         app.activate_hit_target(HitTarget::AgentPane(AgentPaneTarget {
+            node_id: "local".to_string(),
+            provider_id: "tmux".to_string(),
             session: "opensessions".to_string(),
             agent: "amp".to_string(),
             thread_id: Some("thread-2".to_string()),
@@ -3034,6 +3136,8 @@ mod tests {
             app.drain_commands(),
             vec![
                 ClientCommand::SwitchSession {
+                    node_id: "local".to_string(),
+                    provider_id: "tmux".to_string(),
                     name: "opensessions".to_string(),
                     client_tty: None,
                 },

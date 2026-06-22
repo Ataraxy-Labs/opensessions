@@ -109,6 +109,8 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
                 build_local_links(ports.iter().copied(), input.portless_state.as_ref());
 
             SessionData {
+                node_id: provider.node_id().to_string(),
+                provider_id: provider.name().to_string(),
                 name: session.name,
                 created_at: session.created_at,
                 dir: session.dir,
@@ -193,5 +195,102 @@ fn format_uptime(now_secs: u64, created_at: u64) -> String {
         format!("{hours}h{mins}m")
     } else {
         format!("{mins}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mux::MuxSessionInfo;
+
+    struct FakeProvider {
+        node_id: &'static str,
+        name: &'static str,
+        sessions: Vec<MuxSessionInfo>,
+    }
+
+    impl MuxProvider for FakeProvider {
+        fn node_id(&self) -> &str {
+            self.node_id
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+            self.sessions.clone()
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+        fn get_session_dir(&self, _name: &str) -> String {
+            String::new()
+        }
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            1
+        }
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+        fn kill_session(&self, _name: &str) {}
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+        fn cleanup_hooks(&self) {}
+    }
+
+    #[test]
+    fn read_only_state_keeps_provider_identity_for_duplicate_session_names() {
+        let first = FakeProvider {
+            node_id: "macbook",
+            name: "default",
+            sessions: vec![session("work", 1)],
+        };
+        let second = FakeProvider {
+            node_id: "macbook",
+            name: "secondary",
+            sessions: vec![session("work", 2)],
+        };
+
+        let state = build_read_only_state(ReadOnlyStateInput {
+            providers: vec![&first, &second],
+            visible_session_names: None,
+            metadata_by_session: None,
+            git_by_session: None,
+            agent_state_by_session: None,
+            agents_by_session: None,
+            event_timestamps_by_session: None,
+            unseen_sessions: None,
+            ports_by_session: None,
+            portless_state: None,
+            focused_session: None,
+            current_session_override: None,
+            theme: None,
+            session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
+            collapsed_worktree_groups: Vec::new(),
+            sidebar_width: 30,
+            detail_panel_height: 10,
+            initializing: false,
+            init_label: None,
+            now_ms: 120_000,
+        });
+
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.sessions[0].node_id, "macbook");
+        assert_eq!(state.sessions[0].provider_id, "default");
+        assert_eq!(state.sessions[1].node_id, "macbook");
+        assert_eq!(state.sessions[1].provider_id, "secondary");
+    }
+
+    fn session(name: &str, created_at: u64) -> MuxSessionInfo {
+        MuxSessionInfo {
+            name: name.to_string(),
+            created_at,
+            dir: "/tmp".to_string(),
+            windows: 1,
+        }
     }
 }

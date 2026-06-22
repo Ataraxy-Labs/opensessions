@@ -18,6 +18,11 @@
 #   @opensessions-focus-global-key  ""   — optional no-prefix key to reveal and focus sidebar
 #   @opensessions-index-keys        ""   — optional no-prefix keys mapped to visible sessions 1..9
 #   @opensessions-width             deprecated — use config.json sidebarWidth or the in-sidebar width slider
+#   @opensessions-node-id           ""   — optional node id for sem-cloud/multi-server sync
+#   @opensessions-tmux-sockets      ""   — comma list like default=default,work=os-work
+#   @opensessions-cloud-url         ""   — sem-cloud base URL for snapshot sync
+#   @opensessions-cloud-api-key     ""   — sem-cloud API key for snapshot sync
+#   @opensessions-remote-attach-commands "" — comma list like node=ssh -t host tmux attach -t {session}
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$CURRENT_DIR/integrations/tmux-plugin/scripts"
@@ -50,6 +55,11 @@ get_option() {
 PREFIX_KEY=$(get_option "@opensessions-prefix-key" "o")
 FOCUS_GLOBAL_KEY=$(get_option "@opensessions-focus-global-key" "")
 INDEX_KEYS=$(get_option "@opensessions-index-keys" "")
+NODE_ID=$(get_option "@opensessions-node-id" "")
+TMUX_SOCKETS=$(get_option "@opensessions-tmux-sockets" "")
+CLOUD_URL=$(get_option "@opensessions-cloud-url" "")
+CLOUD_API_KEY=$(get_option "@opensessions-cloud-api-key" "")
+REMOTE_ATTACH_COMMANDS=$(get_option "@opensessions-remote-attach-commands" "")
 COMMAND_TABLE="opensessions"
 
 bind_global_key() {
@@ -72,6 +82,31 @@ bind_global_index_keys() {
 # Export so scripts can read them
 tmux set-environment -g OPENSESSIONS_DIR "$CURRENT_DIR"
 tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true
+if [ -n "$NODE_ID" ]; then
+  tmux set-environment -g OPENSESSIONS_NODE_ID "$NODE_ID"
+else
+  tmux set-environment -gu OPENSESSIONS_NODE_ID 2>/dev/null || true
+fi
+if [ -n "$TMUX_SOCKETS" ]; then
+  tmux set-environment -g OPENSESSIONS_TMUX_SOCKETS "$TMUX_SOCKETS"
+else
+  tmux set-environment -gu OPENSESSIONS_TMUX_SOCKETS 2>/dev/null || true
+fi
+if [ -n "$CLOUD_URL" ]; then
+  tmux set-environment -g OPENSESSIONS_CLOUD_URL "$CLOUD_URL"
+else
+  tmux set-environment -gu OPENSESSIONS_CLOUD_URL 2>/dev/null || true
+fi
+if [ -n "$CLOUD_API_KEY" ]; then
+  tmux set-environment -g OPENSESSIONS_CLOUD_API_KEY "$CLOUD_API_KEY"
+else
+  tmux set-environment -gu OPENSESSIONS_CLOUD_API_KEY 2>/dev/null || true
+fi
+if [ -n "$REMOTE_ATTACH_COMMANDS" ]; then
+  tmux set-environment -g OPENSESSIONS_REMOTE_ATTACH_COMMANDS "$REMOTE_ATTACH_COMMANDS"
+else
+  tmux set-environment -gu OPENSESSIONS_REMOTE_ATTACH_COMMANDS 2>/dev/null || true
+fi
 
 # --- Bootstrap: kill stale server if version or install path changed ---
 VERSION_FILE="${PID_FILE%.pid}.version"

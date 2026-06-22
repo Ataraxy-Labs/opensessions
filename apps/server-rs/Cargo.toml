@@ -11,14 +11,21 @@ path = "src/lib.rs"
 name = "opensessions-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "opensessions-bridge"
+path = "src/bridge.rs"
+
 [dependencies]
 opensessions-runtime = { path = "../../packages/runtime-rs" }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "macros", "sync", "time"] }
 tokio-websockets = { version = "0.13.2", default-features = false, features = ["server", "sha1_smol", "fastrand"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 sha1_smol = { version = "1", default-features = false }
+convex = "0.10.4"
+libc = "0.2"
 
 [dev-dependencies]
 http = "1"

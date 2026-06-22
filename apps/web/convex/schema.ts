@@ -66,4 +66,43 @@ export default defineSchema({
     result: v.optional(v.string()),
     createdAt: v.number(),
   }).index("by_inbox", ["account", "machineId", "status"]),
+
+  // Temporary hosted opensessions workspace relay. Each opensessions server
+  // publishes one full node snapshot; readers materialize a global graph.
+  opensessionsSnapshots: defineTable({
+    apiKey: v.string(),
+    nodeId: v.string(),
+    snapshot: v.any(),
+    updatedAt: v.number(),
+  })
+    .index("by_account", ["apiKey"])
+    .index("by_key", ["apiKey", "nodeId"]),
+
+  opensessionsUiState: defineTable({
+    apiKey: v.string(),
+    state: v.any(),
+    revision: v.number(),
+    updatedAt: v.number(),
+  }).index("by_account", ["apiKey"]),
+
+  opensessionsCommandIntents: defineTable({
+    apiKey: v.string(),
+    intentId: v.string(),
+    targetNodeId: v.string(),
+    action: v.string(),
+    providerId: v.optional(v.string()),
+    session: v.optional(v.string()),
+    payload: v.any(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("completed"),
+      v.literal("failed"),
+    ),
+    result: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_account", ["apiKey"])
+    .index("by_inbox", ["apiKey", "targetNodeId", "status"])
+    .index("by_intent", ["apiKey", "intentId"]),
 });

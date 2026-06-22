@@ -55,6 +55,26 @@ impl SessionOrder {
         let _ = self.save();
     }
 
+    pub fn set_hidden(&mut self, hidden: Vec<String>) {
+        if self.hidden == hidden {
+            return;
+        }
+        self.hidden = hidden;
+        let _ = self.save();
+    }
+
+    pub fn visible_order(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .filter(|name| !self.hidden.contains(*name))
+            .cloned()
+            .collect()
+    }
+
+    pub fn hidden_sessions(&self) -> Vec<String> {
+        self.hidden.clone()
+    }
+
     pub fn hide(&mut self, name: &str) {
         if !self.order.iter().any(|candidate| candidate == name)
             || self.hidden.iter().any(|candidate| candidate == name)

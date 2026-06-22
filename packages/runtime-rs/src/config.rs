@@ -35,6 +35,25 @@ pub struct OpensessionsConfig {
     pub detail_panel_height: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_nodes: Vec<SshNodeConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshNodeConfig {
+    pub node_id: String,
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
 }
 
 pub fn config_path_from_home(home: &Path) -> PathBuf {
@@ -99,6 +118,12 @@ fn update_map(updates: OpensessionsConfig) -> Map<String, Value> {
     insert_option(&mut map, "keybinding", updates.keybinding);
     insert_option(&mut map, "detailPanelHeight", updates.detail_panel_height);
     insert_option(&mut map, "sessionFilter", updates.session_filter);
+    if !updates.ssh_nodes.is_empty() {
+        map.insert(
+            "sshNodes".to_string(),
+            serde_json::to_value(updates.ssh_nodes).expect("ssh nodes serialize"),
+        );
+    }
 
     map
 }

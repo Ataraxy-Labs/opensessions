@@ -17,6 +17,23 @@ use crate::tmux_scripting::{
 const SEP: &str = "\t";
 const STASH_SESSION: &str = "_os_stash";
 
+fn shell_join(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            if word
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | ':'))
+            {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub exit_code: i32,
@@ -32,17 +49,29 @@ impl CommandOutput {
 
 pub trait CommandRunner: Send + Sync {
     fn run(&self, args: &[String]) -> CommandOutput;
+    fn command_words(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct StdCommandRunner {
     binary: String,
+    prefix_args: Vec<String>,
 }
 
 impl StdCommandRunner {
     pub fn new(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            prefix_args: Vec::new(),
+        }
+    }
+
+    pub fn with_prefix_args(binary: impl Into<String>, prefix_args: Vec<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            prefix_args,
         }
     }
 }
@@ -54,8 +83,17 @@ impl Default for StdCommandRunner {
 }
 
 impl CommandRunner for StdCommandRunner {
+    fn command_words(&self) -> Option<Vec<String>> {
+        let mut words = Vec::with_capacity(self.prefix_args.len() + 1);
+        words.push(self.binary.clone());
+        words.extend(self.prefix_args.clone());
+        Some(words)
+    }
+
     fn run(&self, args: &[String]) -> CommandOutput {
-        match Command::new(&self.binary).args(args).output() {
+        let mut command = Command::new(&self.binary);
+        command.args(&self.prefix_args).args(args);
+        match command.output() {
             Ok(output) => CommandOutput {
                 exit_code: output.status.code().unwrap_or(1),
                 stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -197,6 +235,25 @@ impl TmuxClient {
         }
         args.push("-t");
         args.push(target);
+        self.run(&args);
+    }
+
+    pub fn attach_session_command(&self, target: &str) -> Option<String> {
+        let mut words = self.runner.command_words()?;
+        words.push("attach-session".to_string());
+        words.push("-t".to_string());
+        words.push(target.to_string());
+        Some(shell_join(&words))
+    }
+
+    pub fn detach_client_and_run(&self, client_tty: Option<&str>, command: &str) {
+        let mut args = vec!["detach-client"];
+        if let Some(client_tty) = client_tty.filter(|value| !value.is_empty()) {
+            args.push("-t");
+            args.push(client_tty);
+        }
+        args.push("-E");
+        args.push(command);
         self.run(&args);
     }
 
@@ -379,6 +436,14 @@ impl TmuxClient {
         })
     }
 
+    pub fn get_client_size(&self, client_tty: Option<&str>) -> Option<(u32, u32)> {
+        let raw = self.display_for_client("#{client_width}\t#{client_height}", client_tty);
+        let mut parts = raw.split(SEP);
+        let width = parts.next()?.parse::<u32>().ok()?;
+        let height = parts.next()?.parse::<u32>().ok()?;
+        (width > 0 && height > 0).then_some((width, height))
+    }
+
     pub fn get_session_dir(&self, target: &str) -> String {
         self.display("#{pane_current_path}", Some(target))
     }
@@ -446,20 +511,34 @@ pub enum PaneScope<'a> {
 
 #[derive(Clone)]
 pub struct TmuxProvider {
+    node_id: String,
     name: String,
     client: TmuxClient,
 }
 
 impl TmuxProvider {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self::with_identity("local", "tmux", runner)
+    }
+
+    pub fn with_identity(
+        node_id: impl Into<String>,
+        name: impl Into<String>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Self {
         Self {
-            name: "tmux".to_string(),
+            node_id: node_id.into(),
+            name: name.into(),
             client: TmuxClient::new(runner),
         }
     }
 }
 
 impl MuxProvider for TmuxProvider {
+    fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -480,6 +559,14 @@ impl MuxProvider for TmuxProvider {
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
         self.client.switch_client(name, client_tty);
+    }
+
+    fn attach_session_command(&self, name: &str) -> Option<String> {
+        self.client.attach_session_command(name)
+    }
+
+    fn detach_client_and_run(&self, client_tty: Option<&str>, command: &str) {
+        self.client.detach_client_and_run(client_tty, command);
     }
 
     fn get_current_session(&self) -> Option<String> {
@@ -505,6 +592,10 @@ impl MuxProvider for TmuxProvider {
 
     fn get_client_tty(&self) -> String {
         self.client.get_client_tty()
+    }
+
+    fn get_client_size(&self, client_tty: Option<&str>) -> Option<(u32, u32)> {
+        self.client.get_client_size(client_tty)
     }
 
     fn create_session(&self, name: Option<&str>, dir: Option<&str>) {
@@ -698,6 +789,8 @@ impl MuxProvider for TmuxProvider {
                     status: detection.status.unwrap_or(AgentStatus::Idle),
                     thread_name: detection.thread_name,
                     agent,
+                    node_id: self.node_id.clone(),
+                    provider_id: self.name.clone(),
                     pane_id: pane.id,
                     active: pane.active,
                     thread_id: None,
@@ -720,6 +813,8 @@ impl MuxProvider for TmuxProvider {
                 });
                 let screen = detection.screen.as_ref();
                 AgentPaneDiagnostic {
+                    node_id: self.node_id.clone(),
+                    provider_id: self.name.clone(),
                     session: pane.session_name,
                     pane_id: pane.id,
                     window_id: pane.window_id,
