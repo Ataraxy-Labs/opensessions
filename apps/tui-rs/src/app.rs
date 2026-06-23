@@ -132,6 +132,7 @@ pub struct App {
     pub spinner_now: u64,
     pub session_filter: SessionFilterMode,
     pub provider_filter: Option<String>,
+    pub local_node_filter: bool,
     pub panel_focus: PanelFocus,
     pub agent_panel_scope: AgentPanelScope,
     pub focused_agent_idx: usize,
@@ -182,6 +183,7 @@ impl App {
             spinner_now: 0,
             session_filter: SessionFilterMode::All,
             provider_filter: None,
+            local_node_filter: false,
             panel_focus: PanelFocus::Sessions,
             agent_panel_scope: AgentPanelScope::Current,
             focused_agent_idx: 0,
@@ -238,6 +240,7 @@ impl App {
             spinner_now: 0,
             session_filter: state.session_filter.unwrap_or_default(),
             provider_filter: None,
+            local_node_filter: state.local_node_filter,
             panel_focus: PanelFocus::Sessions,
             agent_panel_scope: state.agent_panel_scope,
             focused_agent_idx: 0,
@@ -449,6 +452,7 @@ impl App {
                 theme,
                 session_filter,
                 provider_filter,
+                local_node_filter,
                 agent_panel_scope,
             } => {
                 self.server_state_query.observe_query_success(key, ts);
@@ -457,6 +461,7 @@ impl App {
                     theme,
                     session_filter,
                     provider_filter,
+                    local_node_filter,
                     agent_panel_scope,
                 );
             }
@@ -532,11 +537,13 @@ impl App {
         theme: Option<String>,
         session_filter: Option<SessionFilterMode>,
         provider_filter: Option<String>,
+        local_node_filter: bool,
         agent_panel_scope: AgentPanelScope,
     ) {
         self.theme = theme;
         self.session_filter = session_filter.unwrap_or_default();
         self.provider_filter = provider_filter;
+        self.local_node_filter = local_node_filter;
         self.apply_server_agent_panel_scope(agent_panel_scope);
         self.clamp_session_scroll_offset(0);
     }
@@ -943,6 +950,7 @@ impl App {
                 });
             }
             HitTarget::ProviderFilter(provider) => self.set_provider_filter_request(provider),
+            HitTarget::LocalNodeFilter(enabled) => self.set_local_node_filter_request(enabled),
             HitTarget::Agent(idx) => self.activate_agent_target(idx),
             HitTarget::AgentPane(target) => self.activate_agent_pane_target(target),
             HitTarget::AgentScopeToggle => self.toggle_agent_panel_scope(),
@@ -1408,6 +1416,7 @@ impl App {
                 .position(|provider| provider == current)
                 .and_then(|idx| providers.get(idx + 1).cloned()),
         };
+        self.local_node_filter = false;
         self.commands.push(ClientCommand::SetProviderFilter {
             provider: self.provider_filter.clone(),
         });
@@ -1417,11 +1426,22 @@ impl App {
 
     pub fn set_provider_filter_request(&mut self, provider: Option<String>) {
         self.provider_filter = provider;
+        self.local_node_filter = false;
         self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
         self.clamp_session_scroll_offset(0);
         self.commands.push(ClientCommand::SetProviderFilter {
             provider: self.provider_filter.clone(),
         });
+    }
+
+    pub fn set_local_node_filter_request(&mut self, enabled: bool) {
+        self.local_node_filter = enabled;
+        if enabled {
+            self.provider_filter = None;
+        }
+        self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
+        self.clamp_session_scroll_offset(0);
+        self.commands.push(ClientCommand::SetLocalNodeFilter { enabled });
     }
 
     fn clamp_session_scroll_offset(&mut self, viewport_rows: usize) {
@@ -1561,6 +1581,7 @@ mod tests {
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
+            local_node_filter: false,
             sidebar_width: 40,
             detail_panel_height,
             initializing: false,
@@ -1703,6 +1724,7 @@ mod tests {
                 theme: state.theme,
                 session_filter: state.session_filter,
                 provider_filter: None,
+                local_node_filter: state.local_node_filter,
                 agent_panel_scope: state.agent_panel_scope,
             },
             ts: state.ts,
@@ -1864,6 +1886,7 @@ mod tests {
                 theme: Some("dark".to_string()),
                 session_filter: Some(SessionFilterMode::Running),
                 provider_filter: Some("secondary".to_string()),
+                local_node_filter: false,
                 agent_panel_scope: AgentPanelScope::All,
             },
             ts: 50,

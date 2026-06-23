@@ -70,6 +70,7 @@ const PORT_POLL_INTERVAL_MS: u64 = 10_000;
 const ENABLE_JSONL_AGENT_WATCHERS: bool = true;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 const TMUX_STATE_POLL_MS: u64 = 2_000;
+const ACTIVE_BRIDGE_CLOUD_POLL_MS: u64 = 200;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
 const SIDEBAR_STAGGER_MS: u64 = 35;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
@@ -403,6 +404,8 @@ struct CloudWorkspaceUiState {
     #[serde(default)]
     provider_filter: Option<String>,
     #[serde(default)]
+    local_node_filter: Option<bool>,
+    #[serde(default)]
     session_filter: Option<String>,
     #[serde(default)]
     agent_panel_scope: Option<String>,
@@ -461,6 +464,7 @@ pub struct ReadOnlyMuxStateSource {
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     provider_filter: Mutex<Option<String>>,
+    local_node_filter: Mutex<bool>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
@@ -565,6 +569,7 @@ impl ReadOnlyMuxStateSource {
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
             provider_filter: Mutex::new(None),
+            local_node_filter: Mutex::new(false),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
@@ -759,6 +764,7 @@ impl ReadOnlyMuxStateSource {
             sidebar_visible: Some(sidebar_state.visible),
             focused_session: self.focused_session.lock().unwrap().clone(),
             provider_filter: self.provider_filter.lock().unwrap().clone(),
+            local_node_filter: Some(*self.local_node_filter.lock().unwrap()),
             session_filter: self
                 .session_filter
                 .lock()
@@ -894,6 +900,12 @@ impl ReadOnlyMuxStateSource {
             && self.provider_filter.lock().unwrap().is_some()
         {
             *self.provider_filter.lock().unwrap() = None;
+            changed.extend([ServerQueryKey::Settings, ServerQueryKey::Sessions]);
+        }
+        if let Some(local_node_filter) = ui_state.local_node_filter
+            && *self.local_node_filter.lock().unwrap() != local_node_filter
+        {
+            *self.local_node_filter.lock().unwrap() = local_node_filter;
             changed.extend([ServerQueryKey::Settings, ServerQueryKey::Sessions]);
         }
         if let Some(session_filter) = &ui_state.session_filter
@@ -1089,6 +1101,7 @@ impl ReadOnlyMuxStateSource {
             theme: self.theme.lock().unwrap().clone(),
             session_filter: *self.session_filter.lock().unwrap(),
             agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
+            local_node_filter: *self.local_node_filter.lock().unwrap(),
             collapsed_worktree_groups: self
                 .collapsed_worktree_groups
                 .lock()
@@ -1106,6 +1119,12 @@ impl ReadOnlyMuxStateSource {
             .sessions
             .extend(self.cloud_graph_cache.lock().unwrap().sessions.clone());
         apply_global_session_order(&mut state.sessions, &self.session_order.lock().unwrap());
+        if *self.local_node_filter.lock().unwrap() {
+            let local_node_ids = self.local_node_ids();
+            state
+                .sessions
+                .retain(|session| local_node_ids.contains(&session.node_id));
+        }
         state
     }
 
@@ -1183,6 +1202,7 @@ impl ReadOnlyMuxStateSource {
                     theme: self.theme.lock().unwrap().clone(),
                     session_filter: *self.session_filter.lock().unwrap(),
                     provider_filter: self.provider_filter.lock().unwrap().clone(),
+                    local_node_filter: *self.local_node_filter.lock().unwrap(),
                     agent_panel_scope: *self.agent_panel_scope.lock().unwrap(),
                 },
                 ts,
@@ -1271,8 +1291,19 @@ impl StateSource for ReadOnlyMuxStateSource {
                 shutdown.clone(),
             )));
         }
+        warm_registered_ssh_nodes_from_config();
         tasks.extend([
             tokio::spawn(run_sidebar_lifecycle_loop(
+                self.clone(),
+                state_updates.clone(),
+                shutdown.clone(),
+            )),
+            tokio::spawn(run_active_bridge_cloud_poll_loop(
+                self.clone(),
+                state_updates.clone(),
+                shutdown.clone(),
+            )),
+            tokio::spawn(run_convex_realtime_graph_loop(
                 self.clone(),
                 state_updates.clone(),
                 shutdown.clone(),
@@ -1342,6 +1373,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             "register-ssh-node" => {
                 let node = ssh_node_config_from_value(command)?;
                 persist_ssh_node(&node).ok()?;
+                warm_ssh_control_master(&node);
                 Some(self.invalidate_queries_json(vec![ServerQueryKey::Settings]))
             }
             "deregister-ssh-node" => {
@@ -1436,6 +1468,19 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .filter(|provider| !provider.is_empty())
                     .map(str::to_string);
                 *self.provider_filter.lock().unwrap() = provider;
+                *self.local_node_filter.lock().unwrap() = false;
+                self.mark_workspace_ui_updated();
+                Some(self.invalidate_queries_json(vec![
+                    ServerQueryKey::Sessions,
+                    ServerQueryKey::Settings,
+                ]))
+            }
+            "set-local-node-filter" => {
+                let enabled = command.get("enabled")?.as_bool()?;
+                *self.local_node_filter.lock().unwrap() = enabled;
+                if enabled {
+                    *self.provider_filter.lock().unwrap() = None;
+                }
                 self.mark_workspace_ui_updated();
                 Some(self.invalidate_queries_json(vec![
                     ServerQueryKey::Sessions,
@@ -2545,6 +2590,42 @@ async fn run_tmux_state_poll_loop(
     }
 }
 
+/// While a cross-node SSH bridge is active, return clicks are represented as
+/// cloud command intents that need to be observed by the origin node before the
+/// user's terminal can reattach locally. Poll that path quickly only during an
+/// active bridge so OVH→Mac feels immediate without increasing the steady-state
+/// tmux/snapshot poll load.
+async fn run_active_bridge_cloud_poll_loop(
+    source: Arc<ReadOnlyMuxStateSource>,
+    state_updates: broadcast::Sender<String>,
+    shutdown: broadcast::Sender<()>,
+) {
+    let mut shutdown_rx = shutdown.subscribe();
+    let mut interval =
+        tokio::time::interval(Duration::from_millis(ACTIVE_BRIDGE_CLOUD_POLL_MS));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            _ = interval.tick() => {
+                if !has_managed_ssh_bridge() {
+                    continue;
+                }
+                let changed_keys = sync_opensessions_graph_if_configured(&source).await;
+                if !changed_keys.is_empty() {
+                    let mut deduped_keys = Vec::new();
+                    for key in changed_keys {
+                        if !deduped_keys.contains(&key) {
+                            deduped_keys.push(key);
+                        }
+                    }
+                    let _ = state_updates.send(source.invalidate_queries_json(deduped_keys));
+                }
+            }
+        }
+    }
+}
+
 async fn publish_opensessions_snapshot_if_configured(
     source: &ReadOnlyMuxStateSource,
     state: &ServerState,
@@ -2696,7 +2777,6 @@ async fn sync_opensessions_graph_if_configured(
     else {
         return Vec::new();
     };
-    let local_node_ids = source.local_node_ids();
     let graph = match get_opensessions_graph(&base_url, &api_key).await {
         Ok(graph) => graph,
         Err(err) => {
@@ -2704,6 +2784,16 @@ async fn sync_opensessions_graph_if_configured(
             return Vec::new();
         }
     };
+    apply_opensessions_graph(source, graph, &base_url, &api_key).await
+}
+
+async fn apply_opensessions_graph(
+    source: &ReadOnlyMuxStateSource,
+    graph: OpensessionsGraphSnapshot,
+    base_url: &str,
+    api_key: &str,
+) -> Vec<ServerQueryKey> {
+    let local_node_ids = source.local_node_ids();
     let ui_state = graph.ui_state.clone();
     let command_intents = graph.command_intents.clone();
     let mut sessions = graph
@@ -2737,6 +2827,114 @@ async fn sync_opensessions_graph_if_configured(
         changed_keys.extend(source.apply_cloud_ui_state(ui_state));
     }
     changed_keys
+}
+
+async fn run_convex_realtime_graph_loop(
+    source: Arc<ReadOnlyMuxStateSource>,
+    state_updates: broadcast::Sender<String>,
+    shutdown: broadcast::Sender<()>,
+) {
+    let Some(base_url) = std::env::var("OPENSESSIONS_CLOUD_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(deployment_url) = convex_url_from_cloud_url(&base_url).map(str::to_string) else {
+        return;
+    };
+    let Some(api_key) = std::env::var("OPENSESSIONS_CLOUD_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let mut shutdown_rx = shutdown.subscribe();
+    loop {
+        let mut client = match ConvexClient::new(&deployment_url).await {
+            Ok(client) => client,
+            Err(err) => {
+                debug_log(format!("opensessions-convex realtime connect failed: {err}"));
+                tokio::select! {
+                    _ = shutdown_rx.recv() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                }
+            }
+        };
+        let mut subscription = match client
+            .subscribe(
+                "opensessions:getGraph",
+                BTreeMap::from([("apiKey".to_string(), api_key.clone().into())]),
+            )
+            .await
+        {
+            Ok(subscription) => subscription,
+            Err(err) => {
+                debug_log(format!("opensessions-convex realtime subscribe failed: {err}"));
+                tokio::select! {
+                    _ = shutdown_rx.recv() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                }
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => return,
+                result = subscription.next() => {
+                    let Some(result) = result else {
+                        debug_log("opensessions-convex realtime subscription ended");
+                        break;
+                    };
+                    let FunctionResult::Value(value) = result else {
+                        debug_log(format!("opensessions-convex realtime query error: {result:?}"));
+                        continue;
+                    };
+                    let json = convex_value_to_json(value);
+                    let Ok(graph) = serde_json::from_value::<OpensessionsGraphSnapshot>(json) else {
+                        debug_log("opensessions-convex realtime result decode failed");
+                        continue;
+                    };
+                    let changed_keys = apply_opensessions_graph(&source, graph, &base_url, &api_key).await;
+                    if !changed_keys.is_empty() {
+                        let mut deduped_keys = Vec::new();
+                        for key in changed_keys {
+                            if !deduped_keys.contains(&key) {
+                                deduped_keys.push(key);
+                            }
+                        }
+                        let _ = state_updates.send(source.invalidate_queries_json(deduped_keys));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn convex_value_to_json(value: ConvexValue) -> Value {
+    match value {
+        ConvexValue::Null => Value::Null,
+        ConvexValue::Int64(value) => Value::Number(serde_json::Number::from(value)),
+        ConvexValue::Float64(value) => serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        ConvexValue::Boolean(value) => Value::Bool(value),
+        ConvexValue::String(value) => Value::String(value),
+        ConvexValue::Bytes(value) => Value::Array(
+            value
+                .into_iter()
+                .map(|byte| Value::Number(serde_json::Number::from(byte)))
+                .collect(),
+        ),
+        ConvexValue::Array(values) => {
+            Value::Array(values.into_iter().map(convex_value_to_json).collect())
+        }
+        ConvexValue::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, convex_value_to_json(value)))
+                .collect(),
+        ),
+    }
 }
 
 async fn get_opensessions_graph(
@@ -3638,6 +3836,7 @@ fn query_data_from_state(key: ServerQueryKey, state: ServerState) -> ServerQuery
             theme: state.theme,
             session_filter: state.session_filter,
             provider_filter: None,
+            local_node_filter: state.local_node_filter,
             agent_panel_scope: state.agent_panel_scope,
         },
     }
@@ -4595,19 +4794,11 @@ fn ssh_attach_command(
     session_name: &str,
     client_size: Option<(u32, u32)>,
 ) -> String {
-    let mut words = vec!["ssh".to_string()];
-    if let Some(identity_file) = &node.identity_file {
-        words.extend(["-i".to_string(), shell_quote(identity_file)]);
-    }
-    if let Some(port) = node.port {
-        words.extend(["-p".to_string(), port.to_string()]);
-    }
+    let mut base_args = ssh_base_args(node);
+    let mut words = vec![base_args.remove(0)];
+    words.extend(base_args.into_iter().map(|arg| shell_quote(&arg)));
     words.push("-tt".to_string());
-    let destination = match &node.user {
-        Some(user) => format!("{user}@{}", node.host),
-        None => node.host.clone(),
-    };
-    words.push(shell_quote(&destination));
+    words.push(shell_quote(&ssh_destination(node)));
     let mut tmux = vec!["tmux".to_string()];
     if let Some(socket) = &node.tmux_socket {
         tmux.extend(["-L".to_string(), shell_quote(socket)]);
@@ -4624,6 +4815,96 @@ fn ssh_attach_command(
     );
     words.push(shell_quote(&remote_command));
     words.join(" ")
+}
+
+fn ssh_destination(node: &SshNodeConfig) -> String {
+    match &node.user {
+        Some(user) => format!("{user}@{}", node.host),
+        None => node.host.clone(),
+    }
+}
+
+fn ssh_base_args(node: &SshNodeConfig) -> Vec<String> {
+    let mut args = vec!["ssh".to_string()];
+    if let Some(identity_file) = &node.identity_file {
+        args.extend(["-i".to_string(), identity_file.clone()]);
+    }
+    if let Some(port) = node.port {
+        args.extend(["-p".to_string(), port.to_string()]);
+    }
+    args.extend([
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        "ControlPersist=10m".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={}", ssh_control_path(node).display()),
+        "-o".to_string(),
+        "ServerAliveInterval=15".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+    ]);
+    args
+}
+
+fn ssh_control_path(node: &SshNodeConfig) -> PathBuf {
+    let dir = PathBuf::from(format!("/tmp/oss-ssh-{}", process::id()));
+    dir.join(format!("{}.sock", sanitize_ssh_control_name(&node.node_id)))
+}
+
+fn sanitize_ssh_control_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "node".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn warm_registered_ssh_nodes_from_config() {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    for node in load_config_from_home(&home).ssh_nodes {
+        warm_ssh_control_master(&node);
+    }
+}
+
+fn warm_ssh_control_master(node: &SshNodeConfig) {
+    let node = node.clone();
+    std::thread::spawn(move || {
+        let control_path = ssh_control_path(&node);
+        if let Some(parent) = control_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut args = ssh_base_args(&node);
+        args.extend([
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=5".to_string(),
+            "-N".to_string(),
+            "-f".to_string(),
+            ssh_destination(&node),
+        ]);
+        let Some((program, rest)) = args.split_first() else {
+            return;
+        };
+        let status = process::Command::new(program).args(rest).status();
+        debug_log(format!(
+            "ssh-control-master warm node={} status={:?}",
+            node.node_id, status
+        ));
+    });
 }
 
 fn opensessions_managed_ssh_attach_command(
@@ -4710,6 +4991,19 @@ fn terminate_managed_ssh_bridges(return_command: Option<&str>) {
         }
         let _ = process::Command::new("kill").arg(pid.to_string()).status();
     }
+}
+
+fn has_managed_ssh_bridge() -> bool {
+    let state_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("opensessions-ssh-bridges");
+    let Ok(entries) = fs::read_dir(state_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.path().extension().and_then(|ext| ext.to_str()) == Some("pid")
+    })
 }
 
 fn enqueue_switch_intent_if_configured(
@@ -4994,6 +5288,7 @@ mod tests {
             theme: Some("dark".to_string()),
             session_filter: Some(SessionFilterMode::Running),
             agent_panel_scope: AgentPanelScope::All,
+            local_node_filter: true,
             sidebar_width: 44,
             detail_panel_height: 12,
             initializing: false,
@@ -5010,11 +5305,13 @@ mod tests {
                 theme,
                 session_filter,
                 provider_filter,
+                local_node_filter,
                 agent_panel_scope,
             } => {
                 assert_eq!(theme.as_deref(), Some("dark"));
                 assert_eq!(session_filter, Some(SessionFilterMode::Running));
                 assert_eq!(provider_filter, None);
+                assert!(local_node_filter);
                 assert_eq!(agent_panel_scope, AgentPanelScope::All);
             }
             other => panic!("expected settings query data, got {other:?}"),
@@ -5201,12 +5498,14 @@ mod tests {
             Some((186, 51)),
         );
 
-        assert!(command.starts_with(
-            "ssh -i /Users/me/.ssh/ovh-palani -p 2222 -tt ubuntu@148.113.49.189 '",
-        ));
-        assert!(command.contains(
-            "stty cols 186 rows 51",
-        ));
+        assert!(command.starts_with("ssh "));
+        assert!(command.contains("-i /Users/me/.ssh/ovh-palani"));
+        assert!(command.contains("-p 2222"));
+        assert!(command.contains("ControlMaster=auto"));
+        assert!(command.contains("ControlPersist=10m"));
+        assert!(command.contains("ControlPath="));
+        assert!(command.contains("-tt ubuntu@148.113.49.189"));
+        assert!(command.contains("stty cols 186 rows 51"));
         assert!(command.contains("TERM=xterm-256color exec tmux attach-session -t"));
         assert!(command.contains("plane preview"));
     }

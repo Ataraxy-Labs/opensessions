@@ -32,7 +32,7 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     install_signal_handlers();
     claim_foreground_tty();
-    reset_terminal(args.cols, args.rows);
+    reset_terminal(args.cols, args.rows, false);
     drain_terminal_input();
 
     let state_dir = env::var_os("XDG_RUNTIME_DIR")
@@ -67,7 +67,7 @@ fn run() -> Result<(), String> {
     };
 
     foreground_process_group(parent_pgrp);
-    reset_terminal(args.cols, args.rows);
+    reset_terminal(args.cols, args.rows, true);
     drain_terminal_input();
 
     let return_command = fs::read_to_string(&return_file).unwrap_or_default();
@@ -160,10 +160,13 @@ fn terminate_process_group(pgrp: libc::pid_t) {
     }
 }
 
-fn reset_terminal(cols: Option<u32>, rows: Option<u32>) {
+fn reset_terminal(cols: Option<u32>, rows: Option<u32>, clear_screen: bool) {
     print!(
-        "\u{000f}\u{001b}(B\u{001b})B\u{001b}[0m\u{001b}[?1l\u{001b}[?7h\u{001b}[?12l\u{001b}[?25h\u{001b}[?1000l\u{001b}[?1002l\u{001b}[?1003l\u{001b}[?1006l\u{001b}[?1015l\u{001b}[?1049l\u{001b}[2J\u{001b}[H"
+        "\u{000f}\u{001b}(B\u{001b})B\u{001b}[0m\u{001b}[?1l\u{001b}[?7h\u{001b}[?12l\u{001b}[?25h\u{001b}[?1000l\u{001b}[?1002l\u{001b}[?1003l\u{001b}[?1006l\u{001b}[?1015l\u{001b}[?1049l"
     );
+    if clear_screen {
+        print!("\u{001b}[2J\u{001b}[H");
+    }
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let _ = Command::new("stty").arg("sane").status();
     if let (Some(cols), Some(rows)) = (cols, rows) {

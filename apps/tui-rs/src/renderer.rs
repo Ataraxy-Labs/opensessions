@@ -28,6 +28,7 @@ pub enum HitTarget {
     Group(String),
     DiffCount(String),
     ProviderFilter(Option<String>),
+    LocalNodeFilter(bool),
     Agent(usize),
     AgentPane(AgentPaneTarget),
     AgentScopeToggle,
@@ -380,10 +381,16 @@ fn server_pills(app: &App, palette: &Palette, width: usize) -> StyledLine {
     }
 
     let mut line = StyledLine::blank();
-    if app.provider_filter.is_none() {
+    if app.provider_filter.is_none() && !app.local_node_filter {
         line.push_hit(" [all]", palette.blue, HitTarget::ProviderFilter(None));
     } else {
         line.push_hit(" all", palette.overlay0, HitTarget::ProviderFilter(None));
+    }
+    line.push("  ", palette.white);
+    if app.local_node_filter {
+        line.push_hit("[this]", palette.blue, HitTarget::LocalNodeFilter(false));
+    } else {
+        line.push_hit("this", palette.overlay0, HitTarget::LocalNodeFilter(true));
     }
     for (provider, sessions, agents) in providers {
         if line.width() >= width.saturating_sub(1) {
@@ -2955,6 +2962,7 @@ mod tests {
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
+            local_node_filter: false,
             sidebar_width: 40,
             detail_panel_height: 10,
             initializing: false,
@@ -3019,6 +3027,7 @@ mod tests {
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
+            local_node_filter: false,
             sidebar_width: 40,
             detail_panel_height: 10,
             initializing: false,
@@ -3276,6 +3285,7 @@ mod tests {
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
+            local_node_filter: false,
             sidebar_width: 40,
             detail_panel_height: 10,
             initializing: false,
@@ -3484,6 +3494,7 @@ mod tests {
             theme: None,
             session_filter: None,
             agent_panel_scope: AgentPanelScope::Current,
+            local_node_filter: false,
             sidebar_width: 40,
             detail_panel_height: 10,
             initializing: true,

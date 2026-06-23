@@ -84,6 +84,8 @@ pub enum ServerQueryData {
         theme: Option<String>,
         session_filter: Option<SessionFilterMode>,
         provider_filter: Option<String>,
+        #[serde(default)]
+        local_node_filter: bool,
         agent_panel_scope: AgentPanelScope,
     },
 }
@@ -114,6 +116,8 @@ pub struct ServerState {
     pub session_filter: Option<SessionFilterMode>,
     #[serde(default)]
     pub agent_panel_scope: AgentPanelScope,
+    #[serde(default)]
+    pub local_node_filter: bool,
     pub sidebar_width: u32,
     pub detail_panel_height: u32,
     pub initializing: bool,
@@ -452,6 +456,9 @@ pub enum ClientCommand {
     SetProviderFilter {
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+    },
+    SetLocalNodeFilter {
+        enabled: bool,
     },
     SetUiFocus {
         focus: ClientUiFocus,
