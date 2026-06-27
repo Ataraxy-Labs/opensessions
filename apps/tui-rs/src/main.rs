@@ -84,6 +84,12 @@ async fn main() -> Result<()> {
 
     let identity = pane_identity_resolve(|key| std::env::var(key).ok(), tmux_display_message);
 
+    // Popup mode: launched inside a transient `tmux display-popup` (see
+    // integrations/tmux-plugin/scripts/popup.sh).
+    let popup_mode = std::env::var("OPENSESSIONS_POPUP")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     debug_log(format!(
         "starting: connecting to ws://{server_host}:{server_port}/ identity={identity:?}"
     ));
@@ -99,19 +105,25 @@ async fn main() -> Result<()> {
     let hello = decode_server_message(first.as_payload())?;
     validate_hello(&hello).map_err(anyhow::Error::msg)?;
 
-    if let Some(RuntimePaneIdentity {
-        pane_id,
-        session_name,
-        window_id,
-    }) = identity.clone()
-    {
-        let command = ClientCommand::IdentifyPane {
+    // Only docked sidebars identify their pane: the server treats IdentifyPane
+    // as a docked-sidebar connection and resizes the pane to sidebar width. A
+    // transient popup must skip it, or it would shrink to sidebar width and
+    // leave the server believing a docked sidebar is visible.
+    if !popup_mode {
+        if let Some(RuntimePaneIdentity {
             pane_id,
             session_name,
             window_id,
-        };
-        ws.send(Message::text(encode_client_command(&command)?))
-            .await?;
+        }) = identity.clone()
+        {
+            let command = ClientCommand::IdentifyPane {
+                pane_id,
+                session_name,
+                window_id,
+            };
+            ws.send(Message::text(encode_client_command(&command)?))
+                .await?;
+        }
     }
 
     let mut terminal = TerminalGuard::enter()?;
@@ -250,6 +262,11 @@ async fn main() -> Result<()> {
                             });
                         }
                     }
+                    if app.should_close {
+                        // Popup close: FocusAgentPane etc. already sent above;
+                        // exit without firing /quit so the server keeps running.
+                        return Ok(());
+                    }
                     for launch in app.drain_launches() {
                         let target_session = launch
                             .session_name()
@@ -286,6 +303,9 @@ async fn main() -> Result<()> {
                     terminal.draw(app)?;
                     for command in app.drain_commands() {
                         send_or_queue_client_command(command, &mut ws, &mut pending_sidebar_width).await?;
+                    }
+                    if app.should_close {
+                        return Ok(());
                     }
                     for launch in app.drain_launches() {
                         let target_session = launch
@@ -331,6 +351,9 @@ async fn main() -> Result<()> {
                                     identity.window_id,
                                 );
                             }
+                            if popup_mode {
+                                new_app.enter_popup_mode();
+                            }
                             *slot = Some(new_app);
                         }
                         (Some(app), ServerMessage::State(state)) => {
@@ -358,7 +381,10 @@ async fn main() -> Result<()> {
                         }
                         if !startup_refocused {
                             startup_refocused = true;
-                            if let Some(identity) = identity.as_ref() {
+                            if popup_mode {
+                                // A popup is its own transient client; don't pull
+                                // focus back to the launching pane.
+                            } else if let Some(identity) = identity.as_ref() {
                                 do_startup_refocus(&identity.pane_id);
                             }
                         }
