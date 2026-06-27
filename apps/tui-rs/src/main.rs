@@ -381,11 +381,13 @@ async fn main() -> Result<()> {
                         }
                         if !startup_refocused {
                             startup_refocused = true;
-                            if popup_mode {
-                                // A popup is its own transient client; don't pull
-                                // focus back to the launching pane.
-                            } else if let Some(identity) = identity.as_ref() {
-                                do_startup_refocus(&identity.pane_id);
+                            // A popup is its own transient client, so skip the
+                            // startup refocus that would pull focus back to the
+                            // launching pane; only docked sidebars refocus.
+                            if !popup_mode {
+                                if let Some(identity) = identity.as_ref() {
+                                    do_startup_refocus(&identity.pane_id);
+                                }
                             }
                         }
                     }
