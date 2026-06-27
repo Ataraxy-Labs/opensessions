@@ -1018,7 +1018,8 @@ impl App {
         // In popup mode, selecting an agent jumps to its pane and closes.
         if self.popup_mode {
             self.should_close = true;
-        }    }
+        }
+    }
 
     pub fn dismiss_focused_agent(&mut self) {
         let agent_count = self.focused_agents_len();
