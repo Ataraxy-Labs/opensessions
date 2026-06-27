@@ -104,6 +104,10 @@ pub struct App {
     pub agent_panel_scope: AgentPanelScope,
     pub focused_agent_idx: usize,
     pub quit_deadline: Option<Instant>,
+    /// Running inside a transient `tmux display-popup`: quitting closes the
+    /// popup locally without tearing down the shared server.
+    pub popup_mode: bool,
+    pub should_close: bool,
     pub flash_target: Option<HitTarget>,
     pub flash_deadline: Option<Instant>,
     pub hover_target: Option<HitTarget>,
@@ -150,6 +154,8 @@ impl App {
             agent_panel_scope: state.agent_panel_scope,
             focused_agent_idx: 0,
             quit_deadline: None,
+            popup_mode: false,
+            should_close: false,
             flash_target: None,
             flash_deadline: None,
             hover_target: None,
@@ -174,6 +180,17 @@ impl App {
         };
         app.sidebar_focus = app.display_session_entries().first().map(entry_focus);
         app
+    }
+
+    /// Open on the all-sessions agent list so finished/running agents are
+    /// visible at a glance.
+    pub fn enter_popup_mode(&mut self) {
+        self.popup_mode = true;
+        self.agent_panel_scope = AgentPanelScope::All;
+        if self.focused_agents_len() > 0 {
+            self.panel_focus = PanelFocus::Agents;
+            self.focused_agent_idx = 0;
+        }
     }
 
     pub fn set_terminal_width(&mut self, width: u16) {
@@ -519,8 +536,12 @@ impl App {
                 }
             }
             'q' => {
-                self.commands.push(ClientCommand::Quit);
-                self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
+                if self.popup_mode {
+                    self.should_close = true;
+                } else {
+                    self.commands.push(ClientCommand::Quit);
+                    self.quit_deadline = Some(Instant::now() + Duration::from_millis(500));
+                }
             }
             'r' => self.commands.push(ClientCommand::Refresh),
             'n' | 'c' => self.commands.push(ClientCommand::NewSession),
@@ -660,10 +681,14 @@ impl App {
             AgentPanelScope::Current => AgentPanelScope::All,
             AgentPanelScope::All => AgentPanelScope::Current,
         };
-        self.pending_agent_panel_scope_intent = Some(self.agent_panel_scope);
-        self.commands.push(ClientCommand::SetAgentPanelScope {
-            scope: self.agent_panel_scope,
-        });
+        // The popup keeps its scope local, so skip the SetAgentPanelScope
+        // round-trip that would rewrite the shared server scope.
+        if !self.popup_mode {
+            self.pending_agent_panel_scope_intent = Some(self.agent_panel_scope);
+            self.commands.push(ClientCommand::SetAgentPanelScope {
+                scope: self.agent_panel_scope,
+            });
+        }
         self.focused_agent_idx = self
             .focused_agent_idx
             .min(self.focused_agents_len().saturating_sub(1));
@@ -935,6 +960,22 @@ impl App {
     }
 
     fn apply_server_agent_panel_scope(&mut self, server_scope: AgentPanelScope) {
+        // The popup keeps a purely local scope (see `toggle_agent_panel_scope`),
+        // so ignore the server's value here; just follow focus onto agents once
+        // they appear and clamp the index if the list shrank.
+        if self.popup_mode {
+            if self.panel_focus != PanelFocus::Agents && self.focused_agents_len() > 0 {
+                self.panel_focus = PanelFocus::Agents;
+                self.focused_agent_idx = 0;
+            }
+            self.focused_agent_idx = self
+                .focused_agent_idx
+                .min(self.focused_agents_len().saturating_sub(1));
+            if self.focused_agents_len() == 0 {
+                self.panel_focus = PanelFocus::Sessions;
+            }
+            return;
+        }
         if let Some(intent) = self.pending_agent_panel_scope_intent {
             if server_scope == intent {
                 self.pending_agent_panel_scope_intent = None;
@@ -974,6 +1015,10 @@ impl App {
             thread_name: target.thread_name,
             pane_id: target.pane_id,
         });
+        // In popup mode, selecting an agent jumps to its pane and closes.
+        if self.popup_mode {
+            self.should_close = true;
+        }
     }
 
     pub fn dismiss_focused_agent(&mut self) {
@@ -1631,6 +1676,86 @@ mod tests {
                 key: "/repo/worktrees".to_string(),
                 delta: 1,
             }]
+        );
+    }
+
+    fn state_with_one_agent() -> ServerState {
+        let mut state = empty_state(10);
+        let mut session = session("alpha", "/repo", false);
+        session.agents = vec![agent_without_pane("claude-code", AgentStatus::Done)];
+        state.sessions = vec![session];
+        state
+    }
+
+    #[test]
+    fn enter_popup_mode_focuses_agents_panel_with_all_scope() {
+        let mut app = App::from_state(state_with_one_agent());
+        app.enter_popup_mode();
+
+        assert!(app.popup_mode);
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+        assert_eq!(app.panel_focus, PanelFocus::Agents);
+    }
+
+    #[test]
+    fn popup_toggle_scope_is_local_and_survives_server_state_updates() {
+        let mut app = App::from_state(state_with_one_agent());
+        app.enter_popup_mode();
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+
+        app.toggle_agent_panel_scope();
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::Current);
+        assert!(
+            app.drain_commands()
+                .iter()
+                .all(|command| !matches!(command, ClientCommand::SetAgentPanelScope { .. })),
+            "popup scope toggle must not push SetAgentPanelScope"
+        );
+
+        let mut update = state_with_one_agent();
+        update.agent_panel_scope = AgentPanelScope::All;
+        app.apply_server_message(ServerMessage::State(update));
+
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::Current);
+    }
+
+    #[test]
+    fn popup_mode_focuses_agents_when_state_update_populates_them() {
+        let mut app = App::from_state(empty_state(10));
+        app.enter_popup_mode();
+        assert_eq!(app.panel_focus, PanelFocus::Sessions);
+
+        app.apply_server_message(ServerMessage::State(state_with_one_agent()));
+
+        assert_eq!(app.panel_focus, PanelFocus::Agents);
+        assert_eq!(app.focused_agent_idx, 0);
+        assert_eq!(app.agent_panel_scope, AgentPanelScope::All);
+    }
+
+    #[test]
+    fn popup_mode_quit_closes_locally_without_quit_command() {
+        let mut app = App::from_state(state_with_one_agent());
+        app.enter_popup_mode();
+
+        app.handle_key_char('q');
+
+        assert!(app.should_close);
+        assert!(app.quit_deadline.is_none());
+        assert!(app.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn popup_mode_selecting_agent_focuses_pane_and_closes() {
+        let mut app = App::from_state(state_with_one_agent());
+        app.enter_popup_mode();
+
+        app.activate_focused_item();
+
+        assert!(app.should_close);
+        assert!(
+            app.drain_commands()
+                .iter()
+                .any(|command| matches!(command, ClientCommand::FocusAgentPane { .. }))
         );
     }
 }

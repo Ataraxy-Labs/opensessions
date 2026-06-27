@@ -98,7 +98,13 @@ pub fn apply_ui_key(app: &mut App, key: UiKey) {
         }
         UiKey::Tab { shift } => app.handle_tab(shift),
         UiKey::Enter => app.activate_focused_item(),
-        UiKey::Esc => app.focus_sessions_panel(),
+        UiKey::Esc => {
+            if app.popup_mode {
+                app.should_close = true;
+            } else {
+                app.focus_sessions_panel();
+            }
+        }
         UiKey::Backspace => {}
         UiKey::Char(ch) => app.handle_key_char(ch),
     }

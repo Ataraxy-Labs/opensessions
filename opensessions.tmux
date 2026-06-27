@@ -45,6 +45,7 @@ get_option() {
 }
 
 PREFIX_KEY=$(get_option "@opensessions-prefix-key" "o")
+POPUP_KEY=$(get_option "@opensessions-popup-key" "g")
 FOCUS_GLOBAL_KEY=$(get_option "@opensessions-focus-global-key" "")
 INDEX_KEYS=$(get_option "@opensessions-index-keys" "")
 COMMAND_TABLE="opensessions"
@@ -96,6 +97,9 @@ if [ -n "$PREFIX_KEY" ]; then
   tmux bind-key -T "$COMMAND_TABLE" s run-shell "sh '$SCRIPTS_DIR/focus.sh'"
   tmux bind-key -T "$COMMAND_TABLE" t run-shell "sh '$SCRIPTS_DIR/toggle.sh'"
   tmux bind-key -T "$COMMAND_TABLE" e run-shell "sh '$SCRIPTS_DIR/even-horizontal.sh' '#{window_id}' '#{pane_id}'"
+  if [ -n "$POPUP_KEY" ]; then
+    tmux bind-key -T "$COMMAND_TABLE" "$POPUP_KEY" run-shell "sh '$SCRIPTS_DIR/popup.sh'"
+  fi
   for i in 1 2 3 4 5 6 7 8 9; do
     tmux bind-key -T "$COMMAND_TABLE" "$i" run-shell "sh '$SCRIPTS_DIR/switch-index.sh' $i"
   done
@@ -106,6 +110,10 @@ fi
 # Both are safe to send as text from terminal emulators without timing issues.
 tmux bind-key C-s run-shell "sh '$SCRIPTS_DIR/focus.sh'"
 tmux bind-key C-t run-shell "sh '$SCRIPTS_DIR/toggle.sh'"
+# Direct prefix binding for the floating agent-status popup (prefix + g).
+if [ -n "$POPUP_KEY" ]; then
+  tmux bind-key "$POPUP_KEY" run-shell "sh '$SCRIPTS_DIR/popup.sh'"
+fi
 for i in 1 2 3 4 5 6 7 8 9; do
   tmux bind-key "M-$i" run-shell "sh '$SCRIPTS_DIR/switch-index.sh' $i"
 done

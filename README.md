@@ -42,6 +42,8 @@ tmux source-file ~/.tmux.conf
 
 Open the sidebar with `prefix o → s`.
 
+Pop up a floating agent-status panel with `prefix + g` (or `prefix o → g`): a centered overlay listing agents across all sessions, then `Enter` to jump to one. It opens scoped to all sessions; press `a` to toggle between all sessions and just the focused one.
+
 TPM clones the repo into `~/.tmux/plugins/opensessions`. On first load, opensessions downloads the matching prebuilt release bundle into `bin/`; that bundle includes `opensessions-sidebar`, `opensessions-server`, and `lazydiff`.
 
 If your platform is unsupported or you are developing locally, you can still build from source:
