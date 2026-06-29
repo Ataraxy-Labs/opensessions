@@ -208,6 +208,25 @@ describe("tmux provider: focus-events forwarding", () => {
     expect(helperMatch![0]).toMatch(/p\.title !== SIDEBAR_PANE_TITLE/);
     expect(helperMatch![0]).toMatch(/tmux\.selectPane\(mainPane\.id\)/);
   });
+
+  test("new sidebar panes are reset and history-cleared after spawn", () => {
+    const spawnMatch = providerSrc.match(/spawnSidebar\([\s\S]*?\n  \}\n\n  hideSidebar/);
+    expect(spawnMatch).not.toBeNull();
+    const body = spawnMatch![0];
+    expect(body).toMatch(/tmux\.resetPane\(newPane\.id\)/);
+    expect(body).toMatch(/tmux\.clearPaneHistory\(newPane\.id\)/);
+  });
+});
+
+describe("TUI launcher: sidebar scrollback isolation", () => {
+  const startPath = resolve(__dirname, "../../../apps/tui/scripts/start.sh");
+  const startSrc = readFileSync(startPath, "utf-8");
+
+  test("clears only its own tmux pane history before starting OpenTUI", () => {
+    expect(startSrc).toMatch(/tmux send-keys -R -t "\$TMUX_PANE"/);
+    expect(startSrc).toMatch(/tmux clear-history -t "\$TMUX_PANE"/);
+    expect(startSrc).not.toMatch(/clear-history -t "?\$?window/i);
+  });
 });
 
 describe("tmux plugin: focus shortcut restore", () => {

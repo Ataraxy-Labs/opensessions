@@ -220,4 +220,14 @@ describe("TmuxClient", () => {
     ]);
     expect(pane?.id).toBe("%9");
   });
+
+  test("pane terminal reset and history clear use pane-scoped tmux commands", () => {
+    const custom = new TestTmuxClient();
+
+    custom.resetPane("%9");
+    custom.clearPaneHistory("%9");
+
+    expect(custom.calls[0]).toEqual(["send-keys", "-R", "-t", "%9"]);
+    expect(custom.calls[1]).toEqual(["clear-history", "-t", "%9"]);
+  });
 });

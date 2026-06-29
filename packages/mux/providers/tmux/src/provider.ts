@@ -235,6 +235,8 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     }
 
     tmux.setPaneTitle(newPane.id, SIDEBAR_PANE_TITLE);
+    tmux.resetPane(newPane.id);
+    tmux.clearPaneHistory(newPane.id);
     // Do NOT selectPane here for fresh spawns — the TUI's refocusMainPane()
     // handles it after terminal capability detection finishes. Refocusing
     // immediately causes capability query responses (DECRPM, DA1, Kitty

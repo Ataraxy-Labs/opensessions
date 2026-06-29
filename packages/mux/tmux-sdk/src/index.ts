@@ -359,6 +359,14 @@ export class TmuxClient {
     this.run(["kill-pane", "-t", target]);
   }
 
+  resetPane(target: string): void {
+    this.run(["send-keys", "-R", "-t", target]);
+  }
+
+  clearPaneHistory(target: string): void {
+    this.run(["clear-history", "-t", target]);
+  }
+
   resizePane(target: string, options: { width?: number; height?: number }): void {
     const args = ["resize-pane", "-t", target];
     if (options.width != null) args.push("-x", String(options.width));
