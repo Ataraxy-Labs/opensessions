@@ -185,6 +185,53 @@ describe("AgentTracker", () => {
     expect(tracker.getState("sess-1")).not.toBeNull();
   });
 
+  // --- hibernation ---
+
+  test("findHibernationCandidates returns old alive idle agents in inactive sessions", () => {
+    const oldTs = Date.now() - 7 * 60 * 60 * 1000;
+    tracker.applyEvent(event({ session: "sess-1", agent: "amp", threadId: "t1", threadName: "Old work", status: "done", ts: oldTs }));
+    tracker.applyPanePresence("sess-1", [{ agent: "amp", paneId: "%1" }]);
+
+    const candidates = tracker.findHibernationCandidates(Date.now(), 6 * 60 * 60 * 1000);
+
+    expect(candidates).toEqual([{
+      session: "sess-1",
+      agent: "amp",
+      threadId: "t1",
+      threadName: "Old work",
+      paneId: "%1",
+    }]);
+  });
+
+  test("findHibernationCandidates skips active sessions and running agents", () => {
+    const oldTs = Date.now() - 7 * 60 * 60 * 1000;
+    tracker.applyEvent(event({ session: "active", agent: "amp", threadId: "t1", status: "done", ts: oldTs }));
+    tracker.applyPanePresence("active", [{ agent: "amp", paneId: "%1" }]);
+    tracker.applyEvent(event({ session: "inactive", agent: "codex", threadId: "t2", status: "running", ts: oldTs }));
+    tracker.applyPanePresence("inactive", [{ agent: "codex", paneId: "%2" }]);
+    tracker.setActiveSessions(["active"]);
+
+    const candidates = tracker.findHibernationCandidates(Date.now(), 6 * 60 * 60 * 1000);
+
+    expect(candidates).toEqual([]);
+  });
+
+  test("markHibernated keeps the agent entry but clears live pane state", () => {
+    const oldTs = Date.now() - 7 * 60 * 60 * 1000;
+    tracker.applyEvent(event({ session: "sess-1", agent: "amp", threadId: "t1", status: "done", ts: oldTs }));
+    tracker.applyPanePresence("sess-1", [{ agent: "amp", paneId: "%1" }]);
+    const [candidate] = tracker.findHibernationCandidates(Date.now(), 6 * 60 * 60 * 1000);
+
+    expect(tracker.markHibernated(candidate!, 1234)).toBe(true);
+
+    const [agent] = tracker.getAgents("sess-1");
+    expect(agent!.status).toBe("hibernated");
+    expect(agent!.ts).toBe(1234);
+    expect(agent!.liveness).toBe("exited");
+    expect(agent!.paneId).toBeUndefined();
+    expect(agent!.unseen).toBeUndefined();
+  });
+
   // --- isUnseen ---
 
   test("isUnseen returns correct value", () => {

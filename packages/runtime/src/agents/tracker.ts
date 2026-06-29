@@ -12,9 +12,20 @@ const STATUS_PRIORITY: Record<string, number> = {
   stale: 4,
   interrupted: 3,
   waiting: 2,
+  hibernated: 1,
   done: 1,
   idle: 0,
 };
+
+const HIBERNATABLE_STATUSES = new Set(["idle", "done", "error", "interrupted", "stale"]);
+
+export interface HibernationCandidate {
+  session: string;
+  agent: string;
+  threadId?: string;
+  threadName?: string;
+  paneId: string;
+}
 
 export function instanceKey(agent: string, threadId?: string): string {
   return threadId ? `${agent}:${threadId}` : agent;
@@ -235,6 +246,46 @@ export class AgentTracker {
         this.instances.delete(session);
         changed = true;
       }
+    }
+    return changed;
+  }
+
+  findHibernationCandidates(now: number, idleAfterMs: number): HibernationCandidate[] {
+    const candidates: HibernationCandidate[] = [];
+    for (const [session, sessionInstances] of this.instances) {
+      if (this.active.has(session)) continue;
+      for (const event of sessionInstances.values()) {
+        if (event.liveness !== "alive" || !event.paneId) continue;
+        if (!HIBERNATABLE_STATUSES.has(event.status)) continue;
+        if (now - event.ts <= idleAfterMs) continue;
+        candidates.push({
+          session,
+          agent: event.agent,
+          threadId: event.threadId,
+          threadName: event.threadName,
+          paneId: event.paneId,
+        });
+      }
+    }
+    return candidates;
+  }
+
+  markHibernated(candidate: HibernationCandidate, ts = Date.now()): boolean {
+    const sessionInstances = this.instances.get(candidate.session);
+    if (!sessionInstances) return false;
+
+    let changed = false;
+    for (const [key, event] of sessionInstances) {
+      if (event.agent !== candidate.agent) continue;
+      if (event.paneId !== candidate.paneId) continue;
+      if (event.threadId !== candidate.threadId) continue;
+
+      event.status = "hibernated";
+      event.ts = ts;
+      event.liveness = "exited";
+      event.paneId = undefined;
+      this.unseenInstances.delete(this.unseenKey(candidate.session, key));
+      changed = true;
     }
     return changed;
   }

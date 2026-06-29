@@ -221,6 +221,7 @@ export const STATUS_COLORS: Record<AgentStatus, string> = {
   waiting: C.blue,
   interrupted: C.peach,
   stale: C.yellow,
+  hibernated: C.overlay1,
 };
 
 export const STATUS_ICONS: Record<AgentStatus, string> = {
@@ -232,4 +233,5 @@ export const STATUS_ICONS: Record<AgentStatus, string> = {
   waiting: "◉",
   interrupted: "⚠",
   stale: "⚠",
+  hibernated: "◌",
 };

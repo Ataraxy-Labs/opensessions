@@ -25,6 +25,8 @@ export interface OpensessionsConfig {
   detailPanelHeights?: Record<string, number>;
   /** Default session filter: "all" (default), "active" (any agent), "running" (running agents only) */
   sessionFilter?: SessionFilterMode;
+  /** Automatically stop idle live agent processes while keeping their session metadata visible. */
+  autoHibernate?: AutoHibernateConfig;
   /**
    * What to do when a sidebar pane is the only pane left in its window
    * (e.g. the user closed their last shell). Default "kill" matches tmux's
@@ -41,6 +43,26 @@ export interface OpensessionsConfig {
  * window. See `OpensessionsConfig.lonelySidebarPolicy`.
  */
 export type LonelySidebarPolicy = "kill" | "spawn-shell";
+
+export interface AutoHibernateConfig {
+  /** Defaults to true. Set false to disable idle agent hibernation. */
+  enabled?: boolean;
+  /** Idle age in milliseconds before an alive idle/terminal agent is hibernated. Defaults to 6 hours. */
+  idleAfterMs?: number;
+}
+
+export const DEFAULT_AUTO_HIBERNATE_IDLE_AFTER_MS = 6 * 60 * 60 * 1000;
+
+export function resolveAutoHibernateConfig(value: unknown): Required<AutoHibernateConfig> {
+  if (!value || typeof value !== "object") {
+    return { enabled: true, idleAfterMs: DEFAULT_AUTO_HIBERNATE_IDLE_AFTER_MS };
+  }
+  const raw = value as AutoHibernateConfig;
+  const idleAfterMs = typeof raw.idleAfterMs === "number" && Number.isFinite(raw.idleAfterMs) && raw.idleAfterMs > 0
+    ? raw.idleAfterMs
+    : DEFAULT_AUTO_HIBERNATE_IDLE_AFTER_MS;
+  return { enabled: raw.enabled !== false, idleAfterMs };
+}
 
 export const DEFAULT_LONELY_SIDEBAR_POLICY: LonelySidebarPolicy = "kill";
 

@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach } from "bun:test";
-import { loadConfig, type OpensessionsConfig } from "../src/config";
+import { loadConfig, resolveAutoHibernateConfig, type OpensessionsConfig } from "../src/config";
 import { resolveTheme, BUILTIN_THEMES, type Theme } from "../src/themes";
 import { resolve, join } from "path";
 
@@ -34,6 +34,20 @@ describe("Config", () => {
     expect(config.sidebarWidth).toBeUndefined();
     expect(config.sidebarPosition).toBeUndefined();
     expect(config.keybinding).toBeUndefined();
+  });
+
+  test("resolveAutoHibernateConfig defaults to enabled after six hours", () => {
+    expect(resolveAutoHibernateConfig(undefined)).toEqual({
+      enabled: true,
+      idleAfterMs: 6 * 60 * 60 * 1000,
+    });
+  });
+
+  test("resolveAutoHibernateConfig accepts explicit disable and timeout", () => {
+    expect(resolveAutoHibernateConfig({ enabled: false, idleAfterMs: 1000 })).toEqual({
+      enabled: false,
+      idleAfterMs: 1000,
+    });
   });
 
   test("loadConfig reads from config file", async () => {
@@ -156,7 +170,7 @@ describe("Themes", () => {
   });
 
   test("every builtin theme has all status colors", () => {
-    const statuses = ["idle", "running", "tool-running", "done", "error", "waiting", "interrupted", "stale"];
+    const statuses = ["idle", "running", "tool-running", "done", "error", "waiting", "interrupted", "stale", "hibernated"];
     for (const [name, theme] of Object.entries(BUILTIN_THEMES)) {
       for (const s of statuses) {
         expect(theme.status).toHaveProperty(s);

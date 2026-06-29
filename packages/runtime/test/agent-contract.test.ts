@@ -26,8 +26,9 @@ describe("Agent Contract", () => {
       "waiting",
       "interrupted",
       "stale",
+      "hibernated",
     ];
-    expect(statuses).toHaveLength(8);
+    expect(statuses).toHaveLength(9);
   });
 
   test("TERMINAL_STATUSES contains done, error, interrupted, stale", () => {
@@ -40,5 +41,6 @@ describe("Agent Contract", () => {
     expect(TERMINAL_STATUSES.has("running")).toBe(false);
     expect(TERMINAL_STATUSES.has("idle")).toBe(false);
     expect(TERMINAL_STATUSES.has("waiting")).toBe(false);
+    expect(TERMINAL_STATUSES.has("hibernated")).toBe(false);
   });
 });

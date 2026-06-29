@@ -25,7 +25,7 @@ import {
 } from "./sidebar-coordinator";
 import { isLastLiveOpensessionsInstance } from "./server-instance-scope";
 import { isAuthorizedToken, isLivenessProbe } from "./server-auth";
-import { loadConfig, resolveLonelySidebarPolicy, saveConfig } from "../config";
+import { loadConfig, resolveAutoHibernateConfig, resolveLonelySidebarPolicy, saveConfig } from "../config";
 import type { LonelySidebarPolicy, SessionFilterMode } from "../config";
 import {
   clampSidebarWidth,
@@ -46,7 +46,7 @@ import {
 } from "../shared";
 
 const VALID_AGENT_STATUSES = new Set<AgentStatus>([
-  "idle", "running", "tool-running", "done", "error", "waiting", "interrupted", "stale",
+  "idle", "running", "tool-running", "done", "error", "waiting", "interrupted", "stale", "hibernated",
 ]);
 
 // --- Debug logger ---
@@ -316,6 +316,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const lonelySidebarPolicy: LonelySidebarPolicy = resolveLonelySidebarPolicy(
     process.env.OPENSESSIONS_LONELY_SIDEBAR_POLICY?.trim() || config.lonelySidebarPolicy,
   );
+  const autoHibernate = resolveAutoHibernateConfig(config.autoHibernate);
   const sidebarCoordinator = createSidebarCoordinator({ width: initialSidebarWidth });
 
   // The sidebar launcher lives with the TUI app, not the tmux integration layer.
@@ -328,7 +329,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
   log("server", "config loaded", {
     sidebarWidth: initialSidebarWidth, sidebarPosition, scriptsDir,
-    theme: currentTheme, lonelySidebarPolicy, configKeys: Object.keys(config),
+    theme: currentTheme, lonelySidebarPolicy, autoHibernate, configKeys: Object.keys(config),
   });
 
   // Bootstrap active sessions
@@ -754,6 +755,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   function broadcastStateImmediate() {
     invalidateCurrentSessionCache();
     tracker.pruneStuck(STUCK_RUNNING_TIMEOUT_MS);
+    hibernateIdleAgentPanes();
     tracker.pruneTerminal();
     lastState = computeState();
     syncGitWatchers(lastState.sessions, broadcastState);
@@ -1596,6 +1598,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   const PANE_HIGHLIGHT_BORDER = "fg=#fab387,bold";
   const PANE_HIGHLIGHT_MS = 300;
   const pendingHighlightResets = new Map<string, ReturnType<typeof setTimeout>>();
+  const pendingHibernateEscalations = new Set<ReturnType<typeof setTimeout>>();
 
   /** Walk child processes (up to 3 levels) to find a process matching `name`, returning its PID. */
   function findChildPid(pid: string, name: string, depth = 0): string | undefined {
@@ -1834,6 +1837,56 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
 
     log("kill-agent-pane", "killing", { sessionName, agentName, paneId: targetPaneId });
     shell(["tmux", "kill-pane", "-t", targetPaneId]);
+  }
+
+  function hibernateAgentPane(paneId: string, agentName: string): boolean {
+    const panePid = shell(["tmux", "display-message", "-t", paneId, "-p", "#{pane_pid}"]);
+    if (!panePid) return false;
+
+    const patterns = agentName === "pi"
+      ? ["pi"]
+      : AGENT_TITLE_PATTERNS[agentName];
+    if (!patterns) return false;
+
+    const targetPid = patterns
+      .map((pattern) => findChildPid(panePid, pattern))
+      .find((pid): pid is string => !!pid);
+    if (!targetPid) return false;
+
+    log("hibernate", "terminating agent process", { paneId, agentName, pid: targetPid });
+    const result = Bun.spawnSync(["kill", "-TERM", targetPid], { stdout: "pipe", stderr: "pipe" });
+    if (result.exitCode !== 0) {
+      log("hibernate", "kill failed", { paneId, agentName, pid: targetPid, stderr: result.stderr.toString().slice(0, 200) });
+      return false;
+    }
+    const escalation = setTimeout(() => {
+      pendingHibernateEscalations.delete(escalation);
+      const alive = Bun.spawnSync(["kill", "-0", targetPid], { stdout: "pipe", stderr: "pipe" }).exitCode === 0;
+      if (!alive) return;
+      log("hibernate", "TERM ignored; escalating to KILL", { paneId, agentName, pid: targetPid });
+      Bun.spawnSync(["kill", "-KILL", targetPid], { stdout: "pipe", stderr: "pipe" });
+    }, 1_000);
+    pendingHibernateEscalations.add(escalation);
+    return true;
+  }
+
+  function hibernateIdleAgentPanes(): boolean {
+    if (!autoHibernate.enabled) return false;
+    const candidates = tracker.findHibernationCandidates(Date.now(), autoHibernate.idleAfterMs);
+    let changed = false;
+    for (const candidate of candidates) {
+      if (!hibernateAgentPane(candidate.paneId, candidate.agent)) continue;
+      if (tracker.markHibernated(candidate)) {
+        log("hibernate", "marked agent hibernated", {
+          session: candidate.session,
+          agent: candidate.agent,
+          threadId: candidate.threadId,
+          threadName: candidate.threadName,
+        });
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   // --- Pane agent scanning (detect agents running in current session panes) ---
@@ -2252,7 +2305,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // --- Port polling (detect new/stopped listeners every 10s) ---
 
   const PORT_POLL_INTERVAL_MS = 10_000;
+  const HIBERNATE_POLL_INTERVAL_MS = 5 * 60 * 1000;
   let portPollTimer: ReturnType<typeof setInterval> | null = null;
+  let hibernatePollTimer: ReturnType<typeof setInterval> | null = null;
 
   function startPortPoll() {
     // Run initial snapshot immediately so first broadcast has ports
@@ -2266,6 +2321,13 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     }, PORT_POLL_INTERVAL_MS);
   }
 
+  function startHibernatePoll() {
+    if (!autoHibernate.enabled) return;
+    hibernatePollTimer = setInterval(() => {
+      if (hibernateIdleAgentPanes()) broadcastState();
+    }, HIBERNATE_POLL_INTERVAL_MS);
+  }
+
   function cleanup() {
     for (const w of allWatchers) w.stop();
     if (watcherBroadcastTimer) clearTimeout(watcherBroadcastTimer);
@@ -2274,9 +2336,12 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
     clearClientResizeSyncTimer();
     clearProgrammaticAdjustmentTimer();
     if (portPollTimer) clearInterval(portPollTimer);
+    if (hibernatePollTimer) clearInterval(hibernatePollTimer);
     if (paneScanTimer) clearInterval(paneScanTimer);
     for (const timer of pendingHighlightResets.values()) clearTimeout(timer);
     pendingHighlightResets.clear();
+    for (const timer of pendingHibernateEscalations.values()) clearTimeout(timer);
+    pendingHibernateEscalations.clear();
     for (const watcher of gitHeadWatchers.values()) watcher.close();
     gitHeadWatchers.clear();
     if (idleTimer) clearTimeout(idleTimer);
@@ -2764,6 +2829,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   }
   broadcastState();
   startPortPoll();
+  startHibernatePoll();
   startPaneScan();
   // Run initial pane scan
   refreshPaneAgents();

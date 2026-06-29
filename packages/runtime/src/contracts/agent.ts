@@ -1,4 +1,4 @@
-export type AgentStatus = "idle" | "running" | "tool-running" | "done" | "error" | "waiting" | "interrupted" | "stale";
+export type AgentStatus = "idle" | "running" | "tool-running" | "done" | "error" | "waiting" | "interrupted" | "stale" | "hibernated";
 
 /** Whether the agent process is alive (pane exists) or has exited.
  *  "unknown" = watcher-only, no pane info available. */

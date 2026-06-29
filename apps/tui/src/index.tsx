@@ -1679,6 +1679,7 @@ function AgentListItem(props: AgentListItemProps) {
   const isUnseen = () => isTerminal() && props.agent.unseen === true;
 
   const icon = () => {
+    if (props.agent.status === "hibernated") return "◌";
     if (isUnseen()) return UNSEEN_ICON;
     if (isTerminal()) return props.agent.status === "done" ? "✓" : props.agent.status === "error" ? "✗" : "⚠";
     if (props.agent.status === "tool-running") return "⚙";
@@ -1700,6 +1701,7 @@ function AgentListItem(props: AgentListItemProps) {
   const statusText = () => {
     if (props.agent.status === "tool-running") return "tools";
     if (props.agent.status === "running") return "running";
+    if (props.agent.status === "hibernated") return "hibernated";
     // Alive + done = idle at prompt, not finished
     if (props.agent.status === "done" && props.agent.liveness === "alive") return "idle";
     if (props.agent.status === "done") return "done";
@@ -1825,6 +1827,7 @@ function SessionCard(props: SessionCardProps) {
     if (isUnseenTerminal()) return UNSEEN_ICON;
     if (s === "done") return "✓";
     if (s === "error") return "✗";
+    if (s === "hibernated") return "◌";
     if (s === "stale" || s === "interrupted") return "⚠";
     if (s === "tool-running") return "⚙";
     if (s === "running") return SPINNERS[props.spinIdx() % SPINNERS.length]!;
