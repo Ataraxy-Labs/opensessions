@@ -13,6 +13,15 @@ use crate::tmux_scripting::{
 const SEP: &str = "\t";
 const STASH_SESSION: &str = "_os_stash";
 
+// tmux hooks are arrays. Setting a hook without an array index (e.g.
+// `set-hook -g after-select-window '...'`) REPLACES the entire array,
+// wiping any elements other plugins installed at different indices. To
+// coexist with other plugins' hooks, opensessions writes every hook into
+// its own fixed array slot and only ever touches that slot. The index is
+// arbitrary but must be distinctive enough not to collide with another
+// plugin's chosen index.
+const HOOK_INDEX: u32 = 90210;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
     pub exit_code: i32,
@@ -396,7 +405,11 @@ impl TmuxClient {
     }
 
     pub fn set_global_hook(&self, name: &str, command: &str) {
-        let output = self.run(&["set-hook", "-g", name, command]);
+        // Write to our own array slot so we don't clobber other plugins'
+        // hooks on the same event. Re-running setup is idempotent because we
+        // always target the same index. See HOOK_INDEX.
+        let slot = format!("{name}[{HOOK_INDEX}]");
+        let output = self.run(&["set-hook", "-g", &slot, command]);
         if !output.ok() {
             eprintln!(
                 "opensessions: failed to install tmux hook {name}: status={} stderr={} command={command}",
@@ -406,7 +419,9 @@ impl TmuxClient {
     }
 
     pub fn unset_global_hook(&self, name: &str) {
-        self.run(&["set-hook", "-gu", name]);
+        // Only remove our own slot, leaving other plugins' elements intact.
+        let slot = format!("{name}[{HOOK_INDEX}]");
+        self.run(&["set-hook", "-gu", &slot]);
     }
 
     pub fn set_global_option(&self, name: &str, value: &str) {
