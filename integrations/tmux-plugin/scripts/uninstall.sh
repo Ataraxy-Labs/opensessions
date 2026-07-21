@@ -13,6 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "opensessions: uninstalling..."
 
 # --- Remove global hooks ---
+# Hooks are installed into a fixed array slot (see HOOK_INDEX in
+# tmux_provider.rs) so they coexist with other plugins' hooks. Unset only
+# that slot, not the whole array, to avoid wiping other plugins' hooks.
+HOOK_INDEX=90210
 for hook in \
   client-session-changed \
   session-created \
@@ -23,7 +27,7 @@ for hook in \
   after-kill-pane \
   pane-exited \
   after-resize-pane; do
-  tmux set-hook -gu "$hook" 2>/dev/null || true
+  tmux set-hook -gu "${hook}[${HOOK_INDEX}]" 2>/dev/null || true
 done
 echo "  ✓ removed global hooks"
 
