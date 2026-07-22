@@ -4,6 +4,9 @@ use crate::protocol::{AgentEvent, AgentLiveness, AgentStatus};
 
 const MAX_EVENT_TIMESTAMPS: usize = 30;
 const TERMINAL_PRUNE_MS: u64 = 5 * 60 * 1000;
+/// Unseen terminal entries stay longer so a finished agent's notification
+/// dot isn't reaped before the user had a chance to notice it.
+const UNSEEN_TERMINAL_PRUNE_MS: u64 = 30 * 60 * 1000;
 const SYNTHETIC_PANE_MARKER: &str = ":pane:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,33 +221,54 @@ impl AgentTracker {
         }
     }
 
-    pub fn prune_terminal(&mut self) {
+    /// Remove terminal-status entries (done/error/interrupted/stale) whose
+    /// pane is not known to be alive, after a TTL: `TERMINAL_PRUNE_MS` once
+    /// seen, `UNSEEN_TERMINAL_PRUNE_MS` while still unseen. Returns whether
+    /// anything was removed.
+    pub fn prune_terminal(&mut self) -> bool {
         let now = now_ms();
         let sessions = self.instances.keys().cloned().collect::<Vec<_>>();
+        let mut changed = false;
 
         for session in sessions {
             let unseen_instances = self.unseen_instances.clone();
+            let mut removed_keys = Vec::new();
             let mut empty = false;
             if let Some(session_instances) = self.instances.get_mut(&session) {
                 let keys = session_instances
                     .iter()
                     .filter(|(key, event)| {
-                        is_terminal_status(event.status)
-                            && !unseen_instances.contains(&format!("{session}\0{key}"))
-                            && event.liveness != Some(AgentLiveness::Alive)
-                            && now.saturating_sub(event.ts) > TERMINAL_PRUNE_MS
+                        if !is_terminal_status(event.status)
+                            || event.liveness == Some(AgentLiveness::Alive)
+                        {
+                            return false;
+                        }
+                        let ttl = if unseen_instances.contains(&format!("{session}\0{key}")) {
+                            UNSEEN_TERMINAL_PRUNE_MS
+                        } else {
+                            TERMINAL_PRUNE_MS
+                        };
+                        now.saturating_sub(event.ts) > ttl
                     })
                     .map(|(key, _)| key.clone())
                     .collect::<Vec<_>>();
                 for key in keys {
                     session_instances.remove(&key);
+                    removed_keys.push(key);
                 }
                 empty = session_instances.is_empty();
             }
             if empty {
                 self.instances.remove(&session);
             }
+            for key in removed_keys {
+                changed = true;
+                self.unseen_instances
+                    .remove(&self.unseen_key(&session, &key));
+            }
         }
+
+        changed
     }
 
     pub fn is_unseen(&self, session: &str) -> bool {
@@ -1219,5 +1243,69 @@ mod tests {
 
         assert!(tracker.is_unseen("work"));
         assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+    }
+
+    fn aged_terminal_event(session: &str, thread_id: &str, age_ms: u64) -> AgentEvent {
+        let mut event = event("pi", session, Some(thread_id), None);
+        event.status = AgentStatus::Done;
+        event.ts = now_ms().saturating_sub(age_ms);
+        event
+    }
+
+    #[test]
+    fn prune_terminal_removes_seen_terminal_entries_after_ttl() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(aged_terminal_event("work", "T-1", TERMINAL_PRUNE_MS + 1));
+        tracker.mark_seen("work");
+
+        assert!(tracker.prune_terminal());
+        assert!(tracker.get_agents("work").is_empty());
+    }
+
+    #[test]
+    fn prune_terminal_keeps_unseen_terminal_entries_within_grace_period() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(aged_terminal_event("work", "T-1", TERMINAL_PRUNE_MS + 1));
+
+        assert!(!tracker.prune_terminal());
+        assert_eq!(tracker.get_agents("work").len(), 1);
+    }
+
+    #[test]
+    fn prune_terminal_removes_unseen_terminal_entries_after_extended_ttl() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(aged_terminal_event(
+            "work",
+            "T-1",
+            UNSEEN_TERMINAL_PRUNE_MS + 1,
+        ));
+
+        assert!(tracker.prune_terminal());
+        assert!(tracker.get_agents("work").is_empty());
+        assert!(!tracker.is_unseen("work"));
+    }
+
+    #[test]
+    fn prune_terminal_keeps_entries_with_live_panes() {
+        let mut tracker = AgentTracker::new();
+        let mut event = aged_terminal_event("work", "T-1", UNSEEN_TERMINAL_PRUNE_MS + 1);
+        event.pane_id = Some("%7".to_string());
+        event.liveness = Some(AgentLiveness::Alive);
+        tracker.apply_event(event);
+        tracker.mark_seen("work");
+
+        assert!(!tracker.prune_terminal());
+        assert_eq!(tracker.get_agents("work").len(), 1);
+    }
+
+    #[test]
+    fn prune_terminal_keeps_non_terminal_entries() {
+        let mut tracker = AgentTracker::new();
+        let mut running = event("pi", "work", Some("T-1"), None);
+        running.ts = now_ms().saturating_sub(UNSEEN_TERMINAL_PRUNE_MS + 1);
+        tracker.apply_event(running);
+
+        assert!(!tracker.prune_terminal());
+        assert_eq!(tracker.get_agents("work").len(), 1);
     }
 }

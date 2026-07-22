@@ -37,8 +37,8 @@ impl PiRuntimeRegistry {
         self.by_pid.insert(info.pid, info);
     }
 
-    pub fn delete(&mut self, pid: u32) -> bool {
-        self.by_pid.remove(&pid).is_some()
+    pub fn delete(&mut self, pid: u32) -> Option<PiRuntimeInfo> {
+        self.by_pid.remove(&pid)
     }
 
     pub fn get(&mut self, pid: u32, now: u64) -> Option<PiRuntimeInfo> {
