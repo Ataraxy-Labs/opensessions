@@ -177,7 +177,7 @@ pub trait StateSource: Send + Sync + 'static {
         Err(PiRuntimeError::InvalidPayload)
     }
 
-    fn handle_pi_runtime_delete(&self, _body: &Value) -> Result<(), PiRuntimeError> {
+    fn handle_pi_runtime_delete(&self, _body: &Value) -> Result<Option<String>, PiRuntimeError> {
         Err(PiRuntimeError::MissingPid)
     }
 
@@ -633,6 +633,9 @@ impl StateSource for ReadOnlyMuxStateSource {
     fn snapshot_json(&self) -> String {
         self.sync_agent_pane_presence();
         self.mark_focused_agent_panes_seen();
+        // Reap terminal agent entries past their TTL so closed agents drop
+        // out of the agents tab without manual dismissal.
+        self.agent_tracker.lock().unwrap().prune_terminal();
 
         let providers = self
             .providers
@@ -886,6 +889,17 @@ impl StateSource for ReadOnlyMuxStateSource {
                 }
                 None
             }
+            "dismiss-agent" => {
+                let session = command.get("session")?.as_str()?;
+                let agent = command.get("agent")?.as_str()?;
+                let thread_id = command.get("threadId").and_then(Value::as_str);
+                let dismissed = self
+                    .agent_tracker
+                    .lock()
+                    .unwrap()
+                    .dismiss(session, agent, thread_id);
+                dismissed.then(|| self.snapshot_json())
+            }
             _ => None,
         }
     }
@@ -1022,14 +1036,27 @@ impl StateSource for ReadOnlyMuxStateSource {
         Ok(())
     }
 
-    fn handle_pi_runtime_delete(&self, body: &Value) -> Result<(), PiRuntimeError> {
+    fn handle_pi_runtime_delete(&self, body: &Value) -> Result<Option<String>, PiRuntimeError> {
         let pid = body
             .get("pid")
             .and_then(Value::as_u64)
             .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
             .ok_or(PiRuntimeError::MissingPid)? as u32;
-        self.pi_runtime_registry.lock().unwrap().delete(pid);
-        Ok(())
+        let removed = self.pi_runtime_registry.lock().unwrap().delete(pid);
+        let Some(info) = removed else {
+            return Ok(None);
+        };
+        // A clean pi exit is the authoritative "this agent is closed" signal;
+        // drop its tracker entry so the agents tab doesn't keep a ghost.
+        let dismissed = self
+            .resolve_session_for_dir(&info.cwd)
+            .is_some_and(|session| {
+                self.agent_tracker
+                    .lock()
+                    .unwrap()
+                    .dismiss(&session, "pi", Some(&info.session_id))
+            });
+        Ok(dismissed.then(|| self.snapshot_json()))
     }
 
     fn handle_http_text(&self, path: &str, body: &str) -> Option<String> {
@@ -1057,7 +1084,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                     .map(|name| activate_session_json(name, None))
                     .or_else(|| spawned.then(|| self.snapshot_json()))
             }
-            "/pane-exited" => {
+            "/pane-exited" | "/pane-died" => {
                 let fallback_sessions = self
                     .providers
                     .iter()
@@ -1075,7 +1102,10 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if self.is_sidebar_visible() {
                     self.enforce_sidebar_width(self.current_sidebar_width_u16());
                 }
-                None
+                // Re-sync agent pane presence and push the update immediately
+                // instead of waiting for the next poll tick (snapshot_json
+                // runs the presence sync and terminal pruning).
+                Some(self.snapshot_json())
             }
             "/pane-layout-changed" | "/client-resized" => {
                 if self.is_sidebar_visible() {
@@ -1237,35 +1267,37 @@ impl ReadOnlyMuxStateSource {
                 .map(|session| session.name.clone());
         }
 
+        self.resolve_session_for_dir(project_dir)
+    }
+
+    /// Resolve a project dir against every provider's session dirs.
+    fn resolve_session_for_dir(&self, project_dir: &str) -> Option<String> {
         let dir_session_map = build_dir_session_map(
-            sessions
-                .into_iter()
+            self.providers
+                .iter()
+                .flat_map(|provider| provider.list_sessions())
                 .map(|session| (session.name, session.dir)),
         );
         resolve_session_for_project_dir(project_dir, &dir_session_map)
     }
 
     fn resolve_agent_event_session(&self, body: &Value) -> Option<String> {
-        let sessions = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .collect::<Vec<_>>();
-
-        if let Some(project_dir) = body.get("projectDir").and_then(Value::as_str) {
-            let dir_session_map = build_dir_session_map(
-                sessions
-                    .iter()
-                    .map(|session| (session.name.clone(), session.dir.clone())),
-            );
-            if let Some(session) = resolve_session_for_project_dir(project_dir, &dir_session_map) {
-                return Some(session);
-            }
+        if let Some(project_dir) = body.get("projectDir").and_then(Value::as_str)
+            && let Some(session) = self.resolve_session_for_dir(project_dir)
+        {
+            return Some(session);
         }
 
         body.get("tmuxSession")
             .and_then(Value::as_str)
-            .filter(|tmux_session| sessions.iter().any(|session| session.name == *tmux_session))
+            .filter(|tmux_session| {
+                self.providers.iter().any(|provider| {
+                    provider
+                        .list_sessions()
+                        .iter()
+                        .any(|session| session.name == *tmux_session)
+                })
+            })
             .map(ToString::to_string)
     }
 
@@ -2638,21 +2670,27 @@ async fn handle_connection(
             let _ = stream.shutdown().await;
             return Ok(());
         };
-        if let Some(state_source) = &state_source
-            && let Err(err) = state_source.handle_pi_runtime_delete(&body)
-        {
-            let body = err.body();
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            let _ = stream.shutdown().await;
-            return Ok(());
+        if let Some(state_source) = &state_source {
+            match state_source.handle_pi_runtime_delete(&body) {
+                Ok(Some(payload)) => {
+                    let _ = state_updates.send(payload);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let body = err.body();
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
+                    let _ = stream.shutdown().await;
+                    return Ok(());
+                }
+            }
         }
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -2946,7 +2984,12 @@ fn is_metadata_path(path: &str) -> bool {
 fn is_ok_hook_path(path: &str) -> bool {
     matches!(
         path,
-        "/pane-exited" | "/pane-layout-changed" | "/client-resized" | "/ensure-sidebar" | "/toggle"
+        "/pane-exited"
+            | "/pane-died"
+            | "/pane-layout-changed"
+            | "/client-resized"
+            | "/ensure-sidebar"
+            | "/toggle"
     )
 }
 
@@ -3018,4 +3061,196 @@ fn clamp_detail_panel_height(height: u16) -> u16 {
 
 fn parse_command(message: &Message) -> Option<Value> {
     serde_json::from_str::<Value>(message.as_text()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opensessions_runtime::mux::MuxSessionInfo;
+
+    struct FakeProvider {
+        sessions: Vec<(&'static str, &'static str)>,
+    }
+
+    impl FakeProvider {
+        fn new(sessions: Vec<(&'static str, &'static str)>) -> Arc<Self> {
+            Arc::new(Self { sessions })
+        }
+    }
+
+    impl MuxProvider for FakeProvider {
+        fn name(&self) -> &str {
+            "tmux"
+        }
+
+        fn list_sessions(&self) -> Vec<MuxSessionInfo> {
+            self.sessions
+                .iter()
+                .map(|(name, dir)| MuxSessionInfo {
+                    name: (*name).to_string(),
+                    created_at: 0,
+                    dir: (*dir).to_string(),
+                    windows: 1,
+                })
+                .collect()
+        }
+
+        fn switch_session(&self, _name: &str, _client_tty: Option<&str>) {}
+
+        fn get_current_session(&self) -> Option<String> {
+            None
+        }
+
+        fn get_session_dir(&self, name: &str) -> String {
+            self.sessions
+                .iter()
+                .find(|(session, _)| *session == name)
+                .map(|(_, dir)| (*dir).to_string())
+                .unwrap_or_default()
+        }
+
+        fn get_pane_count(&self, _name: &str) -> u32 {
+            0
+        }
+
+        fn get_client_tty(&self) -> String {
+            String::new()
+        }
+
+        fn create_session(&self, _name: Option<&str>, _dir: Option<&str>) {}
+
+        fn kill_session(&self, _name: &str) {}
+
+        fn setup_hooks(&self, _server_host: &str, _server_port: u16) {}
+
+        fn cleanup_hooks(&self) {}
+    }
+
+    struct NoPorts;
+
+    impl PortCommandRunner for NoPorts {
+        fn process_rows(&self) -> Vec<(u32, u32)> {
+            Vec::new()
+        }
+
+        fn lsof_fields(&self) -> String {
+            String::new()
+        }
+    }
+
+    struct NoGit;
+
+    impl GitCommandRunner for NoGit {
+        fn git_info_output(&self, _dir: &str) -> String {
+            String::new()
+        }
+    }
+
+    fn source_with(providers: Vec<Arc<dyn MuxProvider>>) -> ReadOnlyMuxStateSource {
+        ReadOnlyMuxStateSource::new(providers)
+            .with_port_command_runner(Arc::new(NoPorts))
+            .with_git_command_runner(Arc::new(NoGit))
+            .with_now_ms(|| 0)
+    }
+
+    #[test]
+    fn dismiss_agent_command_removes_the_tracker_entry() {
+        let source = source_with(vec![FakeProvider::new(vec![("work", "/home/u/work")])]);
+
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "pi",
+                "status": "running",
+                "threadId": "T-1",
+                "projectDir": "/home/u/work",
+            }))
+            .expect("event resolves to the work session");
+        assert_eq!(
+            source
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .get_agents("work")
+                .len(),
+            1
+        );
+
+        let snapshot = source.handle_client_command(&serde_json::json!({
+            "type": "dismiss-agent",
+            "session": "work",
+            "agent": "pi",
+            "threadId": "T-1",
+        }));
+
+        assert!(snapshot.is_some());
+        assert!(
+            source
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .get_agents("work")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dismiss_agent_command_for_unknown_entry_is_a_no_op() {
+        let source = source_with(vec![FakeProvider::new(vec![("work", "/home/u/work")])]);
+
+        let snapshot = source.handle_client_command(&serde_json::json!({
+            "type": "dismiss-agent",
+            "session": "work",
+            "agent": "pi",
+            "threadId": "T-404",
+        }));
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn pi_runtime_delete_dismisses_the_tracked_agent() {
+        let source = source_with(vec![FakeProvider::new(vec![("work", "/home/u/work")])]);
+
+        source
+            .handle_pi_runtime_upsert(&serde_json::json!({
+                "pid": 4242,
+                "sessionId": "S-1",
+                "cwd": "/home/u/work",
+                "ts": 1,
+            }))
+            .expect("upsert");
+        source
+            .apply_agent_event(&serde_json::json!({
+                "agent": "pi",
+                "status": "running",
+                "threadId": "S-1",
+                "projectDir": "/home/u/work",
+            }))
+            .expect("event resolves to the work session");
+
+        let snapshot = source
+            .handle_pi_runtime_delete(&serde_json::json!({ "pid": 4242 }))
+            .expect("delete succeeds");
+
+        assert!(snapshot.is_some());
+        assert!(
+            source
+                .agent_tracker
+                .lock()
+                .unwrap()
+                .get_agents("work")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pi_runtime_delete_for_unknown_pid_is_a_no_op() {
+        let source = source_with(vec![FakeProvider::new(vec![("work", "/home/u/work")])]);
+
+        let snapshot = source
+            .handle_pi_runtime_delete(&serde_json::json!({ "pid": 999 }))
+            .expect("delete succeeds");
+
+        assert!(snapshot.is_none());
+    }
 }

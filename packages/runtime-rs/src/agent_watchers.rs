@@ -253,7 +253,7 @@ pub fn pi_snapshot_from_jsonl(
     }
 
     let idle_for = now_ms.saturating_sub(mtime_ms);
-    if status == AgentStatus::Running && idle_for >= STUCK_MS {
+    if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
         status = AgentStatus::Stale;
     }
 
@@ -327,7 +327,7 @@ pub fn droid_snapshot_from_jsonl(
     }
 
     let idle_for = now_ms.saturating_sub(mtime_ms);
-    if status == AgentStatus::Running && idle_for >= STUCK_MS {
+    if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
         status = AgentStatus::Stale;
     }
 
@@ -758,6 +758,20 @@ mod tests {
         assert_eq!(snapshot.thread_name.as_deref(), Some("Nice title"));
         assert_eq!(snapshot.last_user_prompt.as_deref(), Some("Follow up"));
         assert_eq!(snapshot.status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn pi_snapshot_stales_a_waiting_thread_after_idle_timeout() {
+        let raw = r#"
+{"type":"session","version":3,"id":"pi-session","cwd":"/repo"}
+{"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"Task"}]}}
+{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[{"type":"text","text":"Which option?"}]}}
+"#;
+        let waiting = pi_snapshot_from_jsonl("file", raw, 1_000, 1_100).expect("snapshot");
+        assert_eq!(waiting.status, AgentStatus::Waiting);
+
+        let stale = pi_snapshot_from_jsonl("file", raw, 1_000, 1_000 + STUCK_MS).expect("snapshot");
+        assert_eq!(stale.status, AgentStatus::Stale);
     }
 
     #[test]
