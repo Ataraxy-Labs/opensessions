@@ -439,7 +439,7 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
             // it here so callers don't need to thread dimensions through the
             // event loop.
             let (width, height) = terminal::size().unwrap_or((0, 0));
-            Some(UiMouse::Click {
+            Some(UiMouse::MouseDown {
                 x: mouse.column,
                 y: mouse.row,
                 width,
@@ -455,8 +455,15 @@ fn ui_mouse_from_crossterm(mouse: MouseEvent) -> Option<UiMouse> {
                 height,
             })
         }
-        MouseEventKind::Drag(MouseButton::Left) => Some(UiMouse::Drag { y: mouse.row }),
-        MouseEventKind::Up(MouseButton::Left) => Some(UiMouse::DragEnd),
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let (width, height) = terminal::size().unwrap_or((0, 0));
+            Some(UiMouse::Drag {
+                y: mouse.row,
+                width,
+                height,
+            })
+        }
+        MouseEventKind::Up(MouseButton::Left) => Some(UiMouse::MouseUp),
         _ => None,
     }
 }

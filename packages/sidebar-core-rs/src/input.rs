@@ -1,5 +1,7 @@
 use crate::app::{App, Modal, PanelFocus};
-use crate::renderer::{THEME_NAMES, compute_hit_target, detail_separator_row};
+use crate::renderer::{
+    THEME_NAMES, compute_hit_target, compute_session_drag_target, detail_separator_row,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiKey {
@@ -32,7 +34,7 @@ pub enum UiMouse {
         width: u16,
         height: u16,
     },
-    Click {
+    MouseDown {
         x: u16,
         y: u16,
         width: u16,
@@ -46,8 +48,10 @@ pub enum UiMouse {
     },
     Drag {
         y: u16,
+        width: u16,
+        height: u16,
     },
-    DragEnd,
+    MouseUp,
 }
 
 pub fn apply_ui_key(app: &mut App, key: UiKey) {
@@ -245,7 +249,7 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
                 app.scroll_sessions(1, session_rows);
             }
         }
-        UiMouse::Click {
+        UiMouse::MouseDown {
             x,
             y,
             width,
@@ -258,7 +262,9 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             }
 
             let target = compute_hit_target(app, x, y, width, height);
-            if let Some(target) = target {
+            if let Some(target) = target
+                && !app.begin_session_drag(target.clone())
+            {
                 app.activate_hit_target(target);
             }
         }
@@ -270,15 +276,18 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
         } => {
             app.set_hover_target(compute_hit_target(app, x, y, width, height));
         }
-        UiMouse::Drag { y } => {
+        UiMouse::Drag { y, width, height } => {
             if let Some((start_y, start_height)) = app.resize_drag_state {
                 let delta = start_y as i16 - y as i16;
                 let new_height = (start_height as i16 + delta).max(4) as usize;
                 app.set_detail_panel_height(new_height);
+            } else {
+                app.update_session_drag(compute_session_drag_target(app, y, width, height));
             }
         }
-        UiMouse::DragEnd => {
+        UiMouse::MouseUp => {
             app.resize_drag_state = None;
+            app.finish_session_drag();
         }
     }
 }

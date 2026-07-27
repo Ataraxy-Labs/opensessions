@@ -62,6 +62,13 @@ impl SidebarFocus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDragState {
+    pub source: SidebarFocus,
+    pub target: SidebarFocus,
+    pub moved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillTarget {
     Session(String),
     WorktreeGroup(String),
@@ -112,6 +119,7 @@ pub struct App {
     pub session_scroll_offset: usize,
     session_scroll_follows_focus: bool,
     pub resize_drag_state: Option<(u16, usize)>,
+    pub session_drag_state: Option<SessionDragState>,
     pub pending_switch_session: Option<String>,
     group_focus_surrogate_for: Option<String>,
     collapsed_worktree_groups: HashSet<String>,
@@ -160,6 +168,7 @@ impl App {
             session_scroll_offset: 0,
             session_scroll_follows_focus: true,
             resize_drag_state: None,
+            session_drag_state: None,
             pending_switch_session: None,
             group_focus_surrogate_for: None,
             collapsed_worktree_groups: state.collapsed_worktree_groups.into_iter().collect(),
@@ -257,6 +266,9 @@ impl App {
                 self.theme = state.theme;
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
+                if self.session_filter != SessionFilterMode::All {
+                    self.session_drag_state = None;
+                }
                 self.apply_server_agent_panel_scope(state.agent_panel_scope);
                 self.apply_server_detail_panel_height(state.detail_panel_height as usize);
                 self.collapsed_worktree_groups =
@@ -367,63 +379,70 @@ impl App {
         }
 
         let mut names = self
-            .display_sessions()
-            .into_iter()
+            .filtered_sessions()
             .map(|session| session.name.clone())
             .collect::<Vec<_>>();
-        match &entries[target_index as usize] {
+        let source_group = match &entries[index] {
             DisplaySessionEntry::Session {
-                session, indented, ..
-            } => {
-                let current = names.iter().position(|candidate| candidate == name)?;
-                if *indented && delta < 0 {
-                    let key = worktree_group_key(session)?;
-                    let group_indices = self
-                        .display_sessions()
-                        .into_iter()
-                        .filter_map(|session| {
-                            (worktree_group_key(session).as_deref() == Some(key.as_str()))
-                                .then(|| {
-                                    names
-                                        .iter()
-                                        .position(|candidate| candidate == &session.name)
-                                })
-                                .flatten()
-                        })
-                        .collect::<Vec<_>>();
-                    let name = names.remove(current);
-                    names.insert(group_indices.into_iter().min()?, name);
-                } else {
-                    let target = names
-                        .iter()
-                        .position(|candidate| candidate == &session.name)?;
-                    names.swap(current, target);
-                }
+                session,
+                indented: true,
+                ..
+            } => worktree_group_key(session),
+            DisplaySessionEntry::Session { .. } | DisplaySessionEntry::Group { .. } => None,
+        };
+        let target = &entries[target_index as usize];
+        let target_group = match target {
+            DisplaySessionEntry::Session {
+                session,
+                indented: true,
+                ..
+            } => worktree_group_key(session),
+            DisplaySessionEntry::Session { .. } => None,
+            DisplaySessionEntry::Group { key, .. } => Some(key.clone()),
+        };
+
+        if source_group.is_some() && source_group != target_group {
+            return None;
+        }
+
+        let current = names.iter().position(|candidate| candidate == name)?;
+        let moved_name = names.remove(current);
+        let insert_at = match target {
+            DisplaySessionEntry::Session { session, .. } if source_group.is_some() => {
+                let target = names
+                    .iter()
+                    .position(|candidate| candidate == &session.name)?;
+                if delta > 0 { target + 1 } else { target }
             }
-            DisplaySessionEntry::Group { key, .. } => {
-                let current = names.iter().position(|candidate| candidate == name)?;
-                let name = names.remove(current);
-                let group_indices = self
-                    .display_sessions()
-                    .into_iter()
-                    .filter_map(|session| {
-                        (worktree_group_key(session).as_deref() == Some(key.as_str()))
-                            .then(|| {
-                                names
-                                    .iter()
-                                    .position(|candidate| candidate == &session.name)
-                            })
-                            .flatten()
+            DisplaySessionEntry::Session { session, .. } if target_group.is_none() => {
+                let target = names
+                    .iter()
+                    .position(|candidate| candidate == &session.name)?;
+                if delta > 0 { target + 1 } else { target }
+            }
+            DisplaySessionEntry::Session { .. } | DisplaySessionEntry::Group { .. } => {
+                let key = target_group?;
+                let group_indices = names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, candidate)| {
+                        self.sessions
+                            .iter()
+                            .find(|session| session.name == *candidate)
+                            .and_then(worktree_group_key)
+                            .as_deref()
+                            .is_some_and(|candidate_key| candidate_key == key)
+                            .then_some(index)
                     })
                     .collect::<Vec<_>>();
-                let insert_at = if delta < 0 {
+                if delta < 0 {
                     group_indices.into_iter().min()?
                 } else {
                     group_indices.into_iter().max()?.saturating_add(1)
-                };
-                names.insert(insert_at.min(names.len()), name);
+                }
             }
-        }
+        };
+        names.insert(insert_at.min(names.len()), moved_name);
         Some(names)
     }
 
@@ -781,6 +800,153 @@ impl App {
 
     pub fn set_hover_target(&mut self, target: Option<HitTarget>) {
         self.hover_target = target;
+    }
+
+    pub fn begin_session_drag(&mut self, target: HitTarget) -> bool {
+        if self.session_filter != SessionFilterMode::All {
+            return false;
+        }
+        let Some(source) = sidebar_focus_from_hit_target(&target) else {
+            return false;
+        };
+        self.session_drag_state = Some(SessionDragState {
+            source: source.clone(),
+            target: source,
+            moved: false,
+        });
+        true
+    }
+
+    pub fn update_session_drag(&mut self, target: Option<HitTarget>) {
+        let target = target.as_ref().and_then(sidebar_focus_from_hit_target);
+        let target_is_valid = self
+            .session_drag_state
+            .as_ref()
+            .is_some_and(|state| self.is_valid_session_drag_target(&state.source, target.as_ref()));
+        let Some(state) = self.session_drag_state.as_mut() else {
+            return;
+        };
+        state.moved = true;
+        state.target = if target_is_valid {
+            target.unwrap_or_else(|| state.source.clone())
+        } else {
+            state.source.clone()
+        };
+    }
+
+    fn is_valid_session_drag_target(
+        &self,
+        source: &SidebarFocus,
+        target: Option<&SidebarFocus>,
+    ) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        let SidebarFocus::Session(_) = source else {
+            return true;
+        };
+        let Some(source_group) = self.display_group_for_focus(source) else {
+            return true;
+        };
+        self.display_group_for_focus(target).as_deref() == Some(source_group.as_str())
+    }
+
+    fn display_group_for_focus(&self, focus: &SidebarFocus) -> Option<String> {
+        self.display_session_entries()
+            .into_iter()
+            .find_map(|entry| match entry {
+                DisplaySessionEntry::Session {
+                    session,
+                    indented: true,
+                    ..
+                } if focus == &SidebarFocus::Session(session.name.clone()) => {
+                    worktree_group_key(session)
+                }
+                DisplaySessionEntry::Group { key, .. }
+                    if focus == &SidebarFocus::WorktreeGroup(key.clone()) =>
+                {
+                    Some(key)
+                }
+                _ => None,
+            })
+    }
+
+    pub fn finish_session_drag(&mut self) {
+        let Some(state) = self.session_drag_state.take() else {
+            return;
+        };
+        if self.session_filter != SessionFilterMode::All {
+            return;
+        }
+        if !state.moved {
+            self.activate_hit_target(hit_target_from_sidebar_focus(state.source));
+            return;
+        }
+        if state.source == state.target {
+            return;
+        }
+
+        match state.source {
+            SidebarFocus::Session(name) => {
+                let entries = self.display_session_entries();
+                let Some(source_index) = entries
+                    .iter()
+                    .position(|entry| entry_focus(entry) == SidebarFocus::Session(name.clone()))
+                else {
+                    return;
+                };
+                let Some(target_index) = entries
+                    .iter()
+                    .position(|entry| entry_focus(entry) == state.target)
+                else {
+                    return;
+                };
+                let delta = target_index as isize - source_index as isize;
+                if delta != 0
+                    && let Ok(delta) = i8::try_from(delta)
+                {
+                    self.commands
+                        .push(ClientCommand::ReorderSession { name, delta });
+                }
+            }
+            SidebarFocus::WorktreeGroup(key) => {
+                let blocks = self.session_order_blocks();
+                let Some(source_index) = blocks
+                    .iter()
+                    .position(|block| block.group_key.as_deref() == Some(key.as_str()))
+                else {
+                    return;
+                };
+                let target_index = blocks.iter().position(|block| match &state.target {
+                    SidebarFocus::Session(name) => block.names.contains(name),
+                    SidebarFocus::WorktreeGroup(target_key) => {
+                        block.group_key.as_deref() == Some(target_key.as_str())
+                    }
+                });
+                let Some(target_index) = target_index else {
+                    return;
+                };
+                let delta = target_index as isize - source_index as isize;
+                if delta != 0
+                    && let Ok(delta) = i8::try_from(delta)
+                {
+                    self.commands
+                        .push(ClientCommand::ReorderWorktreeGroup { key, delta });
+                }
+            }
+        }
+    }
+
+    pub fn is_session_drag_source(&self, focus: &SidebarFocus) -> bool {
+        self.session_drag_state
+            .as_ref()
+            .is_some_and(|state| &state.source == focus)
+    }
+
+    pub fn is_session_drag_target(&self, focus: &SidebarFocus) -> bool {
+        self.session_drag_state.as_ref().is_some_and(|state| {
+            state.moved && state.source != state.target && &state.target == focus
+        })
     }
 
     pub fn is_modal_open(&self) -> bool {
@@ -1163,6 +1329,9 @@ impl App {
             SessionFilterMode::Active => SessionFilterMode::Running,
             SessionFilterMode::Running => SessionFilterMode::All,
         };
+        if self.session_filter != SessionFilterMode::All {
+            self.session_drag_state = None;
+        }
         self.clamp_session_scroll_offset(0);
         self.commands.push(ClientCommand::SetFilter {
             filter: self.session_filter,
@@ -1312,6 +1481,21 @@ fn entry_focus(entry: &DisplaySessionEntry<'_>) -> SidebarFocus {
     match entry {
         DisplaySessionEntry::Session { session, .. } => SidebarFocus::Session(session.name.clone()),
         DisplaySessionEntry::Group { key, .. } => SidebarFocus::WorktreeGroup(key.clone()),
+    }
+}
+
+fn sidebar_focus_from_hit_target(target: &HitTarget) -> Option<SidebarFocus> {
+    match target {
+        HitTarget::Session(name) => Some(SidebarFocus::Session(name.clone())),
+        HitTarget::Group(key) => Some(SidebarFocus::WorktreeGroup(key.clone())),
+        _ => None,
+    }
+}
+
+fn hit_target_from_sidebar_focus(focus: SidebarFocus) -> HitTarget {
+    match focus {
+        SidebarFocus::Session(name) => HitTarget::Session(name),
+        SidebarFocus::WorktreeGroup(key) => HitTarget::Group(key),
     }
 }
 
@@ -1624,6 +1808,214 @@ mod tests {
         let mut app = App::from_state(state);
 
         app.reorder_focused_session(1);
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::ReorderWorktreeGroup {
+                key: "/repo/worktrees".to_string(),
+                delta: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn dragging_session_to_distant_target_emits_one_reorder_command() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("one", "/repo/one", false),
+            session("two", "/repo/two", false),
+            session("three", "/repo/three", false),
+        ];
+        let mut app = App::from_state(state);
+
+        assert!(app.begin_session_drag(HitTarget::Session("one".to_string())));
+        app.update_session_drag(Some(HitTarget::Session("three".to_string())));
+        app.finish_session_drag();
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::ReorderSession {
+                name: "one".to_string(),
+                delta: 2,
+            }]
+        );
+        assert_eq!(
+            app.reordered_session_names("one", 2),
+            Some(vec![
+                "two".to_string(),
+                "three".to_string(),
+                "one".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn reordering_session_preserves_collapsed_group_as_a_block() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("one", "/repo/one", false),
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+            session("two", "/repo/two", false),
+        ];
+        state.collapsed_worktree_groups = vec!["/repo/worktrees".to_string()];
+        let app = App::from_state(state);
+
+        assert_eq!(
+            app.reordered_session_names("one", 2),
+            Some(vec![
+                "feature-a".to_string(),
+                "feature-b".to_string(),
+                "two".to_string(),
+                "one".to_string(),
+            ])
+        );
+        assert_eq!(
+            app.reordered_session_names("one", 1),
+            Some(vec![
+                "feature-a".to_string(),
+                "feature-b".to_string(),
+                "one".to_string(),
+                "two".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn reordering_worktree_child_targets_exact_sibling() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+            session("feature-c", "/repo/worktrees/feature-c", true),
+        ];
+        let app = App::from_state(state);
+
+        assert_eq!(
+            app.reordered_session_names("feature-c", -1),
+            Some(vec![
+                "feature-a".to_string(),
+                "feature-c".to_string(),
+                "feature-b".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn reordering_worktree_child_outside_its_group_is_rejected() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+            session("docs", "/repo/docs", false),
+        ];
+        let app = App::from_state(state);
+
+        assert_eq!(app.reordered_session_names("feature-b", 1), None);
+    }
+
+    #[test]
+    fn invalid_drag_target_clears_the_last_valid_target() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+            session("docs", "/repo/docs", false),
+        ];
+        let mut app = App::from_state(state);
+
+        assert!(app.begin_session_drag(HitTarget::Session("feature-a".to_string())));
+        app.update_session_drag(Some(HitTarget::Session("feature-b".to_string())));
+        assert!(app.is_session_drag_target(&SidebarFocus::Session("feature-b".to_string())));
+
+        app.update_session_drag(Some(HitTarget::Session("docs".to_string())));
+        assert!(!app.is_session_drag_target(&SidebarFocus::Session("feature-b".to_string())));
+        app.finish_session_drag();
+
+        assert!(app.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn singleton_worktree_reorders_like_a_normal_session() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("docs", "/repo/docs", false),
+        ];
+        let app = App::from_state(state);
+
+        assert_eq!(
+            app.reordered_session_names("feature-a", 1),
+            Some(vec!["docs".to_string(), "feature-a".to_string()])
+        );
+    }
+
+    #[test]
+    fn releasing_session_without_drag_keeps_click_to_switch_behavior() {
+        let mut state = empty_state(10);
+        state.sessions = vec![session("one", "/repo/one", false)];
+        let mut app = App::from_state(state);
+
+        assert!(app.begin_session_drag(HitTarget::Session("one".to_string())));
+        app.finish_session_drag();
+
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "one".to_string(),
+                client_tty: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn filtered_session_list_does_not_start_drag_reordering() {
+        let mut state = empty_state(10);
+        state.sessions = vec![session("one", "/repo/one", false)];
+        state.session_filter = Some(SessionFilterMode::Active);
+        let mut app = App::from_state(state);
+
+        assert!(!app.begin_session_drag(HitTarget::Session("one".to_string())));
+        assert!(app.session_drag_state.is_none());
+    }
+
+    #[test]
+    fn changing_filter_cancels_drag_reordering() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("one", "/repo/one", false),
+            session("two", "/repo/two", false),
+        ];
+        let mut app = App::from_state(state);
+
+        assert!(app.begin_session_drag(HitTarget::Session("one".to_string())));
+        app.update_session_drag(Some(HitTarget::Session("two".to_string())));
+        app.cycle_filter();
+        app.finish_session_drag();
+
+        assert!(app.session_drag_state.is_none());
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SetFilter {
+                filter: SessionFilterMode::Active,
+            }]
+        );
+    }
+
+    #[test]
+    fn dragging_worktree_group_uses_visible_block_distance() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("main", "/repo/main", false),
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+            session("docs", "/repo/docs", false),
+        ];
+        let mut app = App::from_state(state);
+
+        assert!(app.begin_session_drag(HitTarget::Group("/repo/worktrees".to_string())));
+        app.update_session_drag(Some(HitTarget::Session("docs".to_string())));
+        app.finish_session_drag();
 
         assert_eq!(
             app.drain_commands(),

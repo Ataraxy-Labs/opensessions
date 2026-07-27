@@ -41,6 +41,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 - Pane count and window count per session
 - Session uptime display
 - Session ordering persisted across restarts
+- Drag-and-drop session and worktree-group ordering in the unfiltered session list
 
 ## Sidebar Management Features
 

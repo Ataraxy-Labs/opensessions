@@ -8,7 +8,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, DisplaySessionEntry, Modal};
+use crate::app::{App, DisplaySessionEntry, Modal, SidebarFocus};
 use crate::generated::protocol::{
     AgentEvent, AgentPanelScope, AgentStatus, MetadataTone, SessionData,
 };
@@ -59,6 +59,19 @@ pub fn compute_hit_target(app: &App, x: u16, y: u16, width: u16, height: u16) ->
     let model = build_model(app, width as usize, height as usize);
     let line = model.lines.get(y as usize)?;
     line.hit_at(x as usize).or_else(|| line.hit.clone())
+}
+
+pub fn compute_session_drag_target(
+    app: &App,
+    y: u16,
+    width: u16,
+    height: u16,
+) -> Option<HitTarget> {
+    let model = build_model(app, width as usize, height as usize);
+    match model.lines.get(y as usize)?.hit.clone()? {
+        target @ (HitTarget::Session(_) | HitTarget::Group(_)) => Some(target),
+        _ => None,
+    }
 }
 
 pub fn detail_separator_row(app: &App, width: u16, height: u16) -> u16 {
@@ -595,6 +608,8 @@ fn build_group_row(
     width: usize,
 ) -> StyledLine {
     let hit = HitTarget::Group(key.to_string());
+    let drag_focus = SidebarFocus::WorktreeGroup(key.to_string());
+    let drag_source = app.is_session_drag_source(&drag_focus);
     let focused =
         app.panel_focus == crate::app::PanelFocus::Sessions && app.focused_group_key() == Some(key);
     let active_surrogate = collapsed
@@ -606,7 +621,14 @@ fn build_group_row(
             .as_deref()
             == Some(key);
     let flashed = app.active_flash_target() == Some(&hit);
-    let bg = (focused || flashed).then_some(palette.surface1);
+    let drag_target = app.is_session_drag_target(&drag_focus);
+    let bg = if drag_target {
+        Some(palette.surface2)
+    } else if drag_source {
+        Some(palette.surface1)
+    } else {
+        (focused || flashed).then_some(palette.surface1)
+    };
 
     let mut row = StyledLine::with_bg(bg);
     let marker_color = if active_surrogate {
@@ -614,7 +636,9 @@ fn build_group_row(
     } else {
         palette.lavender
     };
-    let marker = if active_surrogate {
+    let marker = if drag_target {
+        "↕"
+    } else if active_surrogate {
         "▌"
     } else if focused {
         "›"
@@ -770,9 +794,18 @@ fn build_session_name_row(
     width: usize,
 ) -> StyledLine {
     let index = idx;
+    let drag_focus = SidebarFocus::Session(session.name.clone());
+    let drag_source = app.is_session_drag_source(&drag_focus);
+    let drag_target = app.is_session_drag_target(&drag_focus);
     let focused = app.focused_session_name() == Some(session.name.as_str());
     let current = app.current_session.as_deref() == Some(session.name.as_str());
-    let bg = focused.then_some(palette.surface1);
+    let bg = if drag_target {
+        Some(palette.surface2)
+    } else if drag_source {
+        Some(palette.surface1)
+    } else {
+        focused.then_some(palette.surface1)
+    };
     let index_color = if focused {
         palette.subtext0
     } else {
@@ -788,7 +821,11 @@ fn build_session_name_row(
 
     let hit = HitTarget::Session(session.name.clone());
     let flashed = app.active_flash_target() == Some(&hit);
-    let bg = if flashed { Some(palette.surface1) } else { bg };
+    let bg = if flashed && !drag_target {
+        Some(palette.surface1)
+    } else {
+        bg
+    };
 
     let mut row = StyledLine::with_bg(bg);
     let marker_color = if current {
@@ -796,7 +833,9 @@ fn build_session_name_row(
     } else {
         palette.lavender
     };
-    let marker = if current {
+    let marker = if drag_target {
+        "↕"
+    } else if current {
         "▌"
     } else if focused {
         "›"
@@ -1016,11 +1055,24 @@ fn build_session_detail_row(
     tree: TreePosition,
     width: usize,
 ) -> StyledLine {
+    let drag_focus = SidebarFocus::Session(session.name.clone());
+    let drag_source = app.is_session_drag_source(&drag_focus);
+    let drag_target = app.is_session_drag_target(&drag_focus);
     let focused = app.focused_session_name() == Some(session.name.as_str());
-    let bg = focused.then_some(palette.surface1);
+    let bg = if drag_target {
+        Some(palette.surface2)
+    } else if drag_source {
+        Some(palette.surface1)
+    } else {
+        focused.then_some(palette.surface1)
+    };
     let hit = HitTarget::Session(session.name.clone());
     let flashed = app.active_flash_target() == Some(&hit);
-    let bg = if flashed { Some(palette.surface1) } else { bg };
+    let bg = if flashed && !drag_target {
+        Some(palette.surface1)
+    } else {
+        bg
+    };
     let has_ports = !session.ports.is_empty();
     let has_diff_stats = session.insertions > 0 || session.deletions > 0;
     let detail_text = if !session.branch.is_empty() {
@@ -3021,6 +3073,11 @@ mod tests {
                 thread_name: Some("Review PR".to_string()),
                 pane_id: Some("%7".to_string()),
             }))
+        );
+        assert_eq!(
+            compute_session_drag_target(&app, row, width, height),
+            Some(HitTarget::Session("opensessions".to_string())),
+            "drag hit-testing should use the session row even over a nested badge"
         );
     }
 
