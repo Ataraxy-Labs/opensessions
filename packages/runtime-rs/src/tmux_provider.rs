@@ -180,6 +180,101 @@ impl TmuxClient {
         self.run(&args);
     }
 
+    /// Pre-size the destination session's active window (and its sidebar
+    /// pane) to the switching client's current window size before
+    /// `switch-client` attaches it. With `window-size latest`, attaching a
+    /// window last viewed at a different client size rescales every pane
+    /// proportionally, ballooning the sidebar for a visible frame until the
+    /// width-repair hook snaps it back. Resizing before the switch keeps all
+    /// of that off-screen. Returns the resized window id so the caller can
+    /// restore automatic size tracking after the switch (`resize-window`
+    /// pins the window to `window-size manual`).
+    pub fn presize_window_for_switch(
+        &self,
+        target_session: &str,
+        client_tty: Option<&str>,
+    ) -> Option<String> {
+        let clients = self.list_clients();
+        let client = match client_tty {
+            Some(tty) => clients.iter().find(|client| client.tty == tty),
+            None => clients.first(),
+        }?;
+        if client.session_name == target_session {
+            return None;
+        }
+        let source_session = client.session_name.clone();
+        let output = self.run(&[
+            "list-windows",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_id}\t#{window_width}\t#{window_height}\t#{window_active}",
+        ]);
+        if !output.ok() {
+            return None;
+        }
+        let mut source_size: Option<(u16, u16)> = None;
+        let mut destination: Option<(String, u16, u16)> = None;
+        for line in output.stdout.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 5 || parts[4] != "1" {
+                continue;
+            }
+            let (Ok(width), Ok(height)) = (parts[2].parse::<u16>(), parts[3].parse::<u16>())
+            else {
+                continue;
+            };
+            if parts[0] == source_session {
+                source_size = Some((width, height));
+            }
+            if parts[0] == target_session {
+                destination = Some((parts[1].to_string(), width, height));
+            }
+        }
+        let (source_width, source_height) = source_size?;
+        let (dest_window, dest_width, dest_height) = destination?;
+        if (dest_width, dest_height) == (source_width, source_height) {
+            return None;
+        }
+        self.run(&[
+            "resize-window",
+            "-t",
+            &dest_window,
+            "-x",
+            &source_width.to_string(),
+            "-y",
+            &source_height.to_string(),
+        ]);
+        // The rescale redistributed pane widths; put the sidebar back before
+        // the window becomes visible.
+        if let Some(width) = self.sidebar_width_option() {
+            if let Some(sidebar) = self
+                .list_panes(PaneScope::Window(&dest_window))
+                .into_iter()
+                .find(|pane| pane.title == "opensessions-sidebar")
+            {
+                if sidebar.width != width {
+                    self.resize_pane_width(&sidebar.id, width);
+                }
+            }
+        }
+        Some(dest_window)
+    }
+
+    /// Revert a window pinned by `resize-window` back to the global
+    /// `window-size` tracking. Run after the switch, when the recomputed
+    /// size equals the one we just set, so this is never a visible resize.
+    pub fn restore_window_size_tracking(&self, window_id: &str) {
+        self.run(&["set-window-option", "-t", window_id, "-u", "window-size"]);
+    }
+
+    fn sidebar_width_option(&self) -> Option<u16> {
+        let output = self.run(&["show-option", "-gqv", "@opensessions_width"]);
+        if !output.ok() {
+            return None;
+        }
+        output.stdout.trim().parse::<u16>().ok()
+    }
+
     pub fn select_sidebar_pane_for_session(&self, session_name: &str) {
         let Some(window_id) = self
             .list_windows()
@@ -463,7 +558,11 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
+        let presized = self.client.presize_window_for_switch(name, client_tty);
         self.client.switch_client(name, client_tty);
+        if let Some(window_id) = presized {
+            self.client.restore_window_size_tracking(&window_id);
+        }
     }
 
     fn get_current_session(&self) -> Option<String> {
@@ -1064,6 +1163,129 @@ mod tests {
                 "-p".to_string(),
                 "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}".to_string(),
             ],
+        );
+    }
+
+    /// Per-command scripted outputs, recording every call.
+    struct ScriptedRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+        outputs: std::collections::HashMap<&'static str, String>,
+    }
+
+    impl ScriptedRunner {
+        fn new(outputs: &[(&'static str, &str)]) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                outputs: outputs
+                    .iter()
+                    .map(|(command, stdout)| (*command, (*stdout).to_string()))
+                    .collect(),
+            }
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call.join(" "))
+                .collect()
+        }
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            self.calls.lock().unwrap().push(args.to_vec());
+            let stdout = args
+                .first()
+                .and_then(|command| self.outputs.get(command.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn switch_session_presizes_stale_destination_window() {
+        let runner = Arc::new(ScriptedRunner::new(&[
+            ("list-clients", "c0\t/dev/pts/9\t100\tsrc\t187\t71"),
+            (
+                "list-windows",
+                "src\t@1\t187\t70\t1\ndest\t@2\t281\t70\t1\ndest\t@3\t281\t70\t0",
+            ),
+            ("show-option", "32"),
+            (
+                "list-panes",
+                "%9\tdest\t@2\t1\t0\t0\t/dev/pts/2\t200\t/tmp\topensessions-sidebar\topensessions-sidebar\t48\t70\t0\t47",
+            ),
+        ]));
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.switch_session("dest", Some("/dev/pts/9"));
+
+        let commands = runner.commands();
+        let position = |needle: &str| {
+            commands
+                .iter()
+                .position(|command| command.starts_with(needle))
+                .unwrap_or_else(|| panic!("missing command {needle:?} in {commands:?}"))
+        };
+        let resize_window = position("resize-window -t @2 -x 187 -y 70");
+        let resize_pane = position("resize-pane -t %9 -x 32");
+        let switch = position("switch-client -c /dev/pts/9 -t dest");
+        let restore = position("set-window-option -t @2 -u window-size");
+        assert!(
+            resize_window < resize_pane && resize_pane < switch && switch < restore,
+            "presize must run before the switch and tracking restore after: {commands:?}",
+        );
+    }
+
+    #[test]
+    fn switch_session_skips_presize_when_sizes_match() {
+        let runner = Arc::new(ScriptedRunner::new(&[
+            ("list-clients", "c0\t/dev/pts/9\t100\tsrc\t187\t71"),
+            (
+                "list-windows",
+                "src\t@1\t187\t70\t1\ndest\t@2\t187\t70\t1",
+            ),
+        ]));
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.switch_session("dest", Some("/dev/pts/9"));
+
+        let commands = runner.commands();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.starts_with("switch-client")),
+            "switch must still run: {commands:?}",
+        );
+        assert!(
+            !commands.iter().any(|command| {
+                command.starts_with("resize-window") || command.starts_with("set-window-option")
+            }),
+            "no resize when destination already matches: {commands:?}",
+        );
+    }
+
+    #[test]
+    fn switch_session_skips_presize_when_already_on_target() {
+        let runner = Arc::new(ScriptedRunner::new(&[(
+            "list-clients",
+            "c0\t/dev/pts/9\t100\tdest\t187\t71",
+        )]));
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.switch_session("dest", Some("/dev/pts/9"));
+
+        let commands = runner.commands();
+        assert!(
+            !commands.iter().any(|command| command.starts_with("resize-window")),
+            "no resize when client already views the target: {commands:?}",
         );
     }
 }
