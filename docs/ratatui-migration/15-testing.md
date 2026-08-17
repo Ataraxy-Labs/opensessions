@@ -78,8 +78,9 @@ in `tests/common/ansi.rs` (~100 LOC).
 ```rust
 #[test]
 fn server_key_hash_matches_ts() {
-    // Verified against TS implementation
-    assert_eq!(hash_server_key("/private/tmp/tmux-501/default"), 12345);  // record from TS
+    assert_eq!(hash_server_key("/private/tmp/tmux-501/default"), 19916);
+    assert_eq!(hash_server_key("/tmp/é/socket"), 11473);
+    assert_eq!(hash_server_key("/tmp/😀/socket"), 15433);
 }
 
 #[test]

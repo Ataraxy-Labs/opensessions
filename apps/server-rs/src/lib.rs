@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -44,7 +45,7 @@ use serde_json::Value;
 use sha1_smol::Sha1;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, Semaphore, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_websockets::{Message, ServerBuilder};
@@ -55,6 +56,9 @@ pub const HELLO_JSON: &str = r#"{"type":"hello","protocol":1,"serverVersion":"0.
 pub const QUIT_JSON: &str = r#"{"type":"quit"}"#;
 
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
 const GIT_CACHE_TTL_MS: u64 = 5_000;
@@ -63,6 +67,7 @@ const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
 const AGENT_WATCHER_POLL_MS: u64 = 2_000;
 const TMUX_STATE_POLL_MS: u64 = 2_000;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
+const SIDEBAR_WIDTH_REPAIR_SETTLE_MS: u64 = 50;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
@@ -86,6 +91,23 @@ impl ShutdownAnnouncement {
             return;
         }
         announce_shutdown(state_source, state_updates);
+    }
+}
+
+#[derive(Debug, Default)]
+struct SidebarWidthRepairScheduler {
+    pending_requests: AtomicUsize,
+    notify: Notify,
+}
+
+impl SidebarWidthRepairScheduler {
+    fn request(&self) {
+        self.pending_requests.fetch_add(1, Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
+    fn take_pending_requests(&self) -> usize {
+        self.pending_requests.swap(0, Ordering::AcqRel)
     }
 }
 
@@ -351,6 +373,7 @@ pub struct ReadOnlyMuxStateSource {
     // width (`SidebarCoordinator::state().width`), so there is no separate
     // mirror field to drift out of sync.
     sidebar_coordinator: Mutex<SidebarCoordinator>,
+    sidebar_width_repairs: Arc<SidebarWidthRepairScheduler>,
     detail_panel_height: Mutex<u16>,
     agent_panel_scope: Mutex<AgentPanelScope>,
     focused_session: Mutex<Option<String>>,
@@ -396,6 +419,7 @@ impl ReadOnlyMuxStateSource {
             git_command_runner: Arc::new(SystemGitCommandRunner),
             git_info_cache: Mutex::new(HashMap::new()),
             sidebar_coordinator: Mutex::new(SidebarCoordinator::new(26)),
+            sidebar_width_repairs: Arc::new(SidebarWidthRepairScheduler::default()),
             detail_panel_height: Mutex::new(DEFAULT_DETAIL_PANEL_HEIGHT),
             agent_panel_scope: Mutex::new(AgentPanelScope::Current),
             focused_session: Mutex::new(None),
@@ -626,6 +650,10 @@ impl StateSource for ReadOnlyMuxStateSource {
                 state_updates.clone(),
                 shutdown.clone(),
             )),
+            tokio::spawn(run_sidebar_width_repair_loop(
+                self.clone(),
+                shutdown.clone(),
+            )),
             tokio::spawn(run_tmux_state_poll_loop(self, state_updates, shutdown)),
         ]
     }
@@ -806,7 +834,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 for provider in &self.providers {
                     provider.set_sidebar_width_hint(width);
                 }
-                self.enforce_sidebar_width(width);
+                self.request_sidebar_width_repair();
                 Some(self.snapshot_json())
             }
             "set-detail-panel-height" => {
@@ -825,7 +853,7 @@ impl StateSource for ReadOnlyMuxStateSource {
                 if self.is_sidebar_visible() {
                     let width = self.current_sidebar_width_u16();
                     if !self.repair_context_sidebar_width(context, width) {
-                        self.enforce_sidebar_width(width);
+                        self.request_sidebar_width_repair();
                     }
                 }
                 None
@@ -931,7 +959,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         if self.is_sidebar_visible() {
             let width = self.current_sidebar_width_u16();
             if !self.repair_context_sidebar_width(Some(context), width) {
-                self.enforce_sidebar_width(width);
+                self.request_sidebar_width_repair();
             }
         }
         let client_tty = self.providers.first()?.get_client_tty();
@@ -1073,13 +1101,13 @@ impl StateSource for ReadOnlyMuxStateSource {
                     provider.kill_orphaned_sidebar_panes_with_fallbacks(&fallback_sessions);
                 }
                 if self.is_sidebar_visible() {
-                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
+                    self.request_sidebar_width_repair();
                 }
                 None
             }
             "/pane-layout-changed" | "/client-resized" => {
                 if self.is_sidebar_visible() {
-                    self.enforce_sidebar_width(self.current_sidebar_width_u16());
+                    self.request_sidebar_width_repair();
                 }
                 None
             }
@@ -1344,14 +1372,20 @@ impl ReadOnlyMuxStateSource {
         true
     }
 
-    fn enforce_sidebar_width(&self, width: u16) {
+    fn request_sidebar_width_repair(&self) {
+        self.sidebar_width_repairs.request();
+    }
+
+    fn enforce_sidebar_width(&self, width: u16) -> usize {
         let panes = self.sidebar_panes_to_resize(width);
+        let pane_count = panes.len();
         for pane_id in panes {
             debug_log(format!("width-repair: resize pane={pane_id} to={width}",));
             for provider in &self.providers {
                 provider.resize_sidebar_pane(&pane_id, width);
             }
         }
+        pane_count
     }
 
     fn provider_for_session(&self, session: &str) -> Option<Arc<dyn MuxProvider>> {
@@ -1547,9 +1581,9 @@ impl ReadOnlyMuxStateSource {
             return false;
         }
         // A window switch / new window can make tmux proportionally redistribute
-        // panes in that window, so repair existing sidebars before spawning any
-        // missing ones. This is event-driven, not a per-tick width scan.
-        self.enforce_sidebar_width(width);
+        // panes in that window. Queue one coalesced global repair while spawning
+        // missing sidebars at the configured width immediately.
+        self.request_sidebar_width_repair();
         let mut spawned = false;
         for provider in &self.providers {
             if !provider.is_full_sidebar_capable() {
@@ -1687,6 +1721,68 @@ async fn run_sidebar_lifecycle_loop(
                     let _ = state_updates.send(source.snapshot_json());
                 }
             }
+        }
+    }
+}
+
+async fn run_sidebar_width_repair_loop(
+    source: Arc<ReadOnlyMuxStateSource>,
+    shutdown: broadcast::Sender<()>,
+) {
+    let scheduler = Arc::clone(&source.sidebar_width_repairs);
+    run_coalesced_sidebar_width_repairs(
+        scheduler,
+        shutdown.subscribe(),
+        Duration::from_millis(SIDEBAR_WIDTH_REPAIR_SETTLE_MS),
+        move |request_count| {
+            let source = Arc::clone(&source);
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if !source.is_sidebar_visible() {
+                        debug_log(format!(
+                            "width-repair: skipped {request_count} coalesced requests while hidden"
+                        ));
+                        return;
+                    }
+                    let started = Instant::now();
+                    let width = source.current_sidebar_width_u16();
+                    let resized_panes = source.enforce_sidebar_width(width);
+                    debug_log(format!(
+                        "width-repair: completed requests={request_count} resized={resized_panes} width={width} elapsed_ms={}",
+                        started.elapsed().as_millis(),
+                    ));
+                })
+                .await;
+            }
+        },
+    )
+    .await;
+}
+
+async fn run_coalesced_sidebar_width_repairs<F, Fut>(
+    scheduler: Arc<SidebarWidthRepairScheduler>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    settle_delay: Duration,
+    mut repair: F,
+) where
+    F: FnMut(usize) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            _ = scheduler.notify.notified() => {}
+        }
+        tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            _ = tokio::time::sleep(settle_delay) => {}
+        }
+        loop {
+            let request_count = scheduler.take_pending_requests();
+            if request_count == 0 {
+                break;
+            }
+            repair(request_count).await;
         }
     }
 }
@@ -2438,6 +2534,7 @@ async fn run_accept_loop(
     state_updates: broadcast::Sender<String>,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
+    let connection_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -2447,11 +2544,15 @@ async fn run_accept_loop(
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                let Ok(connection_permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                    continue;
+                };
                 let connection_shutdown = shutdown.clone();
                 let connection_state_source = state_source.clone();
                 let connection_state_updates = state_updates.clone();
                 let connection_shutdown_announcement = Arc::clone(&shutdown_announcement);
                 tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
                     let _ = handle_connection(
                         stream,
                         connection_shutdown,
@@ -2497,9 +2598,27 @@ async fn handle_connection(
     state_updates: broadcast::Sender<String>,
     shutdown_announcement: Arc<ShutdownAnnouncement>,
 ) -> Result<(), ServerError> {
-    let mut request = read_http_header(&mut stream).await?;
+    let mut request = tokio::time::timeout(HTTP_READ_TIMEOUT, read_http_header(&mut stream))
+        .await
+        .map_err(|_| ServerError::new("timed out reading http request headers"))??;
     let parsed = parse_http_request(&request)?;
-    read_remaining_http_body(&mut stream, &mut request, parsed.content_length()).await?;
+    let content_length = match parsed.content_length() {
+        Ok(content_length) if content_length <= MAX_HTTP_BODY_BYTES => content_length,
+        Ok(_) => {
+            write_http_response(&mut stream, "413 Payload Too Large", "payload too large").await?;
+            return Ok(());
+        }
+        Err(_) => {
+            write_http_response(&mut stream, "400 Bad Request", "invalid content-length").await?;
+            return Ok(());
+        }
+    };
+    tokio::time::timeout(
+        HTTP_READ_TIMEOUT,
+        read_remaining_http_body(&mut stream, &mut request, content_length),
+    )
+    .await
+    .map_err(|_| ServerError::new("timed out reading http request body"))??;
 
     if parsed.method == "POST" && parsed.path == "/refresh" {
         if let Some(state_source) = &state_source {
@@ -2661,29 +2780,29 @@ async fn handle_connection(
         return Ok(());
     }
 
-    if parsed.method == "POST"
-        && let Ok(body) = serde_json::from_slice::<Value>(http_body(&request))
-        && is_metadata_path(&parsed.path)
-        && !body.get("session").is_some_and(Value::is_string)
-    {
-        stream
-            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 15\r\n\r\nmissing session")
-            .await?;
-        let _ = stream.shutdown().await;
+    if parsed.method == "POST" && is_metadata_path(&parsed.path) {
+        let Ok(body) = serde_json::from_slice::<Value>(http_body(&request)) else {
+            write_http_response(&mut stream, "400 Bad Request", "invalid json").await?;
+            return Ok(());
+        };
+        if !body.get("session").is_some_and(Value::is_string) {
+            write_http_response(&mut stream, "400 Bad Request", "missing session").await?;
+            return Ok(());
+        }
+        let Some(payload) = state_source
+            .as_ref()
+            .and_then(|state_source| state_source.handle_http_json(&parsed.path, &body))
+        else {
+            write_http_response(&mut stream, "400 Bad Request", "invalid payload").await?;
+            return Ok(());
+        };
+        let _ = state_updates.send(payload);
+        write_http_response(&mut stream, "204 No Content", "").await?;
         return Ok(());
     }
 
-    if parsed.method == "POST"
-        && let Ok(body) = serde_json::from_slice::<Value>(http_body(&request))
-        && let Some(payload) = state_source
-            .as_ref()
-            .and_then(|state_source| state_source.handle_http_json(&parsed.path, &body))
-    {
-        let _ = state_updates.send(payload);
-        stream
-            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-            .await?;
-        let _ = stream.shutdown().await;
+    if is_metadata_path(&parsed.path) {
+        write_http_response(&mut stream, "405 Method Not Allowed", "method not allowed").await?;
         return Ok(());
     }
 
@@ -2821,9 +2940,29 @@ async fn handle_connection(
         }
     }
 
+    if parsed.method == "GET" && parsed.path == "/" {
+        write_http_response(&mut stream, "200 OK", "opensessions server").await?;
+    } else {
+        write_http_response(&mut stream, "404 Not Found", "not found").await?;
+    }
+    Ok(())
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+) -> Result<(), ServerError> {
     stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\nopensessions server")
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
         .await?;
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
@@ -2879,10 +3018,14 @@ impl HttpRequest {
                 .is_some_and(|value| contains_token_ignore_ascii_case(value, "upgrade"))
     }
 
-    fn content_length(&self) -> usize {
+    fn content_length(&self) -> Result<usize, ServerError> {
         self.header("content-length")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0)
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| ServerError::new("invalid content-length"))
+            })
+            .unwrap_or(Ok(0))
     }
 
     fn query_param(&self, name: &str) -> Option<&str> {
@@ -2961,7 +3104,10 @@ async fn read_remaining_http_body(
     }
 
     let start_len = request.len();
-    request.resize(start_len + remaining, 0);
+    let end_len = start_len
+        .checked_add(remaining)
+        .ok_or_else(|| ServerError::new("http request body length overflowed"))?;
+    request.resize(end_len, 0);
     stream.read_exact(&mut request[start_len..]).await?;
     Ok(())
 }
@@ -3018,4 +3164,123 @@ fn clamp_detail_panel_height(height: u16) -> u16 {
 
 fn parse_command(message: &Message) -> Option<Value> {
     serde_json::from_str::<Value>(message.as_text()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_SERVER_ID: AtomicUsize = AtomicUsize::new(0);
+
+    async fn send_raw_request(request: &[u8]) -> Vec<u8> {
+        let id = NEXT_SERVER_ID.fetch_add(1, Ordering::Relaxed);
+        let pid_file = std::env::temp_dir().join(format!(
+            "opensessions-server-test-{}-{id}.pid",
+            process::id()
+        ));
+        let server = start_server(ServerConfig::new("127.0.0.1", 0, pid_file))
+            .await
+            .expect("start test server");
+        let mut stream = TcpStream::connect(server.addr())
+            .await
+            .expect("connect to test server");
+        stream.write_all(request).await.expect("write test request");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+            .await
+            .expect("server should close the request")
+            .expect("read server response");
+        server.shutdown().await.expect("stop test server");
+        response
+    }
+
+    #[tokio::test]
+    async fn oversized_http_body_is_rejected_before_it_is_read() {
+        let response = send_raw_request(
+            format!(
+                "POST /api/agent-event HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                MAX_HTTP_BODY_BYTES + 1
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(response.starts_with(b"HTTP/1.1 413 Payload Too Large"));
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_and_unknown_routes_return_errors() {
+        let malformed = send_raw_request(
+            b"POST /set-status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n{",
+        )
+        .await;
+        assert!(malformed.starts_with(b"HTTP/1.1 400 Bad Request"));
+
+        let unknown = send_raw_request(
+            b"POST /unknown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(unknown.starts_with(b"HTTP/1.1 404 Not Found"));
+
+        let invalid_length = send_raw_request(
+            b"POST /log HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\n\r\n",
+        )
+        .await;
+        assert!(invalid_length.starts_with(b"HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_http_requests_are_closed_after_the_read_deadline() {
+        let partial_header =
+            send_raw_request(b"POST /api/agent-event HTTP/1.1\r\nHost: localhost\r\n").await;
+        assert!(partial_header.is_empty());
+
+        let partial_body = send_raw_request(
+            b"POST /api/agent-event HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{",
+        )
+        .await;
+        assert!(partial_body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sidebar_width_repair_requests_are_coalesced_without_losing_active_requests() {
+        let scheduler = Arc::new(SidebarWidthRepairScheduler::default());
+        let (shutdown, _) = broadcast::channel(1);
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let worker_scheduler = Arc::clone(&scheduler);
+        let callback_scheduler = Arc::clone(&scheduler);
+        let callback_shutdown = shutdown.clone();
+        let callback_batches = Arc::clone(&batches);
+        let worker = tokio::spawn(run_coalesced_sidebar_width_repairs(
+            worker_scheduler,
+            shutdown.subscribe(),
+            Duration::from_millis(1),
+            move |request_count| {
+                let callback_scheduler = Arc::clone(&callback_scheduler);
+                let callback_shutdown = callback_shutdown.clone();
+                let callback_batches = Arc::clone(&callback_batches);
+                async move {
+                    let mut batches = callback_batches.lock().unwrap();
+                    batches.push(request_count);
+                    if batches.len() == 1 {
+                        callback_scheduler.request();
+                    } else {
+                        let _ = callback_shutdown.send(());
+                    }
+                }
+            },
+        ));
+
+        scheduler.request();
+        scheduler.request();
+        scheduler.request();
+
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("repair worker should stop")
+            .expect("repair worker should not panic");
+        assert_eq!(*batches.lock().unwrap(), vec![3, 1]);
+    }
 }

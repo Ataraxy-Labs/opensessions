@@ -134,15 +134,6 @@ pub fn http_hook_command(base: &str, path: &str, data: Option<&str>, background:
     )
 }
 
-pub fn delayed_http_hook_command(base: &str, path: &str) -> String {
-    run_shell_command(
-        &format!(
-            "sleep 0.05; curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST {base}{path} >/dev/null 2>&1 || true"
-        ),
-        true,
-    )
-}
-
 fn run_shell_command(script: &str, background: bool) -> String {
     let background = if background { " -b" } else { "" };
     format!("run-shell{background} \"{}\"", tmux_double_quote(script))
@@ -155,8 +146,16 @@ fn tmux_double_quote(value: &str) -> String {
         .replace('$', "\\$")
 }
 
-pub fn sidebar_width_repair_pipeline() -> String {
-    resize_sidebar_width_pipeline(sidebar_width_repair_filter())
+pub fn resized_pane_width_repair_command() -> String {
+    run_shell_command(
+        &format!(
+            "[ '{}' != 1 ] || tmux -S #{{socket_path}} resize-pane -t '{}' -x '{}'",
+            sidebar_width_repair_filter().render(),
+            TmuxVar::PaneId.format().render(),
+            TmuxVar::SidebarWidthOption.format().render(),
+        ),
+        true,
+    )
 }
 
 pub fn close_orphan_sidebar_pipeline() -> String {
@@ -171,19 +170,17 @@ pub fn close_orphan_sidebar_pipeline() -> String {
 
 pub fn pane_exited_hook_command(base: &str) -> String {
     format!(
-        "{} ; {} ; {}",
+        "{} ; {}",
         run_shell_command(&close_orphan_sidebar_pipeline(), false),
         http_hook_command(base, "/pane-exited", None, false),
-        run_shell_command(&sidebar_width_repair_pipeline(), true),
     )
 }
 
 pub fn pane_died_hook_command(base: &str) -> String {
     format!(
-        "{} ; {} ; {}",
+        "{} ; {}",
         run_shell_command(&close_dead_content_pane_pipeline(), false),
         http_hook_command(base, "/pane-exited", None, false),
-        run_shell_command(&sidebar_width_repair_pipeline(), true),
     )
 }
 
@@ -214,14 +211,6 @@ fn orphan_sidebar_row_format() -> String {
     .map(|format| format.render_for_hook())
     .collect::<Vec<_>>()
     .join("\t")
-}
-
-fn resize_sidebar_width_pipeline(filter: TmuxFormat) -> String {
-    format!(
-        "tmux -S #{{socket_path}} list-panes -a -f '{}' -F '{}' | xargs -n1 -I{{}} tmux -S #{{socket_path}} resize-pane -t {{}} -x $(tmux -S #{{socket_path}} show-option -gqv @opensessions_width)",
-        filter.render_for_hook(),
-        TmuxVar::PaneId.format().render_for_hook(),
-    )
 }
 
 fn sidebar_width_repair_filter() -> TmuxFormat {
@@ -276,10 +265,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_sidebar_width_repair_pipeline_without_call_site_hash_math() {
+    fn renders_resized_pane_repair_without_a_global_scan() {
         assert_eq!(
-            sidebar_width_repair_pipeline(),
-            "tmux -S #{socket_path} list-panes -a -f '##{&&:##{>:##{window_panes},1},##{&&:##{==:##{pane_title},opensessions-sidebar},##{!=:##{pane_width},##{@opensessions_width}}}}' -F '##{pane_id}' | xargs -n1 -I{} tmux -S #{socket_path} resize-pane -t {} -x $(tmux -S #{socket_path} show-option -gqv @opensessions_width)"
+            resized_pane_width_repair_command(),
+            "run-shell -b \"[ '#{&&:#{>:#{window_panes},1},#{&&:#{==:#{pane_title},opensessions-sidebar},#{!=:#{pane_width},#{@opensessions_width}}}}' != 1 ] || tmux -S #{socket_path} resize-pane -t '#{pane_id}' -x '#{@opensessions_width}'\""
         );
     }
 
@@ -299,6 +288,6 @@ mod tests {
                 || hook.contains("kill-pane -t \"\\$pane\"")
         );
         assert!(hook.contains("-X POST http://127.0.0.1:1234/pane-exited"));
-        assert!(hook.ends_with(&run_shell_command(&sidebar_width_repair_pipeline(), true)));
+        assert!(!hook.contains("list-panes -a -f '##{&&:##{>:"));
     }
 }

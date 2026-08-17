@@ -22,3 +22,15 @@ pub fn resolve_server_port(server_key: Option<u16>, explicit: Option<&str>) -> u
         None => DEFAULT_SERVER_PORT,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hash_server_key;
+
+    #[test]
+    fn server_key_hashes_utf8_bytes() {
+        assert_eq!(hash_server_key("/private/tmp/tmux-501/default"), 19_916);
+        assert_eq!(hash_server_key("/tmp/é/socket"), 11_473);
+        assert_eq!(hash_server_key("/tmp/😀/socket"), 15_433);
+    }
+}

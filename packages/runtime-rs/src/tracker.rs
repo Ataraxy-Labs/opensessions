@@ -607,6 +607,7 @@ impl AgentTracker {
     }
 
     fn apply_event_with_options(&mut self, event: &mut AgentEvent, _seed: bool) {
+        event.ts = event.ts.min(now_ms());
         let key = instance_key(&event.agent, event.thread_id.as_deref());
         let mut removed_unseen_keys = Vec::new();
         if is_terminal_status(event.status) {
@@ -897,6 +898,20 @@ mod tests {
         event.pane_id = pane_id.map(str::to_string);
         event.liveness = pane_id.map(|_| AgentLiveness::Alive);
         event
+    }
+
+    #[test]
+    fn future_event_timestamp_is_clamped_to_receive_time() {
+        let before = now_ms();
+        let mut tracker = AgentTracker::new();
+        let mut future = event("amp", "work", Some("T-future"), Some("Future"));
+        future.ts = u64::MAX;
+
+        tracker.apply_event(future);
+
+        let stored = tracker.get_agents("work").pop().expect("tracked agent");
+        assert!(stored.ts >= before);
+        assert!(stored.ts < u64::MAX);
     }
 
     #[test]

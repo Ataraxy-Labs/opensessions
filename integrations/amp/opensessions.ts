@@ -121,8 +121,9 @@ async function fetchThreadTitle(threadId: string): Promise<string | null> {
  */
 function hashServerKey(input: string): number {
   let hash = 0;
-  for (let i = 0; i < input.length; i += 1) {
-    hash = (hash + input.charCodeAt(i) * (i + 1)) % 20000;
+  const bytes = new TextEncoder().encode(input);
+  for (let i = 0; i < bytes.length; i += 1) {
+    hash = (hash + bytes[i] * (i + 1)) % 20000;
   }
   return hash;
 }

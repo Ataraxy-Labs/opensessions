@@ -13,17 +13,15 @@ server_key() {
   socket_path="${TMUX%%,*}"
   [ -n "$socket_path" ] || return
 
-  awk -v input="$socket_path" 'BEGIN {
-    hash = 0
-    for (i = 1; i <= length(input); i++) {
-      hash = (hash + ord(substr(input, i, 1)) * i) % 20000
+  printf '%s' "$socket_path" | od -An -v -tu1 | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        byte_index++
+        hash = (hash + $i * byte_index) % 20000
+      }
     }
-    printf "%d\n", hash
-  }
-  function ord(ch,    chars) {
-    chars = " !\"#$%&\047()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
-    return index(chars, ch) + 31
-  }'
+    END { printf "%d\n", hash }
+  '
 }
 
 SERVER_KEY="$(server_key)"

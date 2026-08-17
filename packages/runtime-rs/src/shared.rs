@@ -76,8 +76,8 @@ impl OpensessionsEndpoint {
 
 pub fn hash_server_key(input: &str) -> u16 {
     let mut hash = 0_u32;
-    for (index, ch) in input.chars().enumerate() {
-        hash = (hash + ch as u32 * (index as u32 + 1)) % 20_000;
+    for (index, byte) in input.bytes().enumerate() {
+        hash = (hash + u32::from(byte) * (index as u32 + 1)) % 20_000;
     }
     hash as u16
 }
@@ -160,5 +160,17 @@ pub fn resolve_server_settings(env: impl Fn(&str) -> Option<String>) -> ServerSe
         host: endpoint.host,
         port: endpoint.port,
         pid_file: endpoint.pid_file.to_string_lossy().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_server_key;
+
+    #[test]
+    fn server_key_hashes_utf8_bytes() {
+        assert_eq!(hash_server_key("/private/tmp/tmux-501/default"), 19_916);
+        assert_eq!(hash_server_key("/tmp/é/socket"), 11_473);
+        assert_eq!(hash_server_key("/tmp/😀/socket"), 15_433);
     }
 }

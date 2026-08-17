@@ -25,6 +25,7 @@ interface AgentEventPayload {
 const DEFAULT_SERVER_PORT = 7391;
 const RUST_SERVER_PORT_BASE = 22000;
 const HEARTBEAT_MS = 5_000;
+const REQUEST_TIMEOUT_MS = 750;
 
 /**
  * Mirror opensessions Rust runtime port resolution. The
@@ -33,8 +34,9 @@ const HEARTBEAT_MS = 5_000;
  */
 function hashServerKey(input: string): number {
   let hash = 0;
-  for (let i = 0; i < input.length; i += 1) {
-    hash = (hash + input.charCodeAt(i) * (i + 1)) % 20000;
+  const bytes = new TextEncoder().encode(input);
+  for (let i = 0; i < bytes.length; i += 1) {
+    hash = (hash + bytes[i] * (i + 1)) % 20000;
   }
   return hash;
 }
@@ -73,6 +75,7 @@ function resolveServerUrls(): string[] {
 
 export default function opensessionsRuntime(pi: ExtensionAPI) {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let heartbeatRequest: Promise<void> | null = null;
   let current: Omit<PiRuntimePayload, "ts" | "sessionName"> | null = null;
 
   function buildPayload(ctx: ExtensionContext): PiRuntimePayload {
@@ -94,6 +97,7 @@ export default function opensessionsRuntime(pi: ExtensionAPI) {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
         if (response.status >= 200 && response.status < 300) return;
       } catch {
@@ -136,11 +140,15 @@ export default function opensessionsRuntime(pi: ExtensionAPI) {
           cwd: ctx.sessionManager.getCwd(),
         };
       }
-      void post("/api/runtime/pi/upsert", {
-        ...current,
-        sessionName: pi.getSessionName(),
-        ts: Date.now(),
-      } satisfies PiRuntimePayload);
+      if (!heartbeatRequest) {
+        heartbeatRequest = post("/api/runtime/pi/upsert", {
+          ...current,
+          sessionName: pi.getSessionName(),
+          ts: Date.now(),
+        } satisfies PiRuntimePayload).finally(() => {
+          heartbeatRequest = null;
+        });
+      }
     }, HEARTBEAT_MS);
   }
 

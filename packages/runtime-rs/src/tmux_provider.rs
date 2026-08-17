@@ -6,8 +6,8 @@ use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
 };
 use crate::tmux_scripting::{
-    delayed_http_hook_command, hook_context_format, http_hook_command, pane_died_hook_command,
-    pane_exited_hook_command, sidebar_width_repair_pipeline,
+    hook_context_format, http_hook_command, pane_died_hook_command, pane_exited_hook_command,
+    resized_pane_width_repair_command,
 };
 
 const SEP: &str = "\t";
@@ -511,16 +511,8 @@ impl MuxProvider for TmuxProvider {
         let ensure_cmd = http_hook_command(&base, "/ensure-sidebar", Some(hook_context), true);
         let pane_exited_cmd = pane_exited_hook_command(&base);
         let pane_died_cmd = pane_died_hook_command(&base);
-        let repair_sidebar_width_cmd =
-            format!("run-shell -b \"{}\"", sidebar_width_repair_pipeline());
-        let client_resized_cmd = format!(
-            "{repair_sidebar_width_cmd} ; {}",
-            delayed_http_hook_command(&base, "/client-resized"),
-        );
-        let pane_layout_changed_cmd = format!(
-            "{repair_sidebar_width_cmd} ; {}",
-            delayed_http_hook_command(&base, "/pane-layout-changed"),
-        );
+        let client_resized_cmd = http_hook_command(&base, "/client-resized", None, true);
+        let pane_layout_changed_cmd = http_hook_command(&base, "/pane-layout-changed", None, true);
 
         self.client.set_global_hook(
             "client-session-changed",
@@ -539,7 +531,7 @@ impl MuxProvider for TmuxProvider {
         self.client.set_global_hook("pane-exited", &pane_exited_cmd);
         self.client.set_global_hook("pane-died", &pane_died_cmd);
         self.client
-            .set_global_hook("after-resize-pane", &repair_sidebar_width_cmd);
+            .set_global_hook("after-resize-pane", &resized_pane_width_repair_command());
         self.client
             .set_global_hook("after-resize-window", &pane_layout_changed_cmd);
         self.client.set_remain_on_exit_for_sidebar_windows(true);

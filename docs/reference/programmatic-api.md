@@ -6,6 +6,10 @@ opensessions exposes HTTP endpoints that let agents, scripts, and CI pipelines p
 
 All endpoints accept `POST` with `Content-Type: application/json` on `127.0.0.1:7391`.
 
+Successful updates return `204 No Content`. Malformed JSON or invalid payloads return
+`400 Bad Request`; unsupported methods return `405 Method Not Allowed`. Request bodies
+larger than 1 MiB are rejected with `413 Payload Too Large`.
+
 ### `POST /set-status`
 
 Set a status pill on a session. Shows in both the session card and the detail panel.

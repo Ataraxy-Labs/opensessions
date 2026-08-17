@@ -42,7 +42,7 @@ tmux kill-session -t "_os_stash" 2>/dev/null || true
 echo "  ✓ removed stash session"
 
 # --- Kill the server ---
-curl -s -o /dev/null -X POST "http://${HOST}:${PORT}/shutdown" 2>/dev/null || true
+curl -s -o /dev/null -X POST "http://${HOST}:${PORT}/quit" 2>/dev/null || true
 echo "  ✓ stopped server (if running)"
 
 # --- Remove keybindings ---

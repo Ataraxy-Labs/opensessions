@@ -189,8 +189,7 @@ fn server_key() -> Option<u16> {
 }
 
 fn hash_server_key(s: &str) -> u16 {
-    // Match TS algorithm exactly:
-    // hash = (hash + s.charCodeAt(i) * (i+1)) % 20000
+    // Hash UTF-8 bytes identically in Rust, TypeScript, and shell.
     let mut hash: u32 = 0;
     for (i, b) in s.bytes().enumerate() {
         hash = (hash + b as u32 * (i as u32 + 1)) % 20000;
