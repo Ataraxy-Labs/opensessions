@@ -192,7 +192,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Ataraxy-Labs/opensessions&type=Date)](https://star-history.com/#Ataraxy-Labs/opensessions&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=Ataraxy-Labs/opensessions&type=Date)](https://star-history.dera.page/#Ataraxy-Labs/opensessions&Date)
 
 ## License
 
