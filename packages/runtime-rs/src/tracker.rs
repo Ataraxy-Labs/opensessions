@@ -182,29 +182,37 @@ impl AgentTracker {
         changed
     }
 
-    pub fn prune_stuck(&mut self, timeout_ms: u64) {
+    pub fn prune_stuck(&mut self, timeout_ms: u64) -> bool {
         let now = now_ms();
         let sessions = self.instances.keys().cloned().collect::<Vec<_>>();
         let mut unseen_to_remove = Vec::new();
+        let mut changed = false;
 
         for session in sessions {
             let mut empty = false;
             if let Some(session_instances) = self.instances.get_mut(&session) {
-                let keys = session_instances
-                    .iter()
-                    .filter(|(_, event)| {
-                        matches!(
-                            event.status,
-                            AgentStatus::Running | AgentStatus::ToolRunning
-                        ) && now.saturating_sub(event.ts) > timeout_ms
-                            && event.liveness != Some(AgentLiveness::Alive)
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
+                let mut keys_to_remove = Vec::new();
+                for (key, event) in session_instances.iter_mut() {
+                    if !matches!(
+                        event.status,
+                        AgentStatus::Running | AgentStatus::ToolRunning
+                    ) || now.saturating_sub(event.ts) <= timeout_ms
+                    {
+                        continue;
+                    }
 
-                for key in keys {
+                    if event.liveness == Some(AgentLiveness::Alive) {
+                        event.status = AgentStatus::Stale;
+                        changed = true;
+                    } else {
+                        keys_to_remove.push(key.clone());
+                    }
+                }
+
+                for key in keys_to_remove {
                     session_instances.remove(&key);
                     unseen_to_remove.push(format!("{session}\0{key}"));
+                    changed = true;
                 }
                 empty = session_instances.is_empty();
             }
@@ -216,6 +224,7 @@ impl AgentTracker {
         for key in unseen_to_remove {
             self.unseen_instances.remove(&key);
         }
+        changed
     }
 
     pub fn prune_terminal(&mut self) {
@@ -897,6 +906,81 @@ mod tests {
         event.pane_id = pane_id.map(str::to_string);
         event.liveness = pane_id.map(|_| AgentLiveness::Alive);
         event
+    }
+
+    #[test]
+    fn prune_stuck_marks_silent_live_running_and_tool_running_agents_stale() {
+        let mut tracker = AgentTracker::new();
+        for (thread_id, status, pane_id) in [
+            ("running", AgentStatus::Running, "%1"),
+            ("tool", AgentStatus::ToolRunning, "%2"),
+        ] {
+            let mut old = event("amp", "work", Some(thread_id), None);
+            old.status = status;
+            old.ts = now_ms() - 10_000;
+            old.pane_id = Some(pane_id.to_string());
+            old.liveness = Some(AgentLiveness::Alive);
+            tracker.apply_event(old);
+        }
+
+        assert!(tracker.prune_stuck(1_000));
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 2);
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.status == AgentStatus::Stale)
+        );
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.liveness == Some(AgentLiveness::Alive))
+        );
+    }
+
+    #[test]
+    fn prune_stuck_removes_closed_thread_without_touching_active_thread() {
+        let mut tracker = AgentTracker::new();
+        let mut closed = event("amp", "work", Some("closed"), None);
+        closed.ts = now_ms() - 10_000;
+        closed.pane_id = Some("%1".to_string());
+        closed.liveness = Some(AgentLiveness::Alive);
+        tracker.apply_event(closed);
+
+        let mut active = event("amp", "work", Some("active"), None);
+        active.ts = now_ms();
+        active.pane_id = Some("%2".to_string());
+        active.liveness = Some(AgentLiveness::Alive);
+        tracker.apply_event(active);
+        tracker.apply_pane_presence(
+            "work",
+            vec![PanePresenceInput {
+                agent: "amp".to_string(),
+                pane_id: "%2".to_string(),
+                active: true,
+                thread_id: Some("active".to_string()),
+                thread_name: None,
+            }],
+        );
+
+        assert!(tracker.prune_stuck(1_000));
+        let agents = tracker.get_agents("work");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].thread_id.as_deref(), Some("active"));
+        assert_eq!(agents[0].status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn prune_stuck_reports_change_only_once() {
+        let mut tracker = AgentTracker::new();
+        let mut old = event("amp", "work", Some("silent"), None);
+        old.ts = now_ms() - 10_000;
+        old.pane_id = Some("%1".to_string());
+        old.liveness = Some(AgentLiveness::Alive);
+        tracker.apply_event(old);
+
+        assert!(tracker.prune_stuck(1_000));
+        assert!(!tracker.prune_stuck(1_000));
     }
 
     #[test]

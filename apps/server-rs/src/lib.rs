@@ -65,6 +65,7 @@ const TMUX_STATE_POLL_MS: u64 = 2_000;
 const SIDEBAR_WARMUP_MS: u64 = 1_200;
 const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
+const STUCK_RUNNING_TIMEOUT_MS: u64 = 3 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
 const DEFAULT_DETAIL_PANEL_HEIGHT: u16 = 10;
@@ -1795,6 +1796,15 @@ async fn run_agent_watcher_loop(
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
+                let pruned = source
+                    .agent_tracker
+                    .lock()
+                    .unwrap()
+                    .prune_stuck(STUCK_RUNNING_TIMEOUT_MS);
+                if pruned {
+                    debug_log("agent_watcher_loop: stale agent state changed, broadcasting");
+                    let _ = state_updates.send(source.snapshot_json());
+                }
                 let now = current_time_ms();
                 let snapshots = tokio::task::spawn_blocking(move || scan_agent_watcher_snapshots(now))
                     .await
