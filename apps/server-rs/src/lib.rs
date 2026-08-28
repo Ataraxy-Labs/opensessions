@@ -14,8 +14,8 @@ use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
     AgentWatcherSnapshot, amp_snapshot_from_thread_json, claude_code_snapshot_from_jsonl,
     codex_snapshot_from_jsonl, codex_thread_id_from_path, decode_claude_project_dir,
-    droid_snapshot_from_jsonl, opencode_snapshot_from_row, parse_codex_session_index,
-    pi_snapshot_from_jsonl,
+    droid_snapshot_from_jsonl, kilo_snapshot_from_row, opencode_snapshot_from_row,
+    parse_codex_session_index, pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::config::{
     OpensessionsConfig, load_config_from_home, save_config_to_home,
@@ -67,6 +67,7 @@ const SERVER_SHUTDOWN_DRAIN_MS: u64 = 120;
 const AGENT_WATCHER_RECENT_MS: u64 = 5 * 60 * 1000;
 const OPENCODE_SQL_TIMEOUT_MS: u64 = 500;
 const OPENCODE_SQL_SEP: char = '\u{1f}';
+const KILO_SQL_SEP: char = '\u{1f}';
 const DEFAULT_DETAIL_PANEL_HEIGHT: u16 = 10;
 const MIN_DETAIL_PANEL_HEIGHT: u16 = 4;
 const MAX_DETAIL_PANEL_HEIGHT: u16 = 60;
@@ -1873,6 +1874,7 @@ fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {
     scan_claude_code_projects(&home, now_ms, &mut snapshots);
     scan_codex_sessions(&home, now_ms, &mut snapshots);
     scan_opencode_sessions(&home, now_ms, &mut snapshots);
+    scan_kilo_sessions(&home, now_ms, &mut snapshots);
     scan_pi_sessions(&home, now_ms, &mut snapshots);
     scan_droid_sessions(&home, now_ms, &mut snapshots);
     snapshots
@@ -1979,6 +1981,57 @@ fn scan_codex_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatche
             &raw,
             names.get(&thread_id).map(String::as_str),
             mtime_ms,
+            now_ms,
+        ) {
+            snapshots.push(snapshot);
+        }
+    }
+}
+
+fn scan_kilo_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+    let db_path = std::env::var_os("KILO_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/kilo/kilo.db"));
+    if !db_path.exists() {
+        return;
+    }
+
+    let stale_threshold = now_ms.saturating_sub(AGENT_WATCHER_RECENT_MS);
+    let query = format!(
+        "SELECT s.id, s.title, s.directory, s.time_updated, \
+         (SELECT m.data FROM message m WHERE m.session_id = s.id ORDER BY m.time_created DESC LIMIT 1) \
+         FROM session s \
+         WHERE s.time_updated > {stale_threshold} \
+         ORDER BY s.time_updated DESC \
+         LIMIT 50"
+    );
+
+    let output = process::Command::new("sqlite3")
+        .arg("-readonly")
+        .arg("-separator")
+        .arg(KILO_SQL_SEP.to_string())
+        .arg(&db_path)
+        .arg(query)
+        .output();
+
+    let Some(output) = output.ok() else { return };
+    if !output.status.success() {
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split(KILO_SQL_SEP).collect();
+        if parts.len() < 5 || parts[4].is_empty() {
+            continue;
+        }
+        let time_updated = parts[3].parse::<u64>().unwrap_or(now_ms);
+        if let Some(snapshot) = kilo_snapshot_from_row(
+            parts[0],
+            (!parts[1].is_empty()).then_some(parts[1]),
+            parts[2],
+            time_updated,
+            parts[4],
             now_ms,
         ) {
             snapshots.push(snapshot);

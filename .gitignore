@@ -5,3 +5,4 @@ target
 *.log
 .DS_Store
 .agents/skills/grill-me/
+bin
