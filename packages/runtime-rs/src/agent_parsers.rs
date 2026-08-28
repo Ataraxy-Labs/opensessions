@@ -190,6 +190,47 @@ pub fn determine_pi_status(entry: &Value) -> AgentStatus {
     }
 }
 
+pub fn determine_kilo_status(msg: &Value) -> AgentStatus {
+    let Some(role) = msg.get("role").and_then(Value::as_str) else {
+        return if msg.get("finish").and_then(Value::as_str) == Some("stop") {
+            AgentStatus::Done
+        } else if msg.get("finish").and_then(Value::as_str) == Some("tool-calls") {
+            AgentStatus::Running
+        } else if msg.get("finish").and_then(Value::as_str) == Some("error") {
+            AgentStatus::Error
+        } else {
+            AgentStatus::Idle
+        };
+    };
+
+    if let Some(error_name) = msg.pointer("/error/name").and_then(Value::as_str) {
+        return if error_name == "MessageAbortedError" {
+            AgentStatus::Interrupted
+        } else {
+            AgentStatus::Error
+        };
+    }
+
+    match role {
+        "assistant" => match msg.get("finish").and_then(Value::as_str) {
+            Some("tool-calls") => AgentStatus::Running,
+            Some("stop") => AgentStatus::Done,
+            Some("error") => AgentStatus::Error,
+            Some("unknown") => AgentStatus::Done,
+            _ if msg
+                .pointer("/time/completed")
+                .and_then(Value::as_u64)
+                .is_some() =>
+            {
+                AgentStatus::Done
+            }
+            _ => AgentStatus::Running,
+        },
+        "user" => AgentStatus::Running,
+        _ => AgentStatus::Idle,
+    }
+}
+
 fn content_has_type(content: Option<&Value>, target_type: &str) -> bool {
     content.and_then(Value::as_array).is_some_and(|items| {
         items
@@ -239,4 +280,63 @@ fn is_noise_user_prefix(text: &str) -> bool {
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kilo_status_user_is_running() {
+        let msg = serde_json::json!({"role": "user", "time": {"created": 1000}});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Running);
+    }
+
+    #[test]
+    fn kilo_status_assistant_stop_is_done() {
+        let msg = serde_json::json!({"role": "assistant", "finish": "stop", "time": {"created": 1000, "completed": 1500}});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Done);
+    }
+
+    #[test]
+    fn kilo_status_assistant_tool_calls_is_running() {
+        let msg = serde_json::json!({"role": "assistant", "finish": "tool-calls", "time": {"created": 1000, "completed": 1500}});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Running);
+    }
+
+    #[test]
+    fn kilo_status_streaming_is_running() {
+        let msg = serde_json::json!({"role": "assistant", "time": {"created": 1000}});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Running);
+    }
+
+    #[test]
+    fn kilo_status_message_aborted_error_is_interrupted() {
+        let msg = serde_json::json!({"role": "assistant", "time": {"created": 1000, "completed": 1500}, "error": {"name": "MessageAbortedError", "data": {"message": "aborted"}}});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Interrupted);
+    }
+
+    #[test]
+    fn kilo_status_api_error_is_error() {
+        let msg = serde_json::json!({"role": "assistant", "time": {"created": 1000, "completed": 1500}, "error": {"name": "APIError", "data": {"message": "no payment"}}});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Error);
+    }
+
+    #[test]
+    fn kilo_status_completed_without_finish_is_done() {
+        let msg = serde_json::json!({"role": "assistant", "time": {"created": 1000, "completed": 1500}});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Done);
+    }
+
+    #[test]
+    fn kilo_status_no_role_with_finish_stop_is_done() {
+        let msg = serde_json::json!({"finish": "stop"});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Done);
+    }
+
+    #[test]
+    fn kilo_status_no_role_with_finish_error_is_error() {
+        let msg = serde_json::json!({"finish": "error"});
+        assert_eq!(determine_kilo_status(&msg), AgentStatus::Error);
+    }
 }

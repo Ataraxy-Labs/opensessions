@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::agent_parsers::{
     determine_amp_message_status, determine_claude_code_status, determine_codex_status,
-    determine_opencode_status,
+    determine_kilo_status, determine_opencode_status,
 };
 use crate::protocol::AgentStatus;
 
@@ -265,6 +265,34 @@ pub fn pi_snapshot_from_jsonl(
         project_dir,
         status,
         ts: mtime_ms,
+    })
+}
+
+pub fn kilo_snapshot_from_row(
+    session_id: &str,
+    title: Option<&str>,
+    directory: &str,
+    time_updated: u64,
+    last_message_json: &str,
+    now_ms: u64,
+) -> Option<AgentWatcherSnapshot> {
+    let message = serde_json::from_str::<Value>(last_message_json).ok()?;
+    let mut status = determine_kilo_status(&message);
+    if status == AgentStatus::Running && now_ms.saturating_sub(time_updated) >= STUCK_MS {
+        status = AgentStatus::Stale;
+    }
+    let last_user_prompt = extract_kilo_user_prompt(&message);
+
+    Some(AgentWatcherSnapshot {
+        agent: "kilo",
+        thread_id: Some(session_id.to_string()),
+        thread_name: title
+            .filter(|title| !title.is_empty())
+            .map(ToString::to_string),
+        last_user_prompt,
+        project_dir: (!directory.is_empty()).then(|| directory.to_string()),
+        status,
+        ts: now_ms,
     })
 }
 
@@ -548,6 +576,18 @@ fn extract_opencode_user_prompt_json(raw: &str) -> Option<String> {
     normalize_prompt(text)
 }
 
+fn extract_kilo_user_prompt(msg: &Value) -> Option<String> {
+    if msg.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    if let Some(summary) = msg.get("summary")
+        && let Some(text) = summary.as_str()
+    {
+        return normalize_prompt(text);
+    }
+    None
+}
+
 fn extract_pi_session_name(entry: &Value) -> Option<String> {
     (entry.get("type").and_then(Value::as_str) == Some("session_info"))
         .then(|| entry.get("name")?.as_str())?
@@ -798,5 +838,82 @@ mod tests {
             Some("Ship this sidebar")
         );
         assert_eq!(snapshot.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn kilo_snapshot_reads_user_and_assistant_messages() {
+        let last_message = r#"{"role":"user","time":{"created":1000}}"#;
+        let snapshot = kilo_snapshot_from_row(
+            "ses_1",
+            Some("Kilo task"),
+            "/repo",
+            1_000,
+            last_message,
+            1_100,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.agent, "kilo");
+        assert_eq!(snapshot.thread_id.as_deref(), Some("ses_1"));
+        assert_eq!(snapshot.thread_name.as_deref(), Some("Kilo task"));
+        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo"));
+        assert_eq!(snapshot.status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn kilo_snapshot_reads_assistant_stop_as_done() {
+        let last_message = r#"{"role":"assistant","finish":"stop","time":{"created":1000,"completed":1500}}"#;
+        let snapshot = kilo_snapshot_from_row(
+            "ses_2",
+            None,
+            "/repo",
+            1_000,
+            last_message,
+            1_100,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn kilo_snapshot_promotes_running_to_stale() {
+        let last_message = r#"{"role":"assistant","time":{"created":1000}}"#;
+        let snapshot = kilo_snapshot_from_row(
+            "ses_3",
+            Some("Stuck"),
+            "/repo",
+            1_000,
+            last_message,
+            20_000,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Stale);
+    }
+
+    #[test]
+    fn kilo_snapshot_detects_message_aborted_error() {
+        let last_message = r#"{"role":"assistant","time":{"created":1000,"completed":1500},"error":{"name":"MessageAbortedError","data":{"message":"aborted"}}}"#;
+        let snapshot = kilo_snapshot_from_row(
+            "ses_4",
+            None,
+            "/repo",
+            1_000,
+            last_message,
+            1_100,
+        )
+        .expect("snapshot");
+        assert_eq!(snapshot.status, AgentStatus::Interrupted);
+    }
+
+    #[test]
+    fn kilo_snapshot_returns_none_for_invalid_json() {
+        let snapshot = kilo_snapshot_from_row(
+            "ses_5",
+            None,
+            "/repo",
+            1_000,
+            "not json",
+            1_100,
+        );
+        assert!(snapshot.is_none());
     }
 }
