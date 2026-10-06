@@ -137,7 +137,7 @@ ensure_server() {
   OPENSESSIONS_PORT="$PORT" \
   OPENSESSIONS_PID_FILE="$PID_FILE" \
   OPENSESSIONS_DIR="$PLUGIN_DIR" \
-    "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
+    nohup "$RUST_SERVER_BIN" >"$SERVER_LOG" 2>&1 &
 
   attempt=0
   while [ "$attempt" -lt 30 ]; do
