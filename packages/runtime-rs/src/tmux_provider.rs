@@ -820,9 +820,10 @@ impl MuxProvider for TmuxProvider {
         // pane works even when the parent pane's cwd is unrelated to the
         // workspace (e.g. tmux sessions whose default cwd is `$HOME`). Falls
         // back to the literal path if the env is unset.
+        let session_name = target.session_name.replace('\'', "'\\''");
+        let window_id_escaped = window_id.replace('\'', "'\\''");
         let command = format!(
-            "OPENSESSIONS_SESSION_NAME={} OPENSESSIONS_WINDOW_ID={window_id} REFOCUS_WINDOW={window_id} exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
-            target.session_name,
+            "sh -c 'OPENSESSIONS_SESSION_NAME=\"{session_name}\" OPENSESSIONS_WINDOW_ID=\"{window_id_escaped}\" REFOCUS_WINDOW=\"{window_id_escaped}\" exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh'",
         );
         let new_pane = self.client.split_sidebar_pane(
             &target.id,
